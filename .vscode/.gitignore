@@ -1,0 +1,32 @@
+@"
+# deps
+/vendor/
+node_modules/
+
+# secrets / env
+.env
+.env.*.local
+database.php
+config/*.local.php
+*.local.php
+
+# logs / runtime / generated
+*.log
+logs/
+cache/
+storage/
+tmp/
+sessions/
+uploads/
+exports/
+
+# builds (if any)
+dist/
+public/build/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+"@ | Set-Content -Encoding utf8 .gitignore
