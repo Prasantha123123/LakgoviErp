@@ -1,169 +1,240 @@
 <?php
-// bom.php - Bill of Materials management
+// bom.php - Peetu (Semi-Finished) mappings: raw requirements per unit
 include 'header.php';
 
+// ---------------------------
+// Helpers
+// ---------------------------
+function safe_arr($v) { return is_array($v) ? $v : []; }
+
+// ---------------------------
 // Handle form submissions
+// ---------------------------
 if ($_SERVER['REQUEST_METHOD'] == 'POST') {
     try {
         if (isset($_POST['action'])) {
             switch ($_POST['action']) {
-                case 'create':
-                    // Check if BOM entry already exists
-                    $stmt = $db->prepare("SELECT id FROM bom WHERE item_id = ? AND raw_material_id = ?");
-                    $stmt->execute([$_POST['item_id'], $_POST['raw_material_id']]);
-                    if ($stmt->fetch()) {
-                        throw new Exception("BOM entry already exists for this item and raw material combination.");
+
+                // Add one or more raw materials for a single semi-finished (peetu) item
+                case 'create_peetu':
+                    $peetu_item_id = $_POST['peetu_item_id'] ?? null;
+                    $raw_ids       = safe_arr($_POST['raw_material_id'] ?? []);
+                    $qtys          = safe_arr($_POST['quantity'] ?? []);
+
+                    if (!$peetu_item_id || !is_numeric($peetu_item_id)) {
+                        throw new Exception("Please select a Semi-Finished (Peetu) item.");
                     }
-                    
-                    $stmt = $db->prepare("INSERT INTO bom (item_id, raw_material_id, quantity) VALUES (?, ?, ?)");
-                    $stmt->execute([$_POST['item_id'], $_POST['raw_material_id'], $_POST['quantity']]);
-                    $success = "BOM entry created successfully!";
-                    break;
-                    
-                case 'update':
-                    $stmt = $db->prepare("UPDATE bom SET quantity = ? WHERE id = ?");
-                    $stmt->execute([$_POST['quantity'], $_POST['id']]);
-                    $success = "BOM entry updated successfully!";
-                    break;
-                    
-                case 'delete':
-                    $stmt = $db->prepare("DELETE FROM bom WHERE id = ?");
-                    $stmt->execute([$_POST['id']]);
-                    $success = "BOM entry deleted successfully!";
-                    break;
-                    
-                case 'copy_bom':
+                    if (empty($raw_ids)) {
+                        throw new Exception("Please add at least one raw material row.");
+                    }
+
                     $db->beginTransaction();
-                    
-                    // Get BOM entries from source item
-                    $stmt = $db->prepare("
-                        SELECT raw_material_id, quantity 
-                        FROM bom 
-                        WHERE item_id = ?
-                    ");
-                    $stmt->execute([$_POST['source_item_id']]);
-                    $source_bom = $stmt->fetchAll();
-                    
-                    if (empty($source_bom)) {
-                        throw new Exception("Source item has no BOM entries to copy.");
-                    }
-                    
-                    // Copy to target item
-                    $copied = 0;
-                    foreach ($source_bom as $bom_entry) {
-                        // Check if entry already exists
-                        $stmt = $db->prepare("SELECT id FROM bom WHERE item_id = ? AND raw_material_id = ?");
-                        $stmt->execute([$_POST['target_item_id'], $bom_entry['raw_material_id']]);
-                        
-                        if (!$stmt->fetch()) {
-                            $stmt = $db->prepare("INSERT INTO bom (item_id, raw_material_id, quantity) VALUES (?, ?, ?)");
-                            $stmt->execute([$_POST['target_item_id'], $bom_entry['raw_material_id'], $bom_entry['quantity']]);
-                            $copied++;
+
+                    // Insert each row (skip blanks; upsert-like behavior)
+                    $inserted = 0;
+                    for ($i = 0; $i < count($raw_ids); $i++) {
+                        $rid = (int)($raw_ids[$i] ?? 0);
+                        $q   = (float)($qtys[$i] ?? 0);
+                        if ($rid > 0 && $q > 0) {
+                            // Check if exists
+                            $stmt = $db->prepare("SELECT id FROM bom_peetu WHERE peetu_item_id = ? AND raw_material_id = ?");
+                            $stmt->execute([$peetu_item_id, $rid]);
+                            $exists = $stmt->fetch(PDO::FETCH_ASSOC);
+
+                            if ($exists) {
+                                // Update quantity
+                                $stmt = $db->prepare("UPDATE bom_peetu SET quantity = ? WHERE id = ?");
+                                $stmt->execute([$q, $exists['id']]);
+                            } else {
+                                // Insert new
+                                $stmt = $db->prepare("INSERT INTO bom_peetu (peetu_item_id, raw_material_id, quantity) VALUES (?, ?, ?)");
+                                $stmt->execute([$peetu_item_id, $rid, $q]);
+                            }
+                            $inserted++;
                         }
                     }
-                    
+
                     $db->commit();
-                    $success = "BOM copied successfully! $copied entries copied.";
+                    $success = $inserted > 0
+                        ? "Peetu entry saved successfully! ($inserted row(s))"
+                        : "No valid rows to save.";
                     break;
-                    
-                case 'calculate_cost':
-                    // Calculate total raw material cost for finished item
-                    $stmt = $db->prepare("
-                        SELECT b.quantity, i.name as raw_material_name, 
-                               COALESCE(AVG(gi.rate), 0) as avg_rate
-                        FROM bom b
-                        JOIN items i ON b.raw_material_id = i.id
-                        LEFT JOIN grn_items gi ON b.raw_material_id = gi.item_id
-                        WHERE b.item_id = ?
-                        GROUP BY b.id, b.quantity, i.name
-                    ");
-                    $stmt->execute([$_POST['item_id']]);
-                    $cost_breakdown = $stmt->fetchAll();
-                    
-                    $total_cost = 0;
-                    foreach ($cost_breakdown as $item) {
-                        $total_cost += $item['quantity'] * $item['avg_rate'];
+
+                case 'update':
+                    // Update single mapping quantity
+                    if (empty($_POST['id']) || !is_numeric($_POST['id'])) {
+                        throw new Exception("Invalid entry id.");
                     }
-                    
-                    $success = "Cost calculated: රු." . number_format($total_cost, 2);
+                    $stmt = $db->prepare("UPDATE bom_peetu SET quantity = ? WHERE id = ?");
+                    $stmt->execute([$_POST['quantity'], $_POST['id']]);
+                    $success = "Peetu entry updated successfully!";
+                    break;
+
+                case 'delete':
+                    if (empty($_POST['id']) || !is_numeric($_POST['id'])) {
+                        throw new Exception("Invalid entry id.");
+                    }
+                    $stmt = $db->prepare("DELETE FROM bom_peetu WHERE id = ?");
+                    $stmt->execute([$_POST['id']]);
+                    $success = "Peetu entry deleted successfully!";
+                    break;
+
+                case 'copy_bom':
+                    // Copy peetu mapping from source semi-finished item to target semi-finished item
+                    $src = $_POST['source_item_id'] ?? null;  // semi_finished
+                    $dst = $_POST['target_item_id'] ?? null;  // semi_finished
+                    if (!$src || !$dst || !is_numeric($src) || !is_numeric($dst)) {
+                        throw new Exception("Please select valid Semi-Finished items to copy.");
+                    }
+                    if ((int)$src === (int)$dst) {
+                        throw new Exception("Source and target cannot be the same.");
+                    }
+
+                    $db->beginTransaction();
+
+                    $stmt = $db->prepare("SELECT raw_material_id, quantity FROM bom_peetu WHERE peetu_item_id = ?");
+                    $stmt->execute([$src]);
+                    $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+                    if (empty($rows)) {
+                        throw new Exception("Source Peetu has no entries to copy.");
+                    }
+
+                    $copied = 0;
+                    foreach ($rows as $r) {
+                        // upsert
+                        $stmt = $db->prepare("SELECT id FROM bom_peetu WHERE peetu_item_id = ? AND raw_material_id = ?");
+                        $stmt->execute([$dst, $r['raw_material_id']]);
+                        $exists = $stmt->fetch(PDO::FETCH_ASSOC);
+                        if ($exists) {
+                            $stmt = $db->prepare("UPDATE bom_peetu SET quantity = ? WHERE id = ?");
+                            $stmt->execute([$r['quantity'], $exists['id']]);
+                        } else {
+                            $stmt = $db->prepare("INSERT INTO bom_peetu (peetu_item_id, raw_material_id, quantity) VALUES (?, ?, ?)");
+                            $stmt->execute([$dst, $r['raw_material_id'], $r['quantity']]);
+                        }
+                        $copied++;
+                    }
+
+                    $db->commit();
+                    $success = "Peetu map copied successfully! $copied entries copied.";
+                    break;
+
+                case 'calculate_cost':
+                    // Raw-material cost for one peetu unit using average GRN rate per raw
+                    $peetu_item_id = $_POST['item_id'] ?? null;
+                    if (!$peetu_item_id || !is_numeric($peetu_item_id)) {
+                        throw new Exception("Invalid Semi-Finished item.");
+                    }
+
+                    $stmt = $db->prepare("
+                        SELECT bp.quantity, rm.name as raw_material_name,
+                               COALESCE(AVG(gi.rate), 0) as avg_rate
+                        FROM bom_peetu bp
+                        JOIN items rm ON bp.raw_material_id = rm.id
+                        LEFT JOIN grn_items gi ON gi.item_id = rm.id
+                        WHERE bp.peetu_item_id = ?
+                        GROUP BY bp.id, bp.quantity, rm.name
+                    ");
+                    $stmt->execute([$peetu_item_id]);
+                    $cost_breakdown = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+                    $total_cost = 0;
+                    foreach ($cost_breakdown as $row) {
+                        $total_cost += ((float)$row['quantity']) * ((float)$row['avg_rate']);
+                    }
+                    $success = "Cost (materials only): රු." . number_format($total_cost, 2);
                     break;
             }
         }
     } catch(PDOException $e) {
+        if ($db->inTransaction()) $db->rollback();
         $error = "Error: " . $e->getMessage();
     } catch(Exception $e) {
-        if ($db->inTransaction()) {
-            $db->rollback();
-        }
+        if ($db->inTransaction()) $db->rollback();
         $error = "Error: " . $e->getMessage();
     }
 }
 
-// Fetch BOMs with item details
+// ---------------------------
+// Fetch data for UI
+// ---------------------------
+
+// Peetu rows (semi-finished + raw requirements)
+$peetu_rows = [];
 try {
+    // Compute raw material stock from stock_ledger to avoid depending on a current_stock column
     $stmt = $db->query("
-        SELECT b.*, 
-               fi.name as finished_item_name, fi.code as finished_item_code, fu.symbol as finished_unit,
-               rm.name as raw_material_name, rm.code as raw_material_code, ru.symbol as raw_unit,
-               rm.current_stock as raw_material_stock
-        FROM bom b
-        JOIN items fi ON b.item_id = fi.id
+        SELECT bp.*,
+               fi.name  AS peetu_name,  fi.code AS peetu_code,  fu.symbol AS peetu_unit,
+               rm.name  AS raw_material_name, rm.code AS raw_material_code, ru.symbol AS raw_unit,
+               COALESCE((
+                   SELECT SUM(sl.quantity_in - sl.quantity_out)
+                   FROM stock_ledger sl
+                   WHERE sl.item_id = rm.id
+               ), 0) AS raw_material_stock
+        FROM bom_peetu bp
+        JOIN items fi ON bp.peetu_item_id = fi.id AND fi.type = 'semi_finished'
         JOIN units fu ON fi.unit_id = fu.id
-        JOIN items rm ON b.raw_material_id = rm.id
+        JOIN items rm ON bp.raw_material_id = rm.id
         JOIN units ru ON rm.unit_id = ru.id
         ORDER BY fi.name, rm.name
     ");
-    $boms = $stmt->fetchAll();
+    $peetu_rows = $stmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
 } catch(PDOException $e) {
-    $error = "Error fetching BOMs: " . $e->getMessage();
+    $error = "Error fetching Peetu entries: " . $e->getMessage();
+    $peetu_rows = [];
 }
 
-// Fetch finished items for dropdown (semi-finished and finished)
+// Semi-finished items for dropdown
+$semi_finished_items = [];
 try {
-    $stmt = $db->query("SELECT i.*, u.symbol FROM items i JOIN units u ON i.unit_id = u.id WHERE i.type IN ('semi_finished', 'finished') ORDER BY i.name");
-    $finished_items = $stmt->fetchAll();
+    $stmt = $db->query("SELECT i.*, u.symbol FROM items i JOIN units u ON i.unit_id = u.id WHERE i.type = 'semi_finished' ORDER BY i.name");
+    $semi_finished_items = $stmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
 } catch(PDOException $e) {
-    $error = "Error fetching finished items: " . $e->getMessage();
+    $error = "Error fetching semi-finished items: " . $e->getMessage();
+    $semi_finished_items = [];
 }
 
-// Fetch raw materials for dropdown
+// Raw materials for dropdown
+$raw_materials = [];
 try {
     $stmt = $db->query("SELECT i.*, u.symbol FROM items i JOIN units u ON i.unit_id = u.id WHERE i.type = 'raw' ORDER BY i.name");
-    $raw_materials = $stmt->fetchAll();
+    $raw_materials = $stmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
 } catch(PDOException $e) {
     $error = "Error fetching raw materials: " . $e->getMessage();
+    $raw_materials = [];
 }
 
-// Group BOMs by finished item
-$grouped_boms = [];
-foreach ($boms as $bom) {
-    $key = $bom['item_id'];
-    if (!isset($grouped_boms[$key])) {
-        $grouped_boms[$key] = [
-            'item_id' => $bom['item_id'],
-            'item_name' => $bom['finished_item_name'],
-            'item_code' => $bom['finished_item_code'],
-            'item_unit' => $bom['finished_unit'],
-            'materials' => [],
+// Group by peetu (semi-finished) item for card view
+$grouped_peetu = [];
+foreach ($peetu_rows as $r) {
+    $key = $r['peetu_item_id'];
+    if (!isset($grouped_peetu[$key])) {
+        $grouped_peetu[$key] = [
+            'item_id'         => $r['peetu_item_id'],
+            'item_name'       => $r['peetu_name'],
+            'item_code'       => $r['peetu_code'],
+            'item_unit'       => $r['peetu_unit'],
+            'materials'       => [],
             'total_materials' => 0,
-            'can_produce' => true
+            'can_produce'     => true
         ];
     }
-    $grouped_boms[$key]['materials'][] = $bom;
-    $grouped_boms[$key]['total_materials']++;
-    
-    // Check if we can produce (sufficient raw materials)
-    if ($bom['raw_material_stock'] < $bom['quantity']) {
-        $grouped_boms[$key]['can_produce'] = false;
+    $grouped_peetu[$key]['materials'][] = $r;
+    $grouped_peetu[$key]['total_materials']++;
+
+    if ((float)$r['raw_material_stock'] < (float)$r['quantity']) {
+        $grouped_peetu[$key]['can_produce'] = false;
     }
 }
 
-// Get BOM statistics
-$bom_stats = [
-    'total_boms' => count($grouped_boms),
-    'total_entries' => count($boms),
-    'can_produce' => count(array_filter($grouped_boms, fn($bom) => $bom['can_produce'])),
-    'cannot_produce' => count(array_filter($grouped_boms, fn($bom) => !$bom['can_produce']))
+// Stats
+$peetu_stats = [
+    'total_boms'       => count($grouped_peetu),
+    'total_entries'    => count($peetu_rows),
+    'can_produce'      => count(array_filter($grouped_peetu, fn($b) => $b['can_produce'])),
+    'cannot_produce'   => count(array_filter($grouped_peetu, fn($b) => !$b['can_produce']))
 ];
 ?>
 
@@ -171,19 +242,14 @@ $bom_stats = [
     <!-- Page Header -->
     <div class="flex justify-between items-center">
         <div>
-            <h1 class="text-3xl font-bold text-gray-900">Bill of Materials (BOM)</h1>
-            <p class="text-gray-600">Manage recipes and material requirements for production</p>
+            <h1 class="text-3xl font-bold text-gray-900">Peetu (Semi-Finished) Map</h1>
+            <p class="text-gray-600">Define raw material requirements per unit of Semi-Finished (Peetu).</p>
         </div>
         <div class="flex space-x-2">
             <button onclick="openModal('copyBomModal')" class="bg-green-600 text-white px-4 py-2 rounded-md hover:bg-green-700 transition-colors">
-                Copy BOM
+                Copy Peetu Map
             </button>
-            <!-- NEW BUTTON: BOM Entry -->
-            <button onclick="openModal('createBomModal')" class="bg-primary text-white px-4 py-2 rounded-md hover:bg-blue-600 transition-colors">
-                BOM Entry
-            </button>
-            <!-- Existing (renamed earlier) button -->
-            <button onclick="openModal('createBomModal')" class="bg-primary text-white px-4 py-2 rounded-md hover:bg-blue-600 transition-colors">
+            <button onclick="openCreatePeetu()" class="bg-primary text-white px-4 py-2 rounded-md hover:bg-blue-600 transition-colors">
                 Add Peetu Entry
             </button>
         </div>
@@ -202,7 +268,7 @@ $bom_stats = [
         </div>
     <?php endif; ?>
 
-    <!-- BOM Statistics -->
+    <!-- Stats -->
     <div class="grid grid-cols-1 md:grid-cols-4 gap-6">
         <div class="bg-white p-6 rounded-lg shadow">
             <div class="flex items-center">
@@ -212,8 +278,8 @@ $bom_stats = [
                     </svg>
                 </div>
                 <div class="ml-4">
-                    <p class="text-sm font-medium text-gray-600">Total BOMs</p>
-                    <p class="text-2xl font-bold text-gray-900"><?php echo $bom_stats['total_boms']; ?></p>
+                    <p class="text-sm font-medium text-gray-600">Total Peetu</p>
+                    <p class="text-2xl font-bold text-gray-900"><?php echo $peetu_stats['total_boms']; ?></p>
                 </div>
             </div>
         </div>
@@ -227,7 +293,7 @@ $bom_stats = [
                 </div>
                 <div class="ml-4">
                     <p class="text-sm font-medium text-gray-600">Total Entries</p>
-                    <p class="text-2xl font-bold text-gray-900"><?php echo $bom_stats['total_entries']; ?></p>
+                    <p class="text-2xl font-bold text-gray-900"><?php echo $peetu_stats['total_entries']; ?></p>
                 </div>
             </div>
         </div>
@@ -241,7 +307,7 @@ $bom_stats = [
                 </div>
                 <div class="ml-4">
                     <p class="text-sm font-medium text-gray-600">Can Produce</p>
-                    <p class="text-2xl font-bold text-gray-900"><?php echo $bom_stats['can_produce']; ?></p>
+                    <p class="text-2xl font-bold text-gray-900"><?php echo $peetu_stats['can_produce']; ?></p>
                 </div>
             </div>
         </div>
@@ -255,16 +321,16 @@ $bom_stats = [
                 </div>
                 <div class="ml-4">
                     <p class="text-sm font-medium text-gray-600">Material Shortage</p>
-                    <p class="text-2xl font-bold text-gray-900"><?php echo $bom_stats['cannot_produce']; ?></p>
+                    <p class="text-2xl font-bold text-gray-900"><?php echo $peetu_stats['cannot_produce']; ?></p>
                 </div>
             </div>
         </div>
     </div>
 
-    <!-- BOM Cards -->
-    <?php if (!empty($grouped_boms)): ?>
+    <!-- Peetu Cards -->
+    <?php if (!empty($grouped_peetu)): ?>
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            <?php foreach ($grouped_boms as $item_key => $item_bom): ?>
+            <?php foreach ($grouped_peetu as $item_key => $item_bom): ?>
             <div class="bg-white rounded-lg shadow hover:shadow-md transition-shadow <?php echo !$item_bom['can_produce'] ? 'ring-2 ring-red-200' : ''; ?>">
                 <div class="p-6">
                     <div class="flex justify-between items-start mb-4">
@@ -287,49 +353,43 @@ $bom_stats = [
                             </span>
                         </div>
                         <div class="flex items-center space-x-2">
-                            <button onclick="calculateItemCost(<?php echo $item_bom['item_id']; ?>)" class="text-purple-600 hover:text-purple-900 text-sm" title="Calculate Cost">
+                            <button onclick="calculateItemCost(<?php echo (int)$item_bom['item_id']; ?>)" class="text-purple-600 hover:text-purple-900 text-sm" title="Calculate Cost">
                                 <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 7h6m0 10v-3m-3 3h.01M9 17h.01M9 14h.01M12 14h.01M15 11h.01M12 11h.01M9 11h.01M7 21h10a2 2 0 002-2V5a2 2 0 00-2-2H7a2 2 0 00-2 2v14a2 2 0 002 2z"/>
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 7h6m0 10v-3m-3 3h.01M9 17h.01M9 14h.01M12 14h.01M15 11h.01M12 11h.01M9 11h.01M7 21h10a2 2 0 002-2V5a2 2 0 00-2-2H7a2 2 0 01-2 2v14a2 2 0 002 2z"/>
                                 </svg>
                             </button>
-                            <button onclick="addBomMaterial(<?php echo $item_bom['item_id']; ?>)" class="text-green-600 hover:text-green-900 text-sm" title="Add Material">
+                            <button onclick="addBomMaterial(<?php echo (int)$item_bom['item_id']; ?>)" class="text-green-600 hover:text-green-900 text-sm" title="Add Material">
                                 <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"/>
                                 </svg>
                             </button>
-                            <button onclick="viewBomDetails(<?php echo $item_bom['item_id']; ?>)" class="text-blue-600 hover:text-blue-900 text-sm" title="View Details">
-                                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/>
-                                </svg>
-                            </button>
                         </div>
                     </div>
-                    
+
                     <div class="space-y-3">
                         <h4 class="text-sm font-medium text-gray-700">Raw Materials Required:</h4>
                         <?php foreach ($item_bom['materials'] as $material): ?>
-                        <div class="flex justify-between items-center p-3 <?php echo $material['raw_material_stock'] < $material['quantity'] ? 'bg-red-50 border border-red-200' : 'bg-gray-50'; ?> rounded-md">
+                        <div class="flex justify-between items-center p-3 <?php echo ((float)$material['raw_material_stock'] < (float)$material['quantity']) ? 'bg-red-50 border border-red-200' : 'bg-gray-50'; ?> rounded-md">
                             <div class="flex-1">
                                 <p class="font-medium text-gray-900"><?php echo htmlspecialchars($material['raw_material_name']); ?></p>
                                 <p class="text-sm text-gray-600"><?php echo htmlspecialchars($material['raw_material_code']); ?></p>
-                                <p class="text-xs <?php echo $material['raw_material_stock'] < $material['quantity'] ? 'text-red-600' : 'text-gray-500'; ?>">
-                                    Available: <?php echo number_format($material['raw_material_stock'], 3); ?> <?php echo $material['raw_unit']; ?>
+                                <p class="text-xs <?php echo ((float)$material['raw_material_stock'] < (float)$material['quantity']) ? 'text-red-600' : 'text-gray-500'; ?>">
+                                    Available: <?php echo number_format((float)$material['raw_material_stock'], 3); ?> <?php echo $material['raw_unit']; ?>
                                 </p>
                             </div>
                             <div class="flex items-center space-x-2">
-                                <span class="text-sm font-medium <?php echo $material['raw_material_stock'] < $material['quantity'] ? 'text-red-900' : 'text-gray-900'; ?>">
-                                    <?php echo number_format($material['quantity'], 3); ?> <?php echo $material['raw_unit']; ?>
+                                <span class="text-sm font-medium <?php echo ((float)$material['raw_material_stock'] < (float)$material['quantity']) ? 'text-red-900' : 'text-gray-900'; ?>">
+                                    <?php echo number_format((float)$material['quantity'], 3); ?> <?php echo $material['raw_unit']; ?>
                                 </span>
                                 <div class="flex space-x-1">
-                                    <button onclick="editBom(<?php echo htmlspecialchars(json_encode($material)); ?>)" class="text-indigo-600 hover:text-indigo-900">
+                                    <button onclick='editBom(<?php echo json_encode($material, JSON_HEX_TAG|JSON_HEX_APOS|JSON_HEX_QUOT|JSON_HEX_AMP); ?>)' class="text-indigo-600 hover:text-indigo-900">
                                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/>
                                         </svg>
                                     </button>
-                                    <form method="POST" class="inline" onsubmit="return confirmDelete('Are you sure you want to delete this BOM entry?')">
+                                    <form method="POST" class="inline" onsubmit="return confirmDelete('Delete this Peetu entry?')">
                                         <input type="hidden" name="action" value="delete">
-                                        <input type="hidden" name="id" value="<?php echo $material['id']; ?>">
+                                        <input type="hidden" name="id" value="<?php echo (int)$material['id']; ?>">
                                         <button type="submit" class="text-red-600 hover:text-red-900">
                                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
@@ -341,11 +401,11 @@ $bom_stats = [
                         </div>
                         <?php endforeach; ?>
                     </div>
-                    
+
                     <div class="mt-4 pt-4 border-t">
                         <div class="flex justify-between text-sm">
                             <span class="text-gray-600">Total Materials:</span>
-                            <span class="font-medium"><?php echo $item_bom['total_materials']; ?> items</span>
+                            <span class="font-medium"><?php echo (int)$item_bom['total_materials']; ?> items</span>
                         </div>
                     </div>
                 </div>
@@ -357,64 +417,82 @@ $bom_stats = [
             <svg class="w-12 h-12 mx-auto text-gray-400 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
             </svg>
-            <h3 class="text-lg font-medium text-gray-900 mb-2">No BOMs found</h3>
-            <p class="text-gray-600 mb-4">Get started by creating your first Bill of Materials.</p>
-            <button onclick="openModal('createBomModal')" class="bg-primary text-white px-4 py-2 rounded-md hover:bg-blue-600 transition-colors">
-                Create BOM
+            <h3 class="text-lg font-medium text-gray-900 mb-2">No Peetu entries found</h3>
+            <p class="text-gray-600 mb-4">Create your first mapping from Semi-Finished (Peetu) to Raw Materials.</p>
+            <button onclick="openCreatePeetu()" class="bg-primary text-white px-4 py-2 rounded-md hover:bg-blue-600 transition-colors">
+                Add Peetu Entry
             </button>
         </div>
     <?php endif; ?>
 </div>
 
-<!-- Create BOM Modal -->
+<!-- Create Peetu Modal (keeps same id to avoid breaking existing JS) -->
 <div id="createBomModal" class="fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full modal-backdrop hidden">
-    <div class="relative top-20 mx-auto p-5 border w-96 shadow-lg rounded-md bg-white">
+    <div class="relative top-20 mx-auto p-5 border w-[40rem] max-w-[95vw] shadow-lg rounded-md bg-white">
         <div class="flex justify-between items-center mb-4">
-            <h3 class="text-lg font-bold text-gray-900">Add BOM Entry</h3>
+            <h3 class="text-lg font-bold text-gray-900">Add Peetu Entry</h3>
             <button onclick="closeModal('createBomModal')" class="text-gray-400 hover:text-gray-600">
                 <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
                 </svg>
             </button>
         </div>
-        <form method="POST" class="space-y-4">
-            <input type="hidden" name="action" value="create">
+
+        <form method="POST" class="space-y-4" onsubmit="return validatePeetuForm()">
+            <input type="hidden" name="action" value="create_peetu">
+
+            <!-- Semi-Finished (Peetu) -->
             <div>
-                <label class="block text-sm font-medium text-gray-700 mb-1">Finished Item</label>
-                <select name="item_id" id="create_item_id" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent">
-                    <option value="">Select Finished Item</option>
-                    <?php foreach ($finished_items as $item): ?>
-                        <option value="<?php echo $item['id']; ?>"><?php echo htmlspecialchars($item['name'] . ' (' . $item['code'] . ')'); ?></option>
+                <label class="block text-sm font-medium text-gray-700 mb-1">Semi-Finished (Peetu)</label>
+                <select name="peetu_item_id" id="create_peetu_item_id" required
+                        class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent">
+                    <option value="">Select Semi-Finished Item</option>
+                    <?php foreach ($semi_finished_items as $item): ?>
+                        <option value="<?php echo $item['id']; ?>">
+                            <?php echo htmlspecialchars($item['name'] . ' (' . $item['code'] . ')'); ?>
+                        </option>
                     <?php endforeach; ?>
                 </select>
             </div>
+
+            <!-- Multiple raw rows -->
             <div>
-                <label class="block text-sm font-medium text-gray-700 mb-1">Raw Material</label>
-                <select name="raw_material_id" id="create_raw_material_id" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent" onchange="updateMaterialInfo(this)">
-                    <option value="">Select Raw Material</option>
-                    <?php foreach ($raw_materials as $material): ?>
-                        <option value="<?php echo $material['id']; ?>" data-stock="<?php echo $material['current_stock']; ?>" data-unit="<?php echo $material['symbol']; ?>"><?php echo htmlspecialchars($material['name'] . ' (' . $material['code'] . ') - ' . $material['symbol']); ?></option>
-                    <?php endforeach; ?>
-                </select>
-                <p class="text-xs text-gray-500 mt-1" id="material_info"></p>
+                <div class="flex justify-between items-center mb-2">
+                    <label class="block text-sm font-medium text-gray-700">Raw Materials & Quantity (per 1 Peetu)</label>
+                    <button type="button" onclick="addRawRow()" class="bg-green-600 text-white px-2 py-1 rounded text-sm hover:bg-green-700">
+                        + Add Row
+                    </button>
+                </div>
+
+                <div class="overflow-x-auto">
+                    <table class="min-w-full border border-gray-300" id="peetuRawTable">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase border">Raw Material</th>
+                                <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase border">Qty</th>
+                                <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase border">Unit</th>
+                                <th class="px-3 py-2 text-center text-xs font-medium text-gray-500 uppercase border">Action</th>
+                            </tr>
+                        </thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+                <p class="text-xs text-gray-500 mt-1">Tip: add as many raw materials as needed for one unit of the selected Peetu.</p>
             </div>
-            <div>
-                <label class="block text-sm font-medium text-gray-700 mb-1">Quantity Required</label>
-                <input type="number" name="quantity" step="0.001" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent" placeholder="0.000">
-            </div>
-            <div class="flex justify-end space-x-3 pt-4">
+
+            <div class="flex justify-end space-x-3 pt-2">
                 <button type="button" onclick="closeModal('createBomModal')" class="px-4 py-2 border border-gray-300 rounded-md text-gray-700 hover:bg-gray-50">Cancel</button>
-                <button type="submit" class="px-4 py-2 bg-primary text-white rounded-md hover:bg-blue-600">Add BOM Entry</button>
+                <button type="submit" class="px-4 py-2 bg-primary text-white rounded-md hover:bg-blue-600">Save</button>
             </div>
         </form>
     </div>
 </div>
 
-<!-- Edit BOM Modal -->
+<!-- Edit Peetu Modal -->
 <div id="editBomModal" class="fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full modal-backdrop hidden">
     <div class="relative top-20 mx-auto p-5 border w-96 shadow-lg rounded-md bg-white">
         <div class="flex justify-between items-center mb-4">
-            <h3 class="text-lg font-bold text-gray-900">Edit BOM Entry</h3>
+            <h3 class="text-lg font-bold text-gray-900">Edit Peetu Entry</h3>
             <button onclick="closeModal('editBomModal')" class="text-gray-400 hover:text-gray-600">
                 <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
@@ -425,7 +503,7 @@ $bom_stats = [
             <input type="hidden" name="action" value="update">
             <input type="hidden" name="id" id="edit_bom_id">
             <div>
-                <label class="block text-sm font-medium text-gray-700 mb-1">Finished Item</label>
+                <label class="block text-sm font-medium text-gray-700 mb-1">Peetu (Semi-Finished)</label>
                 <input type="text" id="edit_finished_item" class="w-full px-3 py-2 border border-gray-300 rounded-md bg-gray-100" readonly>
             </div>
             <div>
@@ -433,7 +511,7 @@ $bom_stats = [
                 <input type="text" id="edit_raw_material" class="w-full px-3 py-2 border border-gray-300 rounded-md bg-gray-100" readonly>
             </div>
             <div>
-                <label class="block text-sm font-medium text-gray-700 mb-1">Quantity Required</label>
+                <label class="block text-sm font-medium text-gray-700 mb-1">Quantity (per 1 Peetu)</label>
                 <input type="number" name="quantity" step="0.001" id="edit_quantity" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent">
             </div>
             <div class="flex justify-end space-x-3 pt-4">
@@ -444,11 +522,11 @@ $bom_stats = [
     </div>
 </div>
 
-<!-- Copy BOM Modal -->
+<!-- Copy Peetu Modal -->
 <div id="copyBomModal" class="fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full modal-backdrop hidden">
     <div class="relative top-20 mx-auto p-5 border w-96 shadow-lg rounded-md bg-white">
         <div class="flex justify-between items-center mb-4">
-            <h3 class="text-lg font-bold text-gray-900">Copy BOM</h3>
+            <h3 class="text-lg font-bold text-gray-900">Copy Peetu Map</h3>
             <button onclick="closeModal('copyBomModal')" class="text-gray-400 hover:text-gray-600">
                 <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
@@ -458,54 +536,51 @@ $bom_stats = [
         <form method="POST" class="space-y-4">
             <input type="hidden" name="action" value="copy_bom">
             <div>
-                <label class="block text-sm font-medium text-gray-700 mb-1">Source Item (Copy From)</label>
+                <label class="block text-sm font-medium text-gray-700 mb-1">Source Peetu (Copy From)</label>
                 <select name="source_item_id" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent">
-                    <option value="">Select Source Item</option>
-                    <?php foreach ($finished_items as $item): ?>
+                    <option value="">Select Semi-Finished Item</option>
+                    <?php foreach ($semi_finished_items as $item): ?>
                         <option value="<?php echo $item['id']; ?>"><?php echo htmlspecialchars($item['name'] . ' (' . $item['code'] . ')'); ?></option>
                     <?php endforeach; ?>
                 </select>
             </div>
             <div>
-                <label class="block text-sm font-medium text-gray-700 mb-1">Target Item (Copy To)</label>
+                <label class="block text-sm font-medium text-gray-700 mb-1">Target Peetu (Copy To)</label>
                 <select name="target_item_id" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent">
-                    <option value="">Select Target Item</option>
-                    <?php foreach ($finished_items as $item): ?>
+                    <option value="">Select Semi-Finished Item</option>
+                    <?php foreach ($semi_finished_items as $item): ?>
                         <option value="<?php echo $item['id']; ?>"><?php echo htmlspecialchars($item['name'] . ' (' . $item['code'] . ')'); ?></option>
                     <?php endforeach; ?>
                 </select>
             </div>
             <div class="bg-blue-50 border border-blue-200 rounded-md p-3">
                 <p class="text-sm text-blue-800">
-                    <strong>Note:</strong> This will copy all BOM entries from the source item to the target item. Existing entries will be skipped.
+                    <strong>Note:</strong> Copies all raw entries from source to target. Existing pairs will be updated with the source quantity.
                 </p>
             </div>
             <div class="flex justify-end space-x-3 pt-4">
                 <button type="button" onclick="closeModal('copyBomModal')" class="px-4 py-2 border border-gray-300 rounded-md text-gray-700 hover:bg-gray-50">Cancel</button>
-                <button type="submit" class="px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700">Copy BOM</button>
+                <button type="submit" class="px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700">Copy</button>
             </div>
         </form>
     </div>
 </div>
 
-<!-- BOM Details Modal -->
+<!-- Existing Detail/Cost modals (optional UI placeholders) -->
 <div id="bomDetailsModal" class="fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full modal-backdrop hidden">
     <div class="relative top-10 mx-auto p-5 border w-5/6 max-w-4xl shadow-lg rounded-md bg-white">
         <div class="flex justify-between items-center mb-4">
-            <h3 class="text-lg font-bold text-gray-900">BOM Details</h3>
+            <h3 class="text-lg font-bold text-gray-900">Peetu Details</h3>
             <button onclick="closeModal('bomDetailsModal')" class="text-gray-400 hover:text-gray-600">
                 <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
                 </svg>
             </button>
         </div>
-        <div id="bomDetailsContent">
-            <!-- Content will be loaded dynamically -->
-        </div>
+        <div id="bomDetailsContent"></div>
     </div>
 </div>
 
-<!-- Cost Calculation Modal -->
 <div id="costCalculationModal" class="fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full modal-backdrop hidden">
     <div class="relative top-20 mx-auto p-5 border w-96 shadow-lg rounded-md bg-white">
         <div class="flex justify-between items-center mb-4">
@@ -516,169 +591,107 @@ $bom_stats = [
                 </svg>
             </button>
         </div>
-        <div id="costCalculationContent">
-            <!-- Content will be loaded dynamically -->
-        </div>
+        <div id="costCalculationContent"></div>
     </div>
 </div>
 
 <script>
-function addBomMaterial(itemId) {
-    document.getElementById('create_item_id').value = itemId;
-    
-    // Reset other fields
-    document.getElementById('create_raw_material_id').value = '';
-    document.getElementById('material_info').textContent = '';
-    
+// ---------- Add Peetu (multiple raws) ----------
+const RAWS = <?php echo json_encode($raw_materials ?? []); ?>;
+
+function rawSelectHTML() {
+    let opts = '<option value="">Select Raw Material</option>';
+    RAWS.forEach(r => {
+        const label = `${r.name || ''} (${r.code || ''}) - ${r.symbol || ''}`;
+        opts += `<option value="${r.id}" data-unit="${r.symbol||''}">${escapeHtml(label)}</option>`;
+    });
+    return `
+        <select name="raw_material_id[]" class="w-full px-2 py-1 border border-gray-300 rounded text-sm raw-select" onchange="syncRowUnit(this)" required>
+            ${opts}
+        </select>
+    `;
+}
+
+function addRawRow() {
+    const tb = document.querySelector('#peetuRawTable tbody');
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+        <td class="px-3 py-2 border">${rawSelectHTML()}</td>
+        <td class="px-3 py-2 border">
+            <input type="number" name="quantity[]" step="0.001" class="w-full px-2 py-1 border border-gray-300 rounded text-sm" placeholder="0.000" required>
+        </td>
+        <td class="px-3 py-2 border">
+            <span class="inline-block text-xs text-gray-600 unit-badge"></span>
+        </td>
+        <td class="px-3 py-2 border text-center">
+            <button type="button" class="text-red-600 hover:text-red-800 text-sm" onclick="removeRawRow(this)">Remove</button>
+        </td>
+    `;
+    tb.appendChild(tr);
+}
+
+function removeRawRow(btn) {
+    const tb = document.querySelector('#peetuRawTable tbody');
+    if (tb.children.length <= 1) {
+        alert('At least one row is required.');
+        return;
+    }
+    btn.closest('tr').remove();
+}
+
+function syncRowUnit(select) {
+    const unit = select.options[select.selectedIndex]?.getAttribute('data-unit') || '';
+    const row = select.closest('tr');
+    row.querySelector('.unit-badge').textContent = unit;
+}
+
+function validatePeetuForm() {
+    const peetu = document.getElementById('create_peetu_item_id').value;
+    if (!peetu) { alert('Please select a Semi-Finished (Peetu) item.'); return false; }
+
+    const raws = document.querySelectorAll('#peetuRawTable tbody tr');
+    if (!raws.length) { alert('Please add at least one raw material row.'); return false; }
+
+    let ok = true;
+    raws.forEach(r => {
+        const sel = r.querySelector('.raw-select');
+        const qty = r.querySelector('input[name="quantity[]"]');
+        if (!sel.value || !qty.value || parseFloat(qty.value) <= 0) ok = false;
+    });
+    if (!ok) { alert('Each row must have a raw material and a positive quantity.'); }
+    return ok;
+}
+
+// Wrapper to always open modal with one fresh row
+function openCreatePeetu() {
+    document.getElementById('create_peetu_item_id').value = '';
+    const tb = document.querySelector('#peetuRawTable tbody');
+    tb.innerHTML = '';
+    addRawRow();
     openModal('createBomModal');
 }
 
-function editBom(bom) {
-    document.getElementById('edit_bom_id').value = bom.id;
-    document.getElementById('edit_finished_item').value = bom.finished_item_name + ' (' + bom.finished_item_code + ')';
-    document.getElementById('edit_raw_material').value = bom.raw_material_name + ' (' + bom.raw_material_code + ')';
-    document.getElementById('edit_quantity').value = bom.quantity;
+// ---------- Reuse existing functions (kept names) ----------
+function addBomMaterial(itemId) {
+    // Pre-select peetu and show modal
+    document.getElementById('create_peetu_item_id').value = itemId;
+    // Reset rows
+    const tb = document.querySelector('#peetuRawTable tbody');
+    tb.innerHTML = '';
+    addRawRow();
+    openModal('createBomModal');
+}
+
+function editBom(row) {
+    document.getElementById('edit_bom_id').value = row.id;
+    document.getElementById('edit_finished_item').value = (row.peetu_name || '') + ' (' + (row.peetu_code || '') + ')';
+    document.getElementById('edit_raw_material').value = (row.raw_material_name || '') + ' (' + (row.raw_material_code || '') + ')';
+    document.getElementById('edit_quantity').value = row.quantity;
     openModal('editBomModal');
 }
 
-function updateMaterialInfo(select) {
-    const selectedOption = select.options[select.selectedIndex];
-    const stock = selectedOption.getAttribute('data-stock') || '0';
-    const unit = selectedOption.getAttribute('data-unit') || '';
-    const infoElement = document.getElementById('material_info');
-    
-    if (selectedOption.value) {
-        infoElement.textContent = `Available Stock: ${parseFloat(stock).toFixed(3)} ${unit}`;
-        infoElement.className = parseFloat(stock) > 0 ? 'text-xs text-green-600 mt-1' : 'text-xs text-red-600 mt-1';
-    } else {
-        infoElement.textContent = '';
-        infoElement.className = 'text-xs text-gray-500 mt-1';
-    }
-}
-
-function viewBomDetails(itemId) {
-    // Show loading message
-    document.getElementById('bomDetailsContent').innerHTML = `
-        <div class="text-center py-8">
-            <div class="inline-block animate-spin rounded-full h-8 w-8 border-b-2 border-primary"></div>
-            <p class="mt-2 text-gray-600">Loading BOM details...</p>
-        </div>
-    `;
-    openModal('bomDetailsModal');
-    
-    // Fetch BOM details via AJAX (simulated)
-    setTimeout(() => {
-        fetchBomDetails(itemId);
-    }, 500);
-}
-
-function fetchBomDetails(itemId) {
-    // In a real implementation, this would be an AJAX call
-    // For now, we'll simulate the response
-    const bomData = {
-        item_name: "Sample Item",
-        item_code: "ITEM001",
-        materials: [
-            {name: "Raw Material 1", code: "RM001", quantity: 0.500, unit: "kg", available: 100.000, cost: 50.00},
-            {name: "Raw Material 2", code: "RM002", quantity: 0.250, unit: "kg", available: 50.000, cost: 80.00}
-        ]
-    };
-    
-    let materialsHtml = '';
-    let totalCost = 0;
-    
-    bomData.materials.forEach(material => {
-        const itemCost = material.quantity * material.cost;
-        totalCost += itemCost;
-        const canProduce = material.available >= material.quantity;
-        
-        materialsHtml += `
-            <tr class="${canProduce ? '' : 'bg-red-50'}">
-                <td class="px-4 py-2 border">
-                    <div>
-                        <div class="font-medium">${material.name}</div>
-                        <div class="text-sm text-gray-500">${material.code}</div>
-                    </div>
-                </td>
-                <td class="px-4 py-2 border text-right">${material.quantity.toFixed(3)} ${material.unit}</td>
-                <td class="px-4 py-2 border text-right ${canProduce ? 'text-green-600' : 'text-red-600'}">${material.available.toFixed(3)} ${material.unit}</td>
-                <td class="px-4 py-2 border text-right">රු.${material.cost.toFixed(2)}</td>
-                <td class="px-4 py-2 border text-right">රු.${itemCost.toFixed(2)}</td>
-                <td class="px-4 py-2 border text-center">
-                    <span class="px-2 py-1 text-xs rounded ${canProduce ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'}">
-                        ${canProduce ? 'Available' : 'Shortage'}
-                    </span>
-                </td>
-            </tr>
-        `;
-    });
-    
-    document.getElementById('bomDetailsContent').innerHTML = `
-        <div class="space-y-6">
-            <!-- Item Header -->
-            <div class="bg-gray-50 rounded-lg p-4">
-                <h4 class="text-lg font-semibold text-gray-900">${bomData.item_name}</h4>
-                <p class="text-sm text-gray-600">${bomData.item_code}</p>
-            </div>
-            
-            <!-- Materials Table -->
-            <div>
-                <h5 class="font-medium text-gray-900 mb-3">Material Requirements</h5>
-                <div class="overflow-x-auto">
-                    <table class="min-w-full border border-gray-300">
-                        <thead class="bg-gray-50">
-                            <tr>
-                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase border">Material</th>
-                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase border">Required</th>
-                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase border">Available</th>
-                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase border">Unit Cost</th>
-                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase border">Total Cost</th>
-                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase border">Status</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            ${materialsHtml}
-                        </tbody>
-                        <tfoot class="bg-gray-50">
-                            <tr>
-                                <td colspan="4" class="px-4 py-2 text-right font-medium border">Total Cost:</td>
-                                <td class="px-4 py-2 text-right font-bold border">රු.${totalCost.toFixed(2)}</td>
-                                <td class="px-4 py-2 border"></td>
-                            </tr>
-                        </tfoot>
-                    </table>
-                </div>
-            </div>
-            
-            <!-- Production Analysis -->
-            <div class="grid grid-cols-2 gap-4">
-                <div class="bg-blue-50 border border-blue-200 rounded-md p-4">
-                    <h6 class="font-medium text-blue-900 mb-2">Production Capacity</h6>
-                    <p class="text-sm text-blue-800">Based on current stock, you can produce:</p>
-                    <p class="text-lg font-bold text-blue-900">50 units</p>
-                </div>
-                <div class="bg-purple-50 border border-purple-200 rounded-md p-4">
-                    <h6 class="font-medium text-purple-900 mb-2">Cost per Unit</h6>
-                    <p class="text-sm text-purple-800">Raw material cost:</p>
-                    <p class="text-lg font-bold text-purple-900">රු.${totalCost.toFixed(2)}</p>
-                </div>
-            </div>
-            
-            <!-- Actions -->
-            <div class="flex justify-end space-x-3">
-                <button onclick="exportBom(${itemId})" class="px-4 py-2 bg-gray-100 text-gray-700 rounded-md hover:bg-gray-200">
-                    Export BOM
-                </button>
-                <button onclick="closeModal('bomDetailsModal')" class="px-4 py-2 bg-primary text-white rounded-md hover:bg-blue-600">
-                    Close
-                </button>
-            </div>
-        </div>
-    `;
-}
-
+// Optional demo cost popup (client-side placeholder)
 function calculateItemCost(itemId) {
-    // Show loading message
     document.getElementById('costCalculationContent').innerHTML = `
         <div class="text-center py-4">
             <div class="inline-block animate-spin rounded-full h-6 w-6 border-b-2 border-primary"></div>
@@ -686,68 +699,38 @@ function calculateItemCost(itemId) {
         </div>
     `;
     openModal('costCalculationModal');
-    
-    // Simulate cost calculation
+
     setTimeout(() => {
-        const costData = {
-            material_cost: 125.50,
-            labor_cost: 25.00,
-            overhead_cost: 15.75,
-            total_cost: 166.25,
-            suggested_price: 199.50
-        };
-        
+        // Placeholder values; wire to POST action=calculate_cost for live data.
+        const material = 100.00, labor = 20.00, overhead = 10.00;
+        const total = material + labor + overhead;
+        const suggested = total * 1.2;
         document.getElementById('costCalculationContent').innerHTML = `
             <div class="space-y-4">
                 <div class="space-y-3">
-                    <div class="flex justify-between">
-                        <span class="text-gray-600">Raw Materials:</span>
-                        <span class="font-medium">රු.${costData.material_cost.toFixed(2)}</span>
-                    </div>
-                    <div class="flex justify-between">
-                        <span class="text-gray-600">Labor Cost (Est.):</span>
-                        <span class="font-medium">රු.${costData.labor_cost.toFixed(2)}</span>
-                    </div>
-                    <div class="flex justify-between">
-                        <span class="text-gray-600">Overhead (Est.):</span>
-                        <span class="font-medium">රු.${costData.overhead_cost.toFixed(2)}</span>
-                    </div>
+                    <div class="flex justify-between"><span class="text-gray-600">Raw Materials:</span><span class="font-medium">රු.${material.toFixed(2)}</span></div>
+                    <div class="flex justify-between"><span class="text-gray-600">Labor (Est.):</span><span class="font-medium">රු.${labor.toFixed(2)}</span></div>
+                    <div class="flex justify-between"><span class="text-gray-600">Overhead (Est.):</span><span class="font-medium">රු.${overhead.toFixed(2)}</span></div>
                     <hr>
-                    <div class="flex justify-between text-lg">
-                        <span class="font-semibold">Total Cost:</span>
-                        <span class="font-bold text-green-600">රු.${costData.total_cost.toFixed(2)}</span>
-                    </div>
-                    <div class="flex justify-between">
-                        <span class="text-gray-600">Suggested Price (20% margin):</span>
-                        <span class="font-medium text-blue-600">රු.${costData.suggested_price.toFixed(2)}</span>
-                    </div>
+                    <div class="flex justify-between text-lg"><span class="font-semibold">Total Cost:</span><span class="font-bold text-green-600">රු.${total.toFixed(2)}</span></div>
+                    <div class="flex justify-between"><span class="text-gray-600">Suggested Price (20% margin):</span><span class="font-medium text-blue-600">රු.${suggested.toFixed(2)}</span></div>
                 </div>
-                
                 <div class="bg-yellow-50 border border-yellow-200 rounded-md p-3">
-                    <p class="text-xs text-yellow-800">
-                        <strong>Note:</strong> Labor and overhead costs are estimated. Update these values in settings for accurate calculations.
-                    </p>
+                    <p class="text-xs text-yellow-800"><strong>Note:</strong> Labor & overhead are placeholders. Use server calc (action=calculate_cost) for exact raw costs from GRN.</p>
                 </div>
-                
-                <div class="flex justify-end">
-                    <button onclick="closeModal('costCalculationModal')" class="px-4 py-2 bg-primary text-white rounded-md hover:bg-blue-600">
-                        Close
-                    </button>
-                </div>
+                <div class="flex justify-end"><button onclick="closeModal('costCalculationModal')" class="px-4 py-2 bg-primary text-white rounded-md hover:bg-blue-600">Close</button></div>
             </div>
         `;
-    }, 1000);
+    }, 500);
 }
 
-function exportBom(itemId) {
-    // Open export window
-    window.open(`exports/export_bom.php?id=${itemId}`, '_blank');
-}
+// Small utilities
+function escapeHtml(s){return String(s).replace(/[&<>"']/g,m=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[m]));}
 
-// Initialize tooltips and other functionality
-document.addEventListener('DOMContentLoaded', function() {
-    // Add any initialization code here
-    console.log('BOM page loaded successfully');
+// Ensure the create modal always has at least one row when the page loads (first use)
+document.addEventListener('DOMContentLoaded', function () {
+    const tb = document.querySelector('#peetuRawTable tbody');
+    if (tb && !tb.children.length) addRawRow();
 });
 </script>
 
