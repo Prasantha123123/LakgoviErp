@@ -67,6 +67,23 @@ try {
     $error = "Error loading BOM Product yields: ".$e->getMessage();
 }
 
+// Direct BOM items (finished items that can be made directly from raw materials)
+$direct_bom_items = [];
+try {
+    $stmt = $db->query("
+        SELECT DISTINCT bd.finished_item_id
+        FROM bom_direct bd
+        JOIN items i ON i.id = bd.finished_item_id AND i.type = 'finished'
+    ");
+    $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    foreach ($rows as $row) {
+        $direct_bom_items[] = (int)$row['finished_item_id'];
+    }
+} catch(PDOException $e) {
+    $direct_bom_items = [];
+    $error = "Error loading Direct BOM items: ".$e->getMessage();
+}
+
 // Production locations
 try {
     $stmt = $db->query("SELECT id, name FROM locations WHERE type='production' ORDER BY name");
@@ -109,54 +126,97 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                 $peetu_qty = null;
 
                 if ($item_type === 'finished') {
-                    // From UI
-                    $peetu_item_id = as_int($_POST['peetu_item_id'] ?? 0);
-                    $peetu_qty     = as_float($_POST['peetu_qty'] ?? 0);
-                    if ($peetu_item_id<=0 || $peetu_qty<=0) {
-                        throw new Exception("Please select a Peetu and enter Peetu quantity.");
-                    }
-                    // find yield
-                    $units_per_peetu = null;
-                    foreach ($bom_yield[$item_id] ?? [] as $opt) {
-                        if ((int)$opt['peetu_id'] === $peetu_item_id) {
-                            $units_per_peetu = (float)$opt['units_per_peetu'];
-                            break;
-                        }
-                    }
-                    if ($units_per_peetu===null) {
-                        throw new Exception("No BOM Product yield configured for this finished → peetu pair.");
-                    }
-                    $planned_qty = $peetu_qty * $units_per_peetu; // finished units
-
-                    // Validate RAW availability to make that many Peetu
-                    //   Need: sum(raw per 1 peetu) * peetu_qty  (from bom_peetu)
-                    $stmt = $db->prepare("
-                        SELECT bp.raw_material_id, bp.quantity AS per_peetu_qty, i.name AS raw_name
-                        FROM bom_peetu bp
-                        JOIN items i ON i.id = bp.raw_material_id
-                        WHERE bp.peetu_item_id = ?
-                    ");
-                    $stmt->execute([$peetu_item_id]);
-                    $raws = $stmt->fetchAll(PDO::FETCH_ASSOC);
-                    if (empty($raws)) {
-                        throw new Exception("No Peetu recipe found (bom_peetu) for the selected Peetu.");
-                    }
-
-                    foreach ($raws as $rw) {
-                        $req = (float)$rw['per_peetu_qty'] * $peetu_qty;
-
-                        $s = $db->prepare("
-                            SELECT COALESCE(SUM(quantity_in - quantity_out),0)
-                            FROM stock_ledger
-                            WHERE item_id=? AND location_id=?
+                    // Check if this finished item has direct BOM first
+                    $stmt = $db->prepare("SELECT COUNT(*) FROM bom_direct WHERE finished_item_id = ?");
+                    $stmt->execute([$item_id]);
+                    $has_direct_bom = (int)$stmt->fetchColumn() > 0;
+                    
+                    if ($has_direct_bom) {
+                        // Direct BOM: finished product made directly from raw materials
+                        $planned_qty = as_float($_POST['planned_qty'] ?? 0);
+                        if ($planned_qty <= 0) throw new Exception("Planned quantity must be greater than 0");
+                        
+                        // Validate RAW availability for direct production
+                        $stmt = $db->prepare("
+                            SELECT bd.raw_material_id, bd.quantity AS per_unit_qty, bd.finished_unit_qty, i.name AS raw_name
+                            FROM bom_direct bd
+                            JOIN items i ON i.id = bd.raw_material_id
+                            WHERE bd.finished_item_id = ?
                         ");
-                        $s->execute([(int)$rw['raw_material_id'], $location_id]);
-                        $have = (float)$s->fetchColumn();
+                        $stmt->execute([$item_id]);
+                        $raws = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                        if (empty($raws)) throw new Exception("No direct BOM recipe found for this finished item.");
 
-                        if ($have + 1e-9 < $req) {
-                            $need = number_format($req, 3);
-                            $haveStr = number_format($have, 3);
-                            throw new Exception("Insufficient RAW: {$rw['raw_name']}. Need {$need}, have {$haveStr}");
+                        foreach ($raws as $rw) {
+                            // Calculate required raw material based on finished unit quantity and planned quantity
+                            $finished_unit_qty = (float)$rw['finished_unit_qty'];
+                            $units_to_produce = $planned_qty / $finished_unit_qty; // How many units we're making
+                            $req = (float)$rw['per_unit_qty'] * $units_to_produce;
+                            
+                            $s = $db->prepare("
+                                SELECT COALESCE(SUM(quantity_in - quantity_out),0)
+                                FROM stock_ledger
+                                WHERE item_id=? AND location_id=?
+                            ");
+                            $s->execute([(int)$rw['raw_material_id'], $location_id]);
+                            $have = (float)$s->fetchColumn();
+                            if ($have + 1e-9 < $req) {
+                                $need = number_format($req, 3);
+                                $haveStr = number_format($have, 3);
+                                throw new Exception("Insufficient RAW: {$rw['raw_name']}. Need {$need}, have {$haveStr}");
+                            }
+                        }
+                    } else {
+                        // Traditional Peetu-based production
+                        // From UI
+                        $peetu_item_id = as_int($_POST['peetu_item_id'] ?? 0);
+                        $peetu_qty     = as_float($_POST['peetu_qty'] ?? 0);
+                        if ($peetu_item_id<=0 || $peetu_qty<=0) {
+                            throw new Exception("Please select a Peetu and enter Peetu quantity, or create a Direct BOM for this item.");
+                        }
+                        // find yield
+                        $units_per_peetu = null;
+                        foreach ($bom_yield[$item_id] ?? [] as $opt) {
+                            if ((int)$opt['peetu_id'] === $peetu_item_id) {
+                                $units_per_peetu = (float)$opt['units_per_peetu'];
+                                break;
+                            }
+                        }
+                        if ($units_per_peetu===null) {
+                            throw new Exception("No BOM Product yield configured for this finished → peetu pair.");
+                        }
+                        $planned_qty = $peetu_qty * $units_per_peetu; // finished units
+
+                        // Validate RAW availability to make that many Peetu
+                        //   Need: sum(raw per 1 peetu) * peetu_qty  (from bom_peetu)
+                        $stmt = $db->prepare("
+                            SELECT bp.raw_material_id, bp.quantity AS per_peetu_qty, i.name AS raw_name
+                            FROM bom_peetu bp
+                            JOIN items i ON i.id = bp.raw_material_id
+                            WHERE bp.peetu_item_id = ?
+                        ");
+                        $stmt->execute([$peetu_item_id]);
+                        $raws = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                        if (empty($raws)) {
+                            throw new Exception("No Peetu recipe found (bom_peetu) for the selected Peetu.");
+                        }
+
+                        foreach ($raws as $rw) {
+                            $req = (float)$rw['per_peetu_qty'] * $peetu_qty;
+
+                            $s = $db->prepare("
+                                SELECT COALESCE(SUM(quantity_in - quantity_out),0)
+                                FROM stock_ledger
+                                WHERE item_id=? AND location_id=?
+                            ");
+                            $s->execute([(int)$rw['raw_material_id'], $location_id]);
+                            $have = (float)$s->fetchColumn();
+
+                            if ($have + 1e-9 < $req) {
+                                $need = number_format($req, 3);
+                                $haveStr = number_format($have, 3);
+                                throw new Exception("Insufficient RAW: {$rw['raw_name']}. Need {$need}, have {$haveStr}");
+                            }
                         }
                     }
                 } else {
@@ -256,43 +316,69 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
 
                 $components = []; // array of [raw_id, raw_name, qty]
                 if ($prod['item_type']==='finished') {
-                    // get units_per_peetu for the chosen peetu on this batch
-                    $peetu_id = (int)$prod['peetu_item_id'];
-                    if ($peetu_id<=0) {
-                        // try infer if single mapping exists
-                        $stmt = $db->prepare("SELECT COUNT(*) FROM bom_product WHERE finished_item_id=?");
-                        $stmt->execute([(int)$prod['item_id']]);
-                        $cnt = (int)$stmt->fetchColumn();
-                        if ($cnt!==1) throw new Exception("Batch missing Peetu selection; cannot complete.");
-                        $stmt = $db->prepare("SELECT peetu_item_id FROM bom_product WHERE finished_item_id=?");
-                        $stmt->execute([(int)$prod['item_id']]);
-                        $peetu_id = (int)$stmt->fetchColumn();
-                    }
-
-                    $stmt = $db->prepare("SELECT quantity FROM bom_product WHERE finished_item_id=? AND peetu_item_id=?");
-                    $stmt->execute([(int)$prod['item_id'], $peetu_id]);
-                    $units_per_peetu = (float)$stmt->fetchColumn();
-                    if ($units_per_peetu<=0) throw new Exception("Invalid yield for finished → peetu.");
-
-                    $actual_peetu_qty = $actual_qty / $units_per_peetu;
-
-                    // RAW per peetu
+                    // Check if this finished item has direct BOM (raw materials) first
                     $stmt = $db->prepare("
-                        SELECT bp.raw_material_id, bp.quantity AS per_peetu_qty, i.name AS raw_name
-                        FROM bom_peetu bp
-                        JOIN items i ON i.id = bp.raw_material_id
-                        WHERE bp.peetu_item_id = ?
+                        SELECT bd.raw_material_id, bd.quantity AS per_unit_qty, bd.finished_unit_qty, i.name AS raw_name
+                        FROM bom_direct bd
+                        JOIN items i ON i.id = bd.raw_material_id
+                        WHERE bd.finished_item_id = ?
                     ");
-                    $stmt->execute([$peetu_id]);
-                    $raws = $stmt->fetchAll(PDO::FETCH_ASSOC);
-                    if (empty($raws)) throw new Exception("No Peetu recipe found (bom_peetu).");
+                    $stmt->execute([(int)$prod['item_id']]);
+                    $direct_raws = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                    
+                    if (!empty($direct_raws)) {
+                        // Direct BOM: finished item made directly from raw materials
+                        foreach ($direct_raws as $rw) {
+                            // Calculate consumption based on finished unit quantity and actual production
+                            $finished_unit_qty = (float)$rw['finished_unit_qty'];
+                            $units_produced = $actual_qty / $finished_unit_qty; // How many units we produced
+                            $raw_consumed = (float)$rw['per_unit_qty'] * $units_produced;
+                            
+                            $components[] = [
+                                'raw_id'   => (int)$rw['raw_material_id'],
+                                'raw_name' => $rw['raw_name'],
+                                'qty'      => $raw_consumed
+                            ];
+                        }
+                    } else {
+                        // Traditional Peetu-based BOM
+                        $peetu_id = (int)$prod['peetu_item_id'];
+                        if ($peetu_id<=0) {
+                            // try infer if single mapping exists
+                            $stmt = $db->prepare("SELECT COUNT(*) FROM bom_product WHERE finished_item_id=?");
+                            $stmt->execute([(int)$prod['item_id']]);
+                            $cnt = (int)$stmt->fetchColumn();
+                            if ($cnt!==1) throw new Exception("No BOM recipe found. Please create either a Direct BOM or Peetu-based BOM for this item.");
+                            $stmt = $db->prepare("SELECT peetu_item_id FROM bom_product WHERE finished_item_id=?");
+                            $stmt->execute([(int)$prod['item_id']]);
+                            $peetu_id = (int)$stmt->fetchColumn();
+                        }
 
-                    foreach ($raws as $rw) {
-                        $components[] = [
-                            'raw_id'   => (int)$rw['raw_material_id'],
-                            'raw_name' => $rw['raw_name'],
-                            'qty'      => (float)$rw['per_peetu_qty'] * $actual_peetu_qty
-                        ];
+                        $stmt = $db->prepare("SELECT quantity FROM bom_product WHERE finished_item_id=? AND peetu_item_id=?");
+                        $stmt->execute([(int)$prod['item_id'], $peetu_id]);
+                        $units_per_peetu = (float)$stmt->fetchColumn();
+                        if ($units_per_peetu<=0) throw new Exception("Invalid yield for finished → peetu.");
+
+                        $actual_peetu_qty = $actual_qty / $units_per_peetu;
+
+                        // RAW per peetu
+                        $stmt = $db->prepare("
+                            SELECT bp.raw_material_id, bp.quantity AS per_peetu_qty, i.name AS raw_name
+                            FROM bom_peetu bp
+                            JOIN items i ON i.id = bp.raw_material_id
+                            WHERE bp.peetu_item_id = ?
+                        ");
+                        $stmt->execute([$peetu_id]);
+                        $raws = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                        if (empty($raws)) throw new Exception("No Peetu recipe found (bom_peetu).");
+
+                        foreach ($raws as $rw) {
+                            $components[] = [
+                                'raw_id'   => (int)$rw['raw_material_id'],
+                                'raw_name' => $rw['raw_name'],
+                                'qty'      => (float)$rw['per_peetu_qty'] * $actual_peetu_qty
+                            ];
+                        }
                     }
                 } else {
                     // semi_finished: RAW = per_peetu_raw * actual_qty
@@ -699,6 +785,8 @@ try {
 const UI_ITEMS = <?php echo json_encode($ui_items, JSON_HEX_TAG|JSON_HEX_APOS|JSON_HEX_QUOT|JSON_HEX_AMP); ?>;
 // map finished_id -> [{peetu_id, peetu_name, units_per_peetu}]
 const BOM_YIELD = <?php echo json_encode($bom_yield, JSON_HEX_TAG|JSON_HEX_APOS|JSON_HEX_QUOT|JSON_HEX_AMP); ?>;
+// array of finished item IDs that have Direct BOM (can be made without Peetu)
+const DIRECT_BOM_ITEMS = <?php echo json_encode($direct_bom_items, JSON_HEX_TAG|JSON_HEX_APOS|JSON_HEX_QUOT|JSON_HEX_AMP); ?>;
 
 function onItemChange(){
   const sel = document.getElementById('cp_item_id');
@@ -706,25 +794,37 @@ function onItemChange(){
   const unit = sel.options[sel.selectedIndex]?.getAttribute('data-unit') || '';
   const planned = document.getElementById('cp_planned_qty');
   const hint = document.getElementById('cp_planned_hint');
+  const fId = parseInt(sel.value,10);
 
   if (type === 'finished') {
-    // show peetu block & lock planned (computed)
-    document.getElementById('cp_peetu_block').classList.remove('hidden');
-    planned.readOnly = true;
-    planned.value = '';
-    hint.textContent = 'Planned qty = Peetu qty × (finished units per Peetu)';
-    // populate peetu list
-    const fId = parseInt(sel.value,10);
-    const list = BOM_YIELD[fId] || [];
-    const pSel = document.getElementById('cp_peetu_id');
-    pSel.innerHTML = '<option value="">Select Peetu</option>';
-    list.forEach(x=>{
-      const opt = document.createElement('option');
-      opt.value = x.peetu_id;
-      opt.textContent = `${x.peetu_name} (${x.peetu_code||''}) - ${x.units_per_peetu} ${unit}/Peetu`;
-      opt.setAttribute('data-units', x.units_per_peetu);
-      pSel.appendChild(opt);
-    });
+    // Check if this is a Direct BOM item
+    const isDirectBom = DIRECT_BOM_ITEMS.includes(fId);
+    
+    if (isDirectBom) {
+      // Direct BOM: hide Peetu block, allow manual planned qty
+      document.getElementById('cp_peetu_block').classList.add('hidden');
+      planned.readOnly = false;
+      planned.value = '';
+      hint.textContent = 'This item can be produced directly from raw materials';
+    } else {
+      // Traditional Peetu-based production
+      document.getElementById('cp_peetu_block').classList.remove('hidden');
+      planned.readOnly = true;
+      planned.value = '';
+      hint.textContent = 'Planned qty = Peetu qty × (finished units per Peetu)';
+      
+      // populate peetu list
+      const list = BOM_YIELD[fId] || [];
+      const pSel = document.getElementById('cp_peetu_id');
+      pSel.innerHTML = '<option value="">Select Peetu</option>';
+      list.forEach(x=>{
+        const opt = document.createElement('option');
+        opt.value = x.peetu_id;
+        opt.textContent = `${x.peetu_name} (${x.peetu_code||''}) - ${x.units_per_peetu} ${unit}/Peetu`;
+        opt.setAttribute('data-units', x.units_per_peetu);
+        pSel.appendChild(opt);
+      });
+    }
   } else {
     // semi-finished: hide peetu, allow manual planned qty
     document.getElementById('cp_peetu_block').classList.add('hidden');
@@ -744,13 +844,25 @@ function recalcPlannedFromPeetu(){
 function validateCreateForm(){
   const itemSel = document.getElementById('cp_item_id');
   const type = itemSel.options[itemSel.selectedIndex]?.getAttribute('data-type') || '';
+  const fId = parseInt(itemSel.value,10);
+  
   if (type === 'finished') {
-    if (!document.getElementById('cp_peetu_id').value) { alert('Select a Peetu.'); return false; }
-    if (!document.getElementById('cp_peetu_qty').value || parseFloat(document.getElementById('cp_peetu_qty').value)<=0) {
-      alert('Enter a Peetu quantity > 0'); return false;
-    }
-    if (!document.getElementById('cp_planned_qty').value) {
-      alert('Planned qty is not calculated.'); return false;
+    const isDirectBom = DIRECT_BOM_ITEMS.includes(fId);
+    
+    if (isDirectBom) {
+      // Direct BOM validation: only need planned quantity
+      if (!document.getElementById('cp_planned_qty').value || parseFloat(document.getElementById('cp_planned_qty').value)<=0) {
+        alert('Enter a planned quantity > 0'); return false;
+      }
+    } else {
+      // Traditional Peetu-based validation
+      if (!document.getElementById('cp_peetu_id').value) { alert('Select a Peetu.'); return false; }
+      if (!document.getElementById('cp_peetu_qty').value || parseFloat(document.getElementById('cp_peetu_qty').value)<=0) {
+        alert('Enter a Peetu quantity > 0'); return false;
+      }
+      if (!document.getElementById('cp_planned_qty').value) {
+        alert('Planned qty is not calculated.'); return false;
+      }
     }
   } else {
     if (!document.getElementById('cp_planned_qty').value || parseFloat(document.getElementById('cp_planned_qty').value)<=0) {

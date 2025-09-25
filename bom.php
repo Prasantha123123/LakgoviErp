@@ -217,6 +217,65 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                     $stmt->execute([$id]);
                     $success = "BOM Product entry deleted successfully!";
                     break;
+
+                /* ---------------------------
+                 *  Direct BOM (Finished → Raw Materials)
+                 * --------------------------- */
+
+                // Create direct BOM (finished product made directly from raw materials)
+                case 'create_direct_bom':
+                    $finished_item_id = as_int_or_zero($_POST['finished_item_id'] ?? 0);
+                    $finished_unit_qty = as_float_or_zero($_POST['finished_unit_qty'] ?? 1.0);
+                    $raw_ids = safe_arr($_POST['raw_material_id'] ?? []);
+                    $qtys = safe_arr($_POST['quantity'] ?? []);
+
+                    if ($finished_item_id <= 0) throw new Exception("Please select a Finished item.");
+                    if ($finished_unit_qty <= 0) throw new Exception("Please enter a valid unit quantity for the finished product.");
+                    if (empty($raw_ids)) throw new Exception("Please add at least one raw material row.");
+
+                    $db->beginTransaction();
+                    $added = 0;
+                    for ($i = 0; $i < count($raw_ids); $i++) {
+                        $rid = as_int_or_zero($raw_ids[$i] ?? 0);
+                        $q = as_float_or_zero($qtys[$i] ?? 0);
+                        if ($rid > 0 && $q > 0) {
+                            // Upsert by (finished_item_id, raw_material_id)
+                            $chk = $db->prepare("SELECT id FROM bom_direct WHERE finished_item_id = ? AND raw_material_id = ?");
+                            $chk->execute([$finished_item_id, $rid]);
+                            if ($row = $chk->fetch(PDO::FETCH_ASSOC)) {
+                                $upd = $db->prepare("UPDATE bom_direct SET quantity = ?, finished_unit_qty = ? WHERE id = ?");
+                                $upd->execute([$q, $finished_unit_qty, $row['id']]);
+                            } else {
+                                $ins = $db->prepare("INSERT INTO bom_direct (finished_item_id, finished_unit_qty, raw_material_id, quantity) VALUES (?, ?, ?, ?)");
+                                $ins->execute([$finished_item_id, $finished_unit_qty, $rid, $q]);
+                            }
+                            $added++;
+                        }
+                    }
+                    $db->commit();
+                    $success = $added > 0 ? "Direct BOM saved successfully! ($added row(s))" : "No valid rows to save.";
+                    break;
+
+                // Update direct BOM entry
+                case 'update_direct_bom':
+                    $id = as_int_or_zero($_POST['id'] ?? 0);
+                    $q = as_float_or_zero($_POST['quantity'] ?? 0);
+                    $finished_unit_qty = as_float_or_zero($_POST['finished_unit_qty'] ?? 1.0);
+                    if ($id <= 0) throw new Exception("Invalid Direct BOM entry id.");
+                    if ($finished_unit_qty <= 0) throw new Exception("Please enter a valid unit quantity for the finished product.");
+                    $stmt = $db->prepare("UPDATE bom_direct SET quantity = ?, finished_unit_qty = ? WHERE id = ?");
+                    $stmt->execute([$q, $finished_unit_qty, $id]);
+                    $success = "Direct BOM entry updated successfully!";
+                    break;
+
+                // Delete direct BOM entry
+                case 'delete_direct_bom':
+                    $id = as_int_or_zero($_POST['id'] ?? 0);
+                    if ($id <= 0) throw new Exception("Invalid Direct BOM entry id.");
+                    $stmt = $db->prepare("DELETE FROM bom_direct WHERE id = ?");
+                    $stmt->execute([$id]);
+                    $success = "Direct BOM entry deleted successfully!";
+                    break;
             }
         }
     } catch(PDOException $e) {
@@ -349,6 +408,53 @@ foreach ($bomprod_rows as $r) {
     }
     $grouped_bomprod[$key]['rows'][] = $r;
 }
+
+/* Direct BOM rows (Finished → Raw directly) */
+$direct_bom_rows = [];
+try {
+    $stmt = $db->query("
+        SELECT bd.*,
+               f.name AS finished_name, f.code AS finished_code, fu.symbol AS finished_unit,
+               r.name AS raw_name, r.code AS raw_code, ru.symbol AS raw_unit,
+               COALESCE((
+                   SELECT SUM(sl.quantity_in - sl.quantity_out)
+                   FROM stock_ledger sl
+                   WHERE sl.item_id = r.id
+               ), 0) AS raw_stock
+        FROM bom_direct bd
+        JOIN items f  ON f.id = bd.finished_item_id AND f.type = 'finished'
+        JOIN units fu ON fu.id = f.unit_id
+        JOIN items r  ON r.id = bd.raw_material_id AND r.type = 'raw'
+        JOIN units ru ON ru.id = r.unit_id
+        ORDER BY f.name, r.name
+    ");
+    $direct_bom_rows = $stmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
+} catch(PDOException $e) {
+    $error = "Error fetching Direct BOM entries: " . $e->getMessage();
+    $direct_bom_rows = [];
+}
+
+/* Group Direct BOM by finished item */
+$grouped_direct_bom = [];
+foreach ($direct_bom_rows as $r) {
+    $key = $r['finished_item_id'];
+    if (!isset($grouped_direct_bom[$key])) {
+        $grouped_direct_bom[$key] = [
+            'item_id'         => $r['finished_item_id'],
+            'item_name'       => $r['finished_name'],
+            'item_code'       => $r['finished_code'],
+            'item_unit'       => $r['finished_unit'],
+            'materials'       => [],
+            'total_materials' => 0,
+            'can_produce'     => true
+        ];
+    }
+    $grouped_direct_bom[$key]['materials'][] = $r;
+    $grouped_direct_bom[$key]['total_materials']++;
+    if ((float)$r['raw_stock'] < (float)$r['quantity']) {
+        $grouped_direct_bom[$key]['can_produce'] = false;
+    }
+}
 ?>
 
 <div class="space-y-10">
@@ -364,6 +470,9 @@ foreach ($bomprod_rows as $r) {
             </button>
             <button onclick="openCreatePeetu()" class="bg-primary text-white px-4 py-2 rounded-md hover:bg-blue-600 transition-colors">
                 Add Peetu Entry
+            </button>
+            <button onclick="openCreateDirectBom()" class="bg-purple-600 text-white px-4 py-2 rounded-md hover:bg-purple-700 transition-colors">
+                Add Direct BOM
             </button>
             <button onclick="openCreateBomProduct()" class="bg-indigo-600 text-white px-4 py-2 rounded-md hover:bg-indigo-700 transition-colors">
                 Add BOM Product
@@ -508,6 +617,89 @@ foreach ($bomprod_rows as $r) {
             <button onclick="openCreatePeetu()" class="bg-primary text-white px-4 py-2 rounded-md hover:bg-blue-600 transition-colors">Add Peetu Entry</button>
         </div>
     <?php endif; ?>
+
+    <!-- ====================== DIRECT BOM SECTION ====================== -->
+    <div class="pt-6">
+        <h2 class="text-2xl font-bold text-gray-900 mb-4">Direct BOM (Finished → Raw Materials)</h2>
+        <p class="text-gray-600 mb-6">Finished products made directly from raw materials without Peetu intermediates.</p>
+
+        <?php if (!empty($grouped_direct_bom)): ?>
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <?php foreach ($grouped_direct_bom as $item_bom): ?>
+                <div class="bg-white rounded-lg shadow hover:shadow-md transition-shadow <?php echo !$item_bom['can_produce'] ? 'ring-2 ring-red-200' : ''; ?>">
+                    <div class="p-6">
+                        <div class="flex justify-between items-start mb-4">
+                            <div class="flex-1">
+                                <div class="flex items-center space-x-2">
+                                    <h3 class="text-lg font-semibold text-gray-900"><?php echo htmlspecialchars($item_bom['item_name']); ?></h3>
+                                    <?php if (!$item_bom['can_produce']): ?>
+                                        <span class="bg-red-100 text-red-800 text-xs font-medium px-2 py-1 rounded">Material Shortage</span>
+                                    <?php else: ?>
+                                        <span class="bg-green-100 text-green-800 text-xs font-medium px-2 py-1 rounded">Ready to Produce</span>
+                                    <?php endif; ?>
+                                </div>
+                                <p class="text-sm text-gray-600"><?php echo htmlspecialchars($item_bom['item_code']); ?></p>
+                                <span class="inline-block mt-1 bg-purple-100 text-purple-800 text-xs font-medium px-2.5 py-0.5 rounded">
+                                    <?php 
+                                        // Get unit quantity from first material (they should all have the same finished_unit_qty)
+                                        $unit_qty = isset($item_bom['materials'][0]['finished_unit_qty']) ? (float)$item_bom['materials'][0]['finished_unit_qty'] : 1.0;
+                                        echo number_format($unit_qty, 0) . 'kg → 1pc'; 
+                                    ?> (Direct)
+                                </span>
+                            </div>
+                        </div>
+
+                        <div class="space-y-3">
+                            <h4 class="text-sm font-medium text-gray-700">Raw Materials Required:</h4>
+                            <?php foreach ($item_bom['materials'] as $material): ?>
+                            <div class="flex justify-between items-center p-3 <?php echo ((float)$material['raw_stock'] < (float)$material['quantity']) ? 'bg-red-50 border border-red-200' : 'bg-gray-50'; ?> rounded-md">
+                                <div class="flex-1">
+                                    <p class="font-medium text-gray-900"><?php echo htmlspecialchars($material['raw_name']); ?></p>
+                                    <p class="text-sm text-gray-600"><?php echo htmlspecialchars($material['raw_code']); ?></p>
+                                    <p class="text-xs <?php echo ((float)$material['raw_stock'] < (float)$material['quantity']) ? 'text-red-600' : 'text-gray-500'; ?>">
+                                        Available: <?php echo number_format((float)$material['raw_stock'], 3); ?> <?php echo $material['raw_unit']; ?>
+                                    </p>
+                                </div>
+                                <div class="flex items-center space-x-2">
+                                    <span class="text-sm font-medium <?php echo ((float)$material['raw_stock'] < (float)$material['quantity']) ? 'text-red-900' : 'text-gray-900'; ?>">
+                                        <?php echo number_format((float)$material['quantity'], 3); ?> <?php echo $material['raw_unit']; ?>
+                                    </span>
+                                    <div class="flex space-x-1">
+                                        <button onclick='editDirectBom(<?php echo json_encode($material, JSON_HEX_TAG|JSON_HEX_APOS|JSON_HEX_QUOT|JSON_HEX_AMP); ?>)' class="text-indigo-600 hover:text-indigo-900" title="Edit">
+                                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>
+                                        </button>
+                                        <form method="POST" class="inline" onsubmit="return confirm('Delete this direct BOM entry?')">
+                                            <input type="hidden" name="action" value="delete_direct_bom">
+                                            <input type="hidden" name="id" value="<?php echo (int)$material['id']; ?>">
+                                            <button type="submit" class="text-red-600 hover:text-red-900" title="Delete">
+                                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+                                            </button>
+                                        </form>
+                                    </div>
+                                </div>
+                            </div>
+                            <?php endforeach; ?>
+                        </div>
+
+                        <div class="mt-4 pt-4 border-t">
+                            <div class="flex justify-between text-sm">
+                                <span class="text-gray-600">Total Materials:</span>
+                                <span class="font-medium"><?php echo (int)$item_bom['total_materials']; ?> items</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <?php endforeach; ?>
+            </div>
+        <?php else: ?>
+            <div class="bg-white rounded-lg shadow p-8 text-center">
+                <svg class="w-12 h-12 mx-auto text-gray-400 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+                <h3 class="text-lg font-medium text-gray-900 mb-2">No direct BOM entries found</h3>
+                <p class="text-gray-600 mb-4">Create direct mappings from finished products to raw materials.</p>
+                <button onclick="openCreateDirectBom()" class="bg-purple-600 text-white px-4 py-2 rounded-md hover:bg-purple-700 transition-colors">Add Direct BOM</button>
+            </div>
+        <?php endif; ?>
+    </div>
 
     <!-- ====================== BOM PRODUCT SECTION ====================== -->
     <div class="pt-6">
@@ -801,6 +993,109 @@ foreach ($bomprod_rows as $r) {
     </div>
 </div>
 
+<!-- Create Direct BOM Modal -->
+<div id="createDirectBomModal" class="fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full modal-backdrop hidden">
+    <div class="relative top-16 mx-auto p-5 border w-[40rem] max-w-[95vw] shadow-lg rounded-md bg-white">
+        <div class="flex justify-between items-center mb-4">
+            <h3 class="text-lg font-bold text-gray-900">Add Direct BOM</h3>
+            <button onclick="closeModal('createDirectBomModal')" class="text-gray-400 hover:text-gray-600">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+            </button>
+        </div>
+
+        <form method="POST" class="space-y-4" onsubmit="return validateDirectBomForm()">
+            <input type="hidden" name="action" value="create_direct_bom">
+
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-1">Finished Product</label>
+                <select name="finished_item_id" id="direct_finished_item_id" required
+                        class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent"
+                        onchange="onFinishedItemChange()">
+                    <option value="">Select Finished Product</option>
+                    <?php foreach ($finished_items as $item): ?>
+                        <option value="<?php echo $item['id']; ?>" data-unit="<?php echo htmlspecialchars($item['symbol']); ?>">
+                            <?php echo htmlspecialchars($item['name'].' ('.$item['code'].')'); ?>
+                        </option>
+                    <?php endforeach; ?>
+                </select>
+            </div>
+
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-1">Weight per Piece (kg)</label>
+                <input type="number" step="0.001" min="0.001" name="finished_unit_qty" id="direct_finished_unit_qty" required
+                       class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent"
+                       placeholder="15.000">
+                <p class="text-xs text-gray-500 mt-1">Enter the weight per piece (e.g., for 15kg packets, enter 15.000)</p>
+            </div>
+
+            <div>
+                <div class="flex justify-between items-center mb-2">
+                    <label class="block text-sm font-medium text-gray-700">Raw Materials & Quantity (per piece)</label>
+                    <button type="button" onclick="addDirectBomRow()" class="bg-green-600 text-white px-2 py-1 rounded text-sm hover:bg-green-700">+ Add Row</button>
+                </div>
+
+                <div class="overflow-x-auto">
+                    <table class="min-w-full border border-gray-300" id="directBomTable">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase border">Raw Material</th>
+                                <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase border">Qty</th>
+                                <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase border">Unit</th>
+                                <th class="px-3 py-2 text-center text-xs font-medium text-gray-500 uppercase border">Action</th>
+                            </tr>
+                        </thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+                <p class="text-xs text-gray-500 mt-1">Add raw materials needed to make 1 piece of the finished product (with specified weight).</p>
+            </div>
+
+            <div class="flex justify-end gap-3 pt-2">
+                <button type="button" onclick="closeModal('createDirectBomModal')" class="px-4 py-2 border border-gray-300 rounded-md text-gray-700 hover:bg-gray-50">Cancel</button>
+                <button type="submit" class="px-4 py-2 bg-purple-600 text-white rounded-md hover:bg-purple-700">Save</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Edit Direct BOM Modal -->
+<div id="editDirectBomModal" class="fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full modal-backdrop hidden">
+    <div class="relative top-20 mx-auto p-5 border w-96 shadow-lg rounded-md bg-white">
+        <div class="flex justify-between items-center mb-4">
+            <h3 class="text-lg font-bold text-gray-900">Edit Direct BOM Entry</h3>
+            <button onclick="closeModal('editDirectBomModal')" class="text-gray-400 hover:text-gray-600">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+            </button>
+        </div>
+        <form method="POST" class="space-y-4">
+            <input type="hidden" name="action" value="update_direct_bom">
+            <input type="hidden" name="id" id="edit_direct_id">
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-1">Finished Product</label>
+                <input type="text" id="edit_direct_finished" class="w-full px-3 py-2 border border-gray-300 rounded-md bg-gray-100" readonly>
+            </div>
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-1">Weight per Piece (kg)</label>
+                <input type="number" step="0.001" min="0.001" name="finished_unit_qty" id="edit_direct_finished_unit_qty" required 
+                       class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent">
+                <p class="text-xs text-gray-500 mt-1">Weight of 1 piece of this finished product</p>
+            </div>
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-1">Raw Material</label>
+                <input type="text" id="edit_direct_raw" class="w-full px-3 py-2 border border-gray-300 rounded-md bg-gray-100" readonly>
+            </div>
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-1">Quantity (per piece)</label>
+                <input type="number" name="quantity" step="0.001" id="edit_direct_quantity" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent">
+            </div>
+            <div class="flex justify-end gap-3 pt-4">
+                <button type="button" onclick="closeModal('editDirectBomModal')" class="px-4 py-2 border border-gray-300 rounded-md text-gray-700 hover:bg-gray-50">Cancel</button>
+                <button type="submit" class="px-4 py-2 bg-purple-600 text-white rounded-md hover:bg-purple-700">Update Entry</button>
+            </div>
+        </form>
+    </div>
+</div>
+
 <!-- ============================ Scripts ============================ -->
 <script>
 /* ---------- Peetu (Semi-Finished → Raw) ---------- */
@@ -1075,15 +1370,96 @@ function calculatePieces(el) {
   }
 }
 
+/* ---------- Direct BOM (Finished → Raw directly) ---------- */
+function onFinishedItemChange() {
+    const select = document.getElementById('direct_finished_item_id');
+    const unit = select.options[select.selectedIndex]?.getAttribute('data-unit') || '';
+    const display = document.getElementById('finished_unit_display');
+    if (unit) {
+        display.textContent = `(${unit})`;
+    } else {
+        display.textContent = '';
+    }
+}
+
+function openCreateDirectBom() {
+    document.getElementById('direct_finished_item_id').value = '';
+    document.getElementById('direct_finished_unit_qty').value = '15.000'; // Default to 15kg
+    const tb = document.querySelector('#directBomTable tbody');
+    tb.innerHTML = '';
+    addDirectBomRow();
+    openModal('createDirectBomModal');
+}
+
+function addDirectBomRow() {
+    const tb = document.querySelector('#directBomTable tbody');
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+        <td class="px-3 py-2 border">${rawSelectHTML()}</td>
+        <td class="px-3 py-2 border">
+            <input type="number" name="quantity[]" step="0.001" class="w-full px-2 py-1 border border-gray-300 rounded text-sm" placeholder="0.000" required>
+        </td>
+        <td class="px-3 py-2 border">
+            <span class="inline-block text-xs text-gray-600 unit-badge"></span>
+        </td>
+        <td class="px-3 py-2 border text-center">
+            <button type="button" class="text-red-600 hover:text-red-800 text-sm" onclick="removeDirectBomRow(this)">Remove</button>
+        </td>
+    `;
+    tb.appendChild(tr);
+    const select = tr.querySelector('.raw-select');
+    if (select) syncRowUnit(select);
+}
+
+function removeDirectBomRow(btn) {
+    const tb = document.querySelector('#directBomTable tbody');
+    if (tb.children.length <= 1) { alert('At least one row is required.'); return; }
+    btn.closest('tr').remove();
+}
+
+function validateDirectBomForm() {
+    const finished = document.getElementById('direct_finished_item_id').value;
+    if (!finished) { alert('Please select a Finished product.'); return false; }
+    
+    const unitQty = document.getElementById('direct_finished_unit_qty').value;
+    if (!unitQty || parseFloat(unitQty) <= 0) { 
+        alert('Please enter a valid unit quantity for the finished product.'); 
+        return false; 
+    }
+    
+    const rows = document.querySelectorAll('#directBomTable tbody tr');
+    if (!rows.length) { alert('Please add at least one raw material row.'); return false; }
+    for (const r of rows) {
+        const sel = r.querySelector('.raw-select');
+        const qty = r.querySelector('input[name="quantity[]"]');
+        if (!sel.value || !qty.value || parseFloat(qty.value) <= 0) {
+            alert('Each row must have a raw material and a positive quantity.');
+            return false;
+        }
+    }
+    return true;
+}
+
+function editDirectBom(row) {
+    document.getElementById('edit_direct_id').value = row.id;
+    document.getElementById('edit_direct_finished').value = (row.finished_name || '') + ' (' + (row.finished_code || '') + ')';
+    document.getElementById('edit_direct_raw').value = (row.raw_name || '') + ' (' + (row.raw_code || '') + ')';
+    document.getElementById('edit_direct_quantity').value = row.quantity;
+    document.getElementById('edit_direct_finished_unit_qty').value = row.finished_unit_qty || '1.000';
+    openModal('editDirectBomModal');
+}
+
 /* ---------- Utils ---------- */
 function escapeHtml(s){return String(s).replace(/[&<>"']/g,m=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[m]));}
 
 document.addEventListener('DOMContentLoaded', function () {
-    // Ensure at least one row appears in both create tables on first open
+    // Ensure at least one row appears in create tables on first open
     const tb1 = document.querySelector('#peetuRawTable tbody');
     if (tb1 && !tb1.children.length) addRawRow();
     const tb2 = document.querySelector('#bomProdTable tbody');
     if (tb2 && !tb2.children.length) addBomProdRow();
+    const tb3 = document.querySelector('#directBomTable tbody');
+    if (tb3 && !tb3.children.length) addDirectBomRow();
 
     // Re-prefill all visible rows when finished item changes
     document.getElementById('bp_finished_item_id')?.addEventListener('change', () => {
