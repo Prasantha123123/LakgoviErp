@@ -1,5 +1,5 @@
 <?php
-// opening_stock.php - Opening Stock Management with NULL Handling Fix
+// opening_stock.php - Opening Stock Management with NULL Handling Fix + Separate Raw/Finished Dropdowns
 include 'header.php';
 
 // 🔧 NULL CLEANUP HANDLER
@@ -35,12 +35,18 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                 case 'create':
                     $db->beginTransaction();
                     
-                    // Validate required fields
-                    if (empty($_POST['item_id']) || empty($_POST['location_id']) || empty($_POST['quantity'])) {
-                        throw new Exception("Item, Location and Quantity are required");
+                    // ✅ Validate exactly one of raw_item_id or finished_item_id
+                    $raw_item_id = isset($_POST['raw_item_id']) ? trim($_POST['raw_item_id']) : '';
+                    $finished_item_id = isset($_POST['finished_item_id']) ? trim($_POST['finished_item_id']) : '';
+
+                    if (($raw_item_id === '' && $finished_item_id === '') || ($raw_item_id !== '' && $finished_item_id !== '')) {
+                        throw new Exception("Select exactly one: Raw Material OR Finished Item");
                     }
-                    
-                    $item_id = $_POST['item_id'];
+                    if (empty($_POST['location_id']) || empty($_POST['quantity'])) {
+                        throw new Exception("Location and Quantity are required");
+                    }
+
+                    $item_id = $raw_item_id !== '' ? $raw_item_id : $finished_item_id;
                     $location_id = $_POST['location_id'];
                     $quantity = floatval($_POST['quantity']);
                     
@@ -244,19 +250,31 @@ try {
     $opening_stocks = [];
 }
 
-// Fetch items for dropdown
+// ✅ Fetch items for dropdowns separately (raw vs finished)
 try {
+    // Raw materials
     $stmt = $db->query("
         SELECT i.id, i.code, i.name, u.symbol 
         FROM items i 
         JOIN units u ON i.unit_id = u.id 
-        WHERE i.type IN ('raw', 'finished')
+        WHERE i.type = 'raw'
         ORDER BY i.name
     ");
-    $items = $stmt->fetchAll();
+    $raw_items = $stmt->fetchAll();
+
+    // Finished items
+    $stmt = $db->query("
+        SELECT i.id, i.code, i.name, u.symbol 
+        FROM items i 
+        JOIN units u ON i.unit_id = u.id 
+        WHERE i.type = 'finished'
+        ORDER BY i.name
+    ");
+    $finished_items = $stmt->fetchAll();
 } catch(PDOException $e) {
     $error = "Error fetching items: " . $e->getMessage();
-    $items = [];
+    $raw_items = [];
+    $finished_items = [];
 }
 
 // Fetch locations for dropdown
@@ -280,8 +298,6 @@ try {
             Create New Opening Stock
         </button>
     </div>
-
-
 
     <!-- Success/Error Messages -->
     <?php if (isset($success)): ?>
@@ -380,17 +396,39 @@ try {
             
             <!-- Opening Stock Header -->
             <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+                <!-- Raw Material Select -->
                 <div>
-                    <label class="block text-sm font-medium text-gray-700 mb-1">Item</label>
-                    <select name="item_id" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent">
-                        <option value="">Select Item</option>
-                        <?php foreach ($items as $item): ?>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Raw Material</label>
+                    <select name="raw_item_id" id="raw_item_id"
+                            class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent"
+                            onchange="onRawSelectChange()">
+                        <option value="">Select Raw Material</option>
+                        <?php foreach ($raw_items as $item): ?>
                             <option value="<?php echo $item['id']; ?>">
                                 <?php echo htmlspecialchars($item['code'] . ' - ' . $item['name'] . ' (' . $item['symbol'] . ')'); ?>
                             </option>
                         <?php endforeach; ?>
                     </select>
+                    <p class="mt-1 text-xs text-gray-500">Pick this OR Finished Item below</p>
                 </div>
+
+                <!-- Finished Item Select -->
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Finished Item</label>
+                    <select name="finished_item_id" id="finished_item_id"
+                            class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent"
+                            onchange="onFinishedSelectChange()">
+                        <option value="">Select Finished Item</option>
+                        <?php foreach ($finished_items as $item): ?>
+                            <option value="<?php echo $item['id']; ?>">
+                                <?php echo htmlspecialchars($item['code'] . ' - ' . $item['name'] . ' (' . $item['symbol'] . ')'); ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
+                    <p class="mt-1 text-xs text-gray-500">Pick this OR Raw Material above</p>
+                </div>
+
+                <!-- Location -->
                 <div>
                     <label class="block text-sm font-medium text-gray-700 mb-1">Location</label>
                     <select name="location_id" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent">
@@ -402,6 +440,8 @@ try {
                         <?php endforeach; ?>
                     </select>
                 </div>
+
+                <!-- Quantity -->
                 <div>
                     <label class="block text-sm font-medium text-gray-700 mb-1">Quantity <span class="text-red-500">*</span></label>
                     <input type="number" 
@@ -414,7 +454,9 @@ try {
                            placeholder="0.000"
                            oninput="calculateRateOrValue()">
                 </div>
-                <div>
+
+                <!-- Opening Date -->
+                <div class="md:col-span-1">
                     <label class="block text-sm font-medium text-gray-700 mb-1">Opening Date</label>
                     <input type="date" name="opening_date" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent" value="<?php echo date('Y-m-d'); ?>">
                 </div>
@@ -568,8 +610,13 @@ function validateForm() {
     const unitRate = parseFloat(document.getElementById('unit_rate').value) || 0;
     const totalValue = parseFloat(document.getElementById('total_value').value) || 0;
     const submitBtn = document.getElementById('submitBtn');
-    
-    if (quantity > 0 && (unitRate > 0 || totalValue > 0)) {
+
+    // Ensure one of the item selects has a value
+    const rawSel = document.getElementById('raw_item_id');
+    const finSel = document.getElementById('finished_item_id');
+    const oneItemSelected = (!!rawSel.value ^ !!finSel.value); // XOR
+
+    if (oneItemSelected && quantity > 0 && (unitRate > 0 || totalValue > 0)) {
         submitBtn.disabled = false;
         submitBtn.classList.remove('opacity-50', 'cursor-not-allowed');
         hideWarning();
@@ -577,7 +624,9 @@ function validateForm() {
         submitBtn.disabled = true;
         submitBtn.classList.add('opacity-50', 'cursor-not-allowed');
         
-        if (quantity > 0 && unitRate === 0 && totalValue === 0) {
+        if (!oneItemSelected) {
+            showWarning('Select exactly one item: Raw Material OR Finished Item');
+        } else if (quantity > 0 && unitRate === 0 && totalValue === 0) {
             showWarning('Please enter either Unit Rate or Total Value');
         } else if (quantity === 0) {
             showWarning('Please enter quantity first');
@@ -587,6 +636,32 @@ function validateForm() {
     }
 }
 
+// ✅ Mutual exclusivity handlers
+function onRawSelectChange() {
+    const rawSel = document.getElementById('raw_item_id');
+    const finSel = document.getElementById('finished_item_id');
+    if (rawSel.value) {
+        finSel.value = '';
+        finSel.disabled = true;
+    } else {
+        finSel.disabled = false;
+    }
+    validateForm();
+}
+
+function onFinishedSelectChange() {
+    const rawSel = document.getElementById('raw_item_id');
+    const finSel = document.getElementById('finished_item_id');
+    if (finSel.value) {
+        rawSel.value = '';
+        rawSel.disabled = true;
+    } else {
+        rawSel.disabled = false;
+    }
+    validateForm();
+}
+
+// ensure clean state when opening/closing modal
 function closeModal(modalId) {
     document.getElementById(modalId).classList.add('hidden');
     document.getElementById('openingStockForm').reset();
@@ -595,14 +670,24 @@ function closeModal(modalId) {
     hideCalculation();
     hideWarning();
     document.getElementById('submitBtn').disabled = true;
+
+    const rawSel = document.getElementById('raw_item_id');
+    const finSel = document.getElementById('finished_item_id');
+    if (rawSel) rawSel.disabled = false;
+    if (finSel) finSel.disabled = false;
 }
 
 function openModal(modalId) {
     document.getElementById(modalId).classList.remove('hidden');
+    // sync exclusivity in case form state restored by browser
+    onRawSelectChange();
+    onFinishedSelectChange();
 }
 
 document.addEventListener('DOMContentLoaded', function() {
     validateForm();
+    onRawSelectChange();
+    onFinishedSelectChange();
 });
 </script>
 

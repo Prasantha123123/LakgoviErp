@@ -8,6 +8,10 @@ $item_type_filter = $_GET['item_type'] ?? '';
 $low_stock_only = isset($_GET['low_stock']);
 $view_mode = $_GET['view'] ?? 'summary'; // summary, detailed, movements, value_analysis
 
+// Constants (adjust if your IDs differ)
+$STORE_ID = 1;
+$PRODUCTION_ID = 2;
+
 // Initialize variables to prevent errors
 $summary_stats = [
     'total_items' => 0,
@@ -19,14 +23,21 @@ $summary_stats = [
 $location_summary = [];
 $type_summary = ['raw' => 0, 'semi_finished' => 0, 'finished' => 0];
 $value_summary = ['raw' => 0, 'semi_finished' => 0, 'finished' => 0];
-$stock_data = [];
+$stock_data = []; // used for value_analysis view
+$detailed_data_by_loc = []; // used for detailed view: [location_id => rows]
+$detailed_location_names = []; // [location_id => name]
 $recent_movements = [];
 
 try {
-    // Get all locations for filters
+    // Get DB handle (from header) and all locations for filters & names
     $stmt = $db->query("SELECT id, name FROM locations ORDER BY name");
     $locations = $stmt->fetchAll();
-    
+
+    $location_map = [];
+    foreach ($locations as $loc) { $location_map[(int)$loc['id']] = $loc['name']; }
+    $detailed_location_names[$STORE_ID] = $location_map[$STORE_ID] ?? 'Store';
+    $detailed_location_names[$PRODUCTION_ID] = $location_map[$PRODUCTION_ID] ?? 'Production Floor';
+
     // Calculate total stock value and other summary statistics using stock_ledger data
     $stmt = $db->query("
         SELECT 
@@ -78,62 +89,84 @@ try {
     ");
     $type_value_analysis = $stmt->fetchAll();
 
-    // Build base query with filters for detailed view
-    $where_conditions = ['stock_qty > 0'];
-    $params = [];
-    
-    if ($location_filter) {
-        $where_conditions[] = "sl.location_id = ?";
-        $params[] = $location_filter;
+    // ---------- DATA FOR DETAILED VIEW: produce two separate tables ----------
+    if ($view_mode === 'detailed') {
+        // Which locations to show? Default = Store + Production; if filter chosen then only that one.
+        $locations_to_show = [];
+        if ($location_filter !== '' && is_numeric($location_filter)) {
+            $locations_to_show = [(int)$location_filter];
+        } else {
+            $locations_to_show = [$STORE_ID, $PRODUCTION_ID];
+        }
+
+        // Build WHERE fragment shared by both queries (type + low stock)
+        $extra_where = [];
+        $extra_params = [];
+        if ($item_type_filter) { $extra_where[] = "i.type = ?"; $extra_params[] = $item_type_filter; }
+        if ($low_stock_only)  { $extra_where[] = "sl.stock_qty <= 10"; }
+        // Always require positive stock
+        array_unshift($extra_where, "sl.stock_qty > 0");
+        $extra_where_sql = implode(' AND ', $extra_where);
+
+        // Prepared query (per location)
+        $sql = "
+            SELECT 
+                i.id, i.code, i.name, i.type, 
+                COALESCE(i.cost_price, 0) as cost_price,
+                sl.stock_qty as current_stock,
+                (sl.stock_qty * COALESCE(i.cost_price, 0)) as stock_value,
+                u.symbol as unit_symbol
+            FROM items i
+            JOIN units u ON i.unit_id = u.id
+            JOIN (
+                SELECT item_id, location_id, COALESCE(SUM(quantity_in - quantity_out), 0) as stock_qty
+                FROM stock_ledger 
+                GROUP BY item_id, location_id
+            ) sl ON sl.item_id = i.id
+            WHERE sl.location_id = ?
+              AND $extra_where_sql
+            ORDER BY i.name
+        ";
+
+        foreach ($locations_to_show as $locId) {
+            $params = array_merge([$locId], $extra_params);
+            $stmt = $db->prepare($sql);
+            $stmt->execute($params);
+            $detailed_data_by_loc[$locId] = $stmt->fetchAll();
+            if (!isset($detailed_location_names[$locId])) {
+                $detailed_location_names[$locId] = $location_map[$locId] ?? ("Location #" . $locId);
+            }
+        }
     }
-    
-    if ($item_type_filter) {
-        $where_conditions[] = "i.type = ?";
-        $params[] = $item_type_filter;
-    }
-    
-    if ($low_stock_only) {
-        $where_conditions[] = "stock_qty <= 10";
-    }
-    
-    $where_clause = implode(' AND ', $where_conditions);
-    
-    // Get detailed stock data with values using stock_ledger as primary source
-    if ($view_mode === 'detailed' || $view_mode === 'value_analysis') {
+
+    // ---------- DATA FOR VALUE ANALYSIS VIEW (aggregate across all locations) ----------
+    if ($view_mode === 'value_analysis') {
+        $v_where = [];
+        $v_params = [];
+        $v_where[] = "sl_total.stock_qty > 0";
+        if ($item_type_filter) { $v_where[] = "i.type = ?"; $v_params[] = $item_type_filter; }
+        if ($low_stock_only)  { $v_where[] = "sl_total.stock_qty <= 10"; }
+        $v_where_sql = implode(' AND ', $v_where);
+
         $query = "
             SELECT 
                 i.id, i.code, i.name, i.type, 
                 COALESCE(i.cost_price, 0) as cost_price,
-                stock_qty as current_stock,
-                (stock_qty * COALESCE(i.cost_price, 0)) as stock_value,
-                u.symbol as unit_symbol,
-                COALESCE(l.name, 'All Locations') as location_name,
-                CASE 
-                    WHEN stock_qty <= 10 THEN 1 
-                    ELSE 0 
-                END as is_low_stock
+                sl_total.stock_qty as current_stock,
+                (sl_total.stock_qty * COALESCE(i.cost_price, 0)) as stock_value,
+                u.symbol as unit_symbol
             FROM items i
             JOIN units u ON i.unit_id = u.id
-            LEFT JOIN locations l ON 1=1
             LEFT JOIN (
-                SELECT 
-                    item_id, 
-                    location_id,
-                    COALESCE(SUM(quantity_in - quantity_out), 0) as stock_qty
+                SELECT item_id, COALESCE(SUM(quantity_in - quantity_out), 0) as stock_qty
                 FROM stock_ledger 
-                GROUP BY item_id, location_id
-            ) sl ON i.id = sl.item_id AND (l.id = sl.location_id OR l.id IS NULL)
-            WHERE $where_clause
+                GROUP BY item_id
+            ) sl_total ON i.id = sl_total.item_id
+            WHERE $v_where_sql
+            ORDER BY stock_value DESC
         ";
-        
-        if ($view_mode === 'value_analysis') {
-            $query .= " ORDER BY stock_value DESC";
-        } else {
-            $query .= " ORDER BY i.name";
-        }
-        
         $stmt = $db->prepare($query);
-        $stmt->execute($params);
+        $stmt->execute($v_params);
         $stock_data = $stmt->fetchAll();
     }
 
@@ -200,7 +233,7 @@ try {
         </div>
         <div class="flex flex-wrap gap-2">
             <select onchange="location.href='?view=<?php echo $view_mode; ?>&location=' + this.value + '&item_type=<?php echo $item_type_filter; ?>' + '<?php echo $low_stock_only ? '&low_stock=1' : ''; ?>'" class="px-3 py-2 border border-gray-300 rounded-md">
-                <option value="">All Locations</option>
+                <option value="">All Locations (detailed shows Store + Production)</option>
                 <?php foreach ($locations as $location): ?>
                     <option value="<?php echo $location['id']; ?>" <?php echo $location_filter == $location['id'] ? 'selected' : ''; ?>>
                         <?php echo htmlspecialchars($location['name']); ?>
@@ -233,106 +266,6 @@ try {
         <div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded">
             <?php echo $error; ?>
         </div>
-    <?php endif; ?>
-
-    <!-- Debug Information (remove after fixing) -->
-    <?php if (isset($_GET['debug'])): ?>
-    <div class="bg-yellow-50 border border-yellow-200 rounded-lg p-6">
-        <h3 class="text-lg font-medium text-yellow-800 mb-4">🔧 Debug Information</h3>
-        
-        <?php
-        // Check opening stock entries
-        $debug_stmt = $db->query("SELECT COUNT(*) as count FROM opening_stock");
-        $opening_count = $debug_stmt->fetch()['count'];
-        
-        // Check stock ledger entries
-        $debug_stmt = $db->query("SELECT COUNT(*) as count FROM stock_ledger WHERE transaction_type = 'opening_stock'");
-        $ledger_count = $debug_stmt->fetch()['count'];
-        
-        // Check items with NULL current_stock
-        $debug_stmt = $db->query("SELECT COUNT(*) as count FROM items WHERE current_stock IS NULL");
-        $null_stock_count = $debug_stmt->fetch()['count'];
-        
-        // Check items with current_stock > 0
-        $debug_stmt = $db->query("SELECT COUNT(*) as count FROM items WHERE current_stock > 0");
-        $positive_stock_count = $debug_stmt->fetch()['count'];
-        
-        // Get sample opening stock data
-        $debug_stmt = $db->query("
-            SELECT os.*, i.code, i.name, i.current_stock, i.cost_price, l.name as location_name
-            FROM opening_stock os 
-            JOIN items i ON os.item_id = i.id 
-            JOIN locations l ON os.location_id = l.id 
-            LIMIT 5
-        ");
-        $sample_opening = $debug_stmt->fetchAll();
-        
-        // Get sample stock ledger data  
-        $debug_stmt = $db->query("
-            SELECT sl.*, i.code, i.name 
-            FROM stock_ledger sl 
-            JOIN items i ON sl.item_id = i.id 
-            WHERE sl.transaction_type = 'opening_stock' 
-            LIMIT 5
-        ");
-        $sample_ledger = $debug_stmt->fetchAll();
-        ?>
-        
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
-            <div class="bg-white p-4 rounded border">
-                <h4 class="font-medium">Database Counts</h4>
-                <ul class="text-sm mt-2 space-y-1">
-                    <li>Opening Stock Entries: <strong><?php echo $opening_count; ?></strong></li>
-                    <li>Stock Ledger (Opening): <strong><?php echo $ledger_count; ?></strong></li>
-                    <li>Items with NULL stock: <strong><?php echo $null_stock_count; ?></strong></li>
-                    <li>Items with stock > 0: <strong><?php echo $positive_stock_count; ?></strong></li>
-                </ul>
-            </div>
-            <div class="bg-white p-4 rounded border">
-                <h4 class="font-medium">Current Query Results</h4>
-                <ul class="text-sm mt-2 space-y-1">
-                    <li>Total Items Found: <strong><?php echo $summary_stats['total_items']; ?></strong></li>
-                    <li>Total Stock Value: <strong>Rs. <?php echo number_format($summary_stats['total_stock_value'], 2); ?></strong></li>
-                    <li>Total Quantity: <strong><?php echo number_format($summary_stats['total_quantity'], 3); ?></strong></li>
-                </ul>
-            </div>
-        </div>
-        
-        <?php if (!empty($sample_opening)): ?>
-        <div class="bg-white p-4 rounded border mb-4">
-            <h4 class="font-medium mb-2">Sample Opening Stock Data</h4>
-            <div class="overflow-x-auto">
-                <table class="min-w-full text-xs">
-                    <thead>
-                        <tr class="border-b">
-                            <th class="text-left p-1">Item</th>
-                            <th class="text-left p-1">Location</th>
-                            <th class="text-right p-1">OS Qty</th>
-                            <th class="text-right p-1">Current Stock</th>
-                            <th class="text-right p-1">Cost Price</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <?php foreach ($sample_opening as $item): ?>
-                        <tr class="border-b">
-                            <td class="p-1"><?php echo htmlspecialchars($item['code'] . ' - ' . $item['name']); ?></td>
-                            <td class="p-1"><?php echo htmlspecialchars($item['location_name']); ?></td>
-                            <td class="p-1 text-right"><?php echo $item['quantity']; ?></td>
-                            <td class="p-1 text-right"><?php echo $item['current_stock'] ?? 'NULL'; ?></td>
-                            <td class="p-1 text-right"><?php echo $item['cost_price']; ?></td>
-                        </tr>
-                        <?php endforeach; ?>
-                    </tbody>
-                </table>
-            </div>
-        </div>
-        <?php endif; ?>
-        
-        <div class="text-sm text-yellow-700">
-            <p><strong>💡 Tip:</strong> Remove <code>?debug=1</code> from URL to hide this section.</p>
-            <p><strong>⚠️ Issue:</strong> If opening stock entries exist but items don't show, check if items.current_stock field is being updated properly for location_id = 1.</p>
-        </div>
-    </div>
     <?php endif; ?>
 
     <!-- 💰 MAIN VALUE HIGHLIGHT CARD -->
@@ -471,9 +404,8 @@ try {
     </div>
     <?php endif; ?>
 
-    <!-- Content based on view mode -->
+    <!-- SUMMARY VIEW (unchanged) -->
     <?php if ($view_mode === 'summary'): ?>
-    <!-- Location Summary -->
     <div class="bg-white rounded-lg shadow">
         <div class="px-6 py-4 border-b border-gray-200">
             <h3 class="text-lg font-medium text-gray-900">📍 Stock Summary by Location</h3>
@@ -525,29 +457,29 @@ try {
     </div>
     <?php endif; ?>
 
-    <?php if ($view_mode === 'detailed' || $view_mode === 'value_analysis'): ?>
-    <!-- Detailed Stock Table -->
-    <div class="bg-white rounded-lg shadow">
-        <div class="px-6 py-4 border-b border-gray-200">
-            <h3 class="text-lg font-medium text-gray-900">
-                <?php echo $view_mode === 'value_analysis' ? '💰 Stock Value Analysis (Highest Value First)' : '🔍 Detailed Stock Report'; ?>
-            </h3>
-        </div>
-        <div class="overflow-x-auto">
-            <table class="min-w-full divide-y divide-gray-200">
-                <thead class="bg-gray-50">
-                    <tr>
-                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Item</th>
-                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Type</th>
-                        <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Current Stock</th>
-                        <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Unit Cost</th>
-                        <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">💰 Stock Value</th>
-                        <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
-                    </tr>
-                </thead>
-                <tbody class="bg-white divide-y divide-gray-200">
-                    <?php foreach ($stock_data as $item): ?>
-                        <tr class="hover:bg-gray-50 <?php echo $item['is_low_stock'] ? 'bg-red-50' : ''; ?>">
+    <!-- DETAILED VIEW: TWO TABLES (Store & Production) or single if location selected -->
+    <?php if ($view_mode === 'detailed'): ?>
+        <?php foreach ($detailed_data_by_loc as $locId => $rows): ?>
+        <div class="bg-white rounded-lg shadow">
+            <div class="px-6 py-4 border-b border-gray-200">
+                <h3 class="text-lg font-medium text-gray-900">🔍 Detailed Stock Report — <?php echo htmlspecialchars($detailed_location_names[$locId] ?? ('Location #' . $locId)); ?></h3>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="min-w-full divide-y divide-gray-200">
+                    <thead class="bg-gray-50">
+                        <tr>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Item</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Type</th>
+                            <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Current Stock</th>
+                            <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Unit Cost</th>
+                            <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">💰 Stock Value</th>
+                            <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                        </tr>
+                    </thead>
+                    <tbody class="bg-white divide-y divide-gray-200">
+                        <?php foreach ($rows as $item): ?>
+                        <?php $is_low = ($item['current_stock'] <= 10); ?>
+                        <tr class="hover:bg-gray-50 <?php echo $is_low ? 'bg-red-50' : ''; ?>">
                             <td class="px-6 py-4 whitespace-nowrap">
                                 <div class="text-sm font-medium text-gray-900"><?php echo htmlspecialchars($item['name']); ?></div>
                                 <div class="text-sm text-gray-500"><?php echo htmlspecialchars($item['code']); ?></div>
@@ -560,7 +492,7 @@ try {
                                 </span>
                             </td>
                             <td class="px-6 py-4 whitespace-nowrap text-sm text-right font-medium">
-                                <div class="<?php echo $item['current_stock'] <= 10 ? 'text-red-600' : 'text-gray-900'; ?>">
+                                <div class="<?php echo $is_low ? 'text-red-600' : 'text-gray-900'; ?>">
                                     <?php echo number_format($item['current_stock'], 3); ?>
                                 </div>
                                 <div class="text-xs text-gray-500"><?php echo htmlspecialchars($item['unit_symbol']); ?></div>
@@ -578,7 +510,87 @@ try {
                                 <?php endif; ?>
                             </td>
                             <td class="px-6 py-4 whitespace-nowrap text-center">
-                                <?php if ($item['is_low_stock']): ?>
+                                <?php if ($is_low): ?>
+                                    <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-red-100 text-red-800">⚠️ Low Stock</span>
+                                <?php else: ?>
+                                    <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-green-100 text-green-800">✅ Normal</span>
+                                <?php endif; ?>
+                            </td>
+                        </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+
+                <?php if (empty($rows)): ?>
+                <div class="text-center py-8">
+                    <div class="text-gray-400 text-lg">🔭</div>
+                    <p class="text-gray-500 mt-2">No stock data found for this location</p>
+                </div>
+                <?php endif; ?>
+            </div>
+        </div>
+        <?php endforeach; ?>
+
+        <?php if (empty($detailed_data_by_loc)): ?>
+        <div class="bg-white rounded-lg shadow p-8 text-center text-gray-500">
+            No locations selected / no data to show.
+        </div>
+        <?php endif; ?>
+    <?php endif; ?>
+
+    <!-- VALUE ANALYSIS VIEW -->
+    <?php if ($view_mode === 'value_analysis'): ?>
+    <div class="bg-white rounded-lg shadow">
+        <div class="px-6 py-4 border-b border-gray-200">
+            <h3 class="text-lg font-medium text-gray-900">💰 Stock Value Analysis (Highest Value First)</h3>
+        </div>
+        <div class="overflow-x-auto">
+            <table class="min-w-full divide-y divide-gray-200">
+                <thead class="bg-gray-50">
+                    <tr>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Item</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Type</th>
+                        <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Current Stock</th>
+                        <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Unit Cost</th>
+                        <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">💰 Stock Value</th>
+                        <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                    </tr>
+                </thead>
+                <tbody class="bg-white divide-y divide-gray-200">
+                    <?php foreach ($stock_data as $item): ?>
+                        <?php $is_low = ($item['current_stock'] <= 10); ?>
+                        <tr class="hover:bg-gray-50 <?php echo $is_low ? 'bg-red-50' : ''; ?>">
+                            <td class="px-6 py-4 whitespace-nowrap">
+                                <div class="text-sm font-medium text-gray-900"><?php echo htmlspecialchars($item['name']); ?></div>
+                                <div class="text-sm text-gray-500"><?php echo htmlspecialchars($item['code']); ?></div>
+                            </td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm">
+                                <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full
+                                    <?php echo $item['type'] === 'raw' ? 'bg-blue-100 text-blue-800' : 
+                                        ($item['type'] === 'semi_finished' ? 'bg-yellow-100 text-yellow-800' : 'bg-green-100 text-green-800'); ?>">
+                                    <?php echo str_replace('_', ' ', $item['type']); ?>
+                                </span>
+                            </td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-right font-medium">
+                                <div class="<?php echo $is_low ? 'text-red-600' : 'text-gray-900'; ?>">
+                                    <?php echo number_format($item['current_stock'], 3); ?>
+                                </div>
+                                <div class="text-xs text-gray-500"><?php echo htmlspecialchars($item['unit_symbol']); ?></div>
+                            </td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-right">
+                                <div class="text-gray-900">Rs. <?php echo number_format($item['cost_price'], 2); ?></div>
+                                <div class="text-xs text-gray-500">per <?php echo htmlspecialchars($item['unit_symbol']); ?></div>
+                            </td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-right font-bold">
+                                <div class="text-lg text-green-600">Rs. <?php echo number_format($item['stock_value'], 2); ?></div>
+                                <?php if ($summary_stats['total_stock_value'] > 0): ?>
+                                    <div class="text-xs text-gray-500">
+                                        <?php echo number_format(($item['stock_value'] / $summary_stats['total_stock_value']) * 100, 1); ?>% of total
+                                    </div>
+                                <?php endif; ?>
+                            </td>
+                            <td class="px-6 py-4 whitespace-nowrap text-center">
+                                <?php if ($is_low): ?>
                                     <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-red-100 text-red-800">
                                         ⚠️ Low Stock
                                     </span>
@@ -592,7 +604,6 @@ try {
                     <?php endforeach; ?>
                 </tbody>
             </table>
-            
             <?php if (empty($stock_data)): ?>
             <div class="text-center py-8">
                 <div class="text-gray-400 text-lg">🔭</div>
@@ -642,6 +653,7 @@ try {
                                     $type_colors = [
                                         'grn' => 'bg-green-100 text-green-800',
                                         'mrn' => 'bg-blue-100 text-blue-800', 
+                                        'return' => 'bg-indigo-100 text-indigo-800',
                                         'production_in' => 'bg-purple-100 text-purple-800',
                                         'production_out' => 'bg-orange-100 text-orange-800',
                                         'trolley' => 'bg-yellow-100 text-yellow-800',
@@ -695,33 +707,42 @@ try {
 <script>
 // Export functions
 function exportToCSV() {
-    // Create CSV content from current view data
     let csvContent = "data:text/csv;charset=utf-8,";
-    
-    <?php if ($view_mode === 'detailed' || $view_mode === 'value_analysis'): ?>
+
+    <?php if ($view_mode === 'detailed'): ?>
+    csvContent += "Location,Item Name,Item Code,Type,Current Stock,Unit Cost,Stock Value,Status\n";
+    <?php foreach ($detailed_data_by_loc as $locId => $rows): 
+          $locName = addslashes($detailed_location_names[$locId] ?? ("Location #".$locId));
+          foreach ($rows as $item): ?>
+    csvContent += "<?php echo $locName; ?>,<?php echo addslashes($item['name']); ?>,<?php echo $item['code']; ?>,<?php echo $item['type']; ?>,<?php echo $item['current_stock']; ?>,<?php echo $item['cost_price']; ?>,<?php echo $item['stock_value']; ?>,<?php echo ($item['current_stock'] <= 10 ? 'Low Stock' : 'Normal'); ?>\n";
+    <?php endforeach; endforeach; ?>
+
+    <?php elseif ($view_mode === 'value_analysis'): ?>
     csvContent += "Item Name,Item Code,Type,Current Stock,Unit Cost,Stock Value,Status\n";
     <?php foreach ($stock_data as $item): ?>
-        csvContent += "<?php echo addslashes($item['name']); ?>,<?php echo $item['code']; ?>,<?php echo $item['type']; ?>,<?php echo $item['current_stock']; ?>,<?php echo $item['cost_price']; ?>,<?php echo $item['stock_value']; ?>,<?php echo $item['is_low_stock'] ? 'Low Stock' : 'Normal'; ?>\n";
+    csvContent += "<?php echo addslashes($item['name']); ?>,<?php echo $item['code']; ?>,<?php echo $item['type']; ?>,<?php echo $item['current_stock']; ?>,<?php echo $item['cost_price']; ?>,<?php echo $item['stock_value']; ?>,<?php echo ($item['current_stock'] <= 10 ? 'Low Stock' : 'Normal'); ?>\n";
     <?php endforeach; ?>
+
     <?php elseif ($view_mode === 'movements'): ?>
     csvContent += "Date,Item Name,Item Code,Location,Type,Reference,Quantity In,Quantity Out,Balance,Unit\n";
     <?php foreach ($recent_movements as $movement): ?>
     csvContent += "<?php echo $movement['transaction_date']; ?>,<?php echo addslashes($movement['item_name']); ?>,<?php echo $movement['item_code']; ?>,<?php echo addslashes($movement['location_name']); ?>,<?php echo $movement['transaction_type']; ?>,<?php echo $movement['reference_no']; ?>,<?php echo $movement['quantity_in']; ?>,<?php echo $movement['quantity_out']; ?>,<?php echo $movement['balance']; ?>,<?php echo $movement['unit_symbol']; ?>\n";
     <?php endforeach; ?>
+
     <?php else: ?>
     csvContent += "Location,Total Items,Raw Materials,Semi-Finished,Finished Goods,Total Value\n";
     <?php foreach ($location_summary as $location): ?>
     csvContent += "<?php echo addslashes($location['name']); ?>,<?php echo $location['items']; ?>,<?php echo $location['raw']; ?>,<?php echo $location['semi_finished']; ?>,<?php echo $location['finished']; ?>,<?php echo $location['total_value']; ?>\n";
     <?php endforeach; ?>
     <?php endif; ?>
-    
+
     // Add summary at the end
     csvContent += "\n--- SUMMARY ---\n";
     csvContent += "Total Stock Value,Rs. <?php echo number_format($summary_stats['total_stock_value'], 2); ?>\n";
     csvContent += "Total Items,<?php echo $summary_stats['total_items']; ?>\n";
     csvContent += "Total Quantity,<?php echo number_format($summary_stats['total_quantity'], 3); ?>\n";
     csvContent += "Low Stock Items,<?php echo $summary_stats['low_stock_items']; ?>\n";
-    
+
     var encodedUri = encodeURI(csvContent);
     var link = document.createElement("a");
     link.setAttribute("href", encodedUri);
@@ -747,40 +768,14 @@ window.addEventListener('afterprint', function() {
         -webkit-print-color-adjust: exact;
         color-adjust: exact;
     }
-    
-    .no-print {
-        display: none !important;
-    }
-    
-    .bg-gradient-to-r {
-        background: #059669 !important;
-        color: white !important;
-    }
-    
-    .shadow-lg, .shadow {
-        box-shadow: none !important;
-        border: 1px solid #e5e7eb !important;
-    }
-    
-    .rounded-lg, .rounded-2xl {
-        border-radius: 8px !important;
-    }
-    
-    body {
-        font-size: 12px !important;
-    }
-    
-    .text-4xl {
-        font-size: 24px !important;
-    }
-    
-    .text-2xl {
-        font-size: 16px !important;
-    }
-    
-    .text-lg {
-        font-size: 14px !important;
-    }
+    .no-print { display: none !important; }
+    .bg-gradient-to-r { background: #059669 !important; color: white !important; }
+    .shadow-lg, .shadow { box-shadow: none !important; border: 1px solid #e5e7eb !important; }
+    .rounded-lg, .rounded-2xl { border-radius: 8px !important; }
+    body { font-size: 12px !important; }
+    .text-4xl { font-size: 24px !important; }
+    .text-2xl { font-size: 16px !important; }
+    .text-lg { font-size: 14px !important; }
 }
 </style>
 
