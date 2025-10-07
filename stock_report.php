@@ -1,5 +1,390 @@
 <?php
 // stock_report.php - Comprehensive Stock Reports with Total Value Display
+
+// Handle PDF export FIRST, before any output
+if ((isset($_GET['download']) && $_GET['download'] === 'pdf') || (isset($_GET['print']) && $_GET['print'] === 'pdf')) {
+    // Include database connection only
+    require_once 'database.php';
+    
+    // Initialize database connection
+    $database = new Database();
+    $db = $database->getConnection();
+    
+    // Get filters
+    $location_filter = $_GET['location'] ?? '';
+    $item_type_filter = $_GET['item_type'] ?? '';
+    $low_stock_only = isset($_GET['low_stock']);
+    $view_mode = $_GET['view'] ?? 'summary';
+    
+    // Determine if this is for print or download
+    $is_print_mode = isset($_GET['print']) && $_GET['print'] === 'pdf';
+    
+    // Constants
+    $STORE_ID = 1;
+    $PRODUCTION_ID = 2;
+    
+    try {
+        // Database connection and data fetching for PDF
+        $stmt = $db->query("SELECT id, name FROM locations ORDER BY name");
+        $locations = $stmt->fetchAll();
+        
+        $location_map = [];
+        foreach ($locations as $loc) { $location_map[(int)$loc['id']] = $loc['name']; }
+        
+        // Get summary statistics
+        $stmt = $db->query("
+            SELECT 
+                COUNT(DISTINCT CASE WHEN stock_qty > 0 THEN i.id END) as total_items,
+                COUNT(DISTINCT l.id) as total_locations,
+                SUM(CASE WHEN stock_qty <= 10 AND stock_qty > 0 THEN 1 ELSE 0 END) as low_stock_items,
+                SUM(CASE WHEN stock_qty > 0 THEN stock_qty * COALESCE(i.cost_price, 0) ELSE 0 END) as total_stock_value,
+                SUM(CASE WHEN stock_qty > 0 THEN stock_qty ELSE 0 END) as total_quantity
+            FROM items i
+            CROSS JOIN locations l
+            LEFT JOIN (
+                SELECT 
+                    item_id, 
+                    location_id, 
+                    COALESCE(SUM(quantity_in - quantity_out), 0) as stock_qty
+                FROM stock_ledger 
+                GROUP BY item_id, location_id
+            ) sl ON i.id = sl.item_id AND l.id = sl.location_id
+        ");
+        $summary_stats = $stmt->fetch() ?: [
+            'total_items' => 0, 'total_locations' => 0, 'low_stock_items' => 0,
+            'total_stock_value' => 0, 'total_quantity' => 0
+        ];
+        
+        // Get data based on view mode
+        $location_summary = [];
+        $type_value_analysis = [];
+        $detailed_data_by_loc = [];
+        $detailed_location_names = [];
+        $stock_data = [];
+        $recent_movements = [];
+        
+        // Get type value analysis
+        $stmt = $db->query("
+            SELECT 
+                i.type,
+                COUNT(DISTINCT CASE WHEN stock_qty > 0 THEN i.id END) as item_count,
+                SUM(CASE WHEN stock_qty > 0 THEN stock_qty ELSE 0 END) as total_quantity,
+                SUM(CASE WHEN stock_qty > 0 THEN stock_qty * COALESCE(i.cost_price, 0) ELSE 0 END) as total_value,
+                AVG(CASE WHEN stock_qty > 0 THEN COALESCE(i.cost_price, 0) ELSE NULL END) as avg_cost_price
+            FROM items i
+            LEFT JOIN (
+                SELECT 
+                    item_id, 
+                    COALESCE(SUM(quantity_in - quantity_out), 0) as stock_qty
+                FROM stock_ledger 
+                GROUP BY item_id
+            ) sl ON i.id = sl.item_id
+            GROUP BY i.type
+            ORDER BY total_value DESC
+        ");
+        $type_value_analysis = $stmt->fetchAll();
+        
+        // Get location summary
+        $stmt = $db->query("
+            SELECT 
+                l.name,
+                COUNT(DISTINCT CASE WHEN stock_qty > 0 THEN i.id END) as items,
+                COUNT(DISTINCT CASE WHEN stock_qty > 0 AND i.type = 'raw' THEN i.id END) as raw,
+                COUNT(DISTINCT CASE WHEN stock_qty > 0 AND i.type = 'semi_finished' THEN i.id END) as semi_finished,
+                COUNT(DISTINCT CASE WHEN stock_qty > 0 AND i.type = 'finished' THEN i.id END) as finished,
+                SUM(CASE WHEN stock_qty > 0 THEN stock_qty * COALESCE(i.cost_price, 0) ELSE 0 END) as total_value
+            FROM locations l
+            CROSS JOIN items i
+            LEFT JOIN (
+                SELECT 
+                    item_id, 
+                    location_id, 
+                    COALESCE(SUM(quantity_in - quantity_out), 0) as stock_qty
+                FROM stock_ledger 
+                GROUP BY item_id, location_id
+            ) sl ON i.id = sl.item_id AND l.id = sl.location_id
+            GROUP BY l.id, l.name
+            ORDER BY total_value DESC
+        ");
+        $location_summary = $stmt->fetchAll();
+        
+        // Get detailed data if needed
+        if ($view_mode === 'detailed') {
+            $locations_to_show = [];
+            if ($location_filter !== '' && is_numeric($location_filter)) {
+                $locations_to_show = [(int)$location_filter];
+            } else {
+                $locations_to_show = [$STORE_ID, $PRODUCTION_ID];
+            }
+            
+            $extra_where = ["sl.stock_qty > 0"];
+            $extra_params = [];
+            if ($item_type_filter) { $extra_where[] = "i.type = ?"; $extra_params[] = $item_type_filter; }
+            if ($low_stock_only) { $extra_where[] = "sl.stock_qty <= 10"; }
+            $extra_where_sql = implode(' AND ', $extra_where);
+            
+            $sql = "
+                SELECT 
+                    i.id, i.code, i.name, i.type, 
+                    COALESCE(i.cost_price, 0) as cost_price,
+                    sl.stock_qty as current_stock,
+                    (sl.stock_qty * COALESCE(i.cost_price, 0)) as stock_value,
+                    u.symbol as unit_symbol
+                FROM items i
+                JOIN units u ON i.unit_id = u.id
+                JOIN (
+                    SELECT item_id, location_id, COALESCE(SUM(quantity_in - quantity_out), 0) as stock_qty
+                    FROM stock_ledger 
+                    GROUP BY item_id, location_id
+                ) sl ON sl.item_id = i.id
+                WHERE sl.location_id = ? AND $extra_where_sql
+                ORDER BY i.name
+            ";
+            
+            foreach ($locations_to_show as $locId) {
+                $params = array_merge([$locId], $extra_params);
+                $stmt = $db->prepare($sql);
+                $stmt->execute($params);
+                $detailed_data_by_loc[$locId] = $stmt->fetchAll();
+                $detailed_location_names[$locId] = $location_map[$locId] ?? ("Location #" . $locId);
+            }
+        }
+        
+        // Get value analysis data if needed
+        if ($view_mode === 'value_analysis') {
+            $v_where = ["sl_total.stock_qty > 0"];
+            $v_params = [];
+            if ($item_type_filter) { $v_where[] = "i.type = ?"; $v_params[] = $item_type_filter; }
+            if ($low_stock_only) { $v_where[] = "sl_total.stock_qty <= 10"; }
+            $v_where_sql = implode(' AND ', $v_where);
+            
+            $query = "
+                SELECT 
+                    i.id, i.code, i.name, i.type, 
+                    COALESCE(i.cost_price, 0) as cost_price,
+                    sl_total.stock_qty as current_stock,
+                    (sl_total.stock_qty * COALESCE(i.cost_price, 0)) as stock_value,
+                    u.symbol as unit_symbol
+                FROM items i
+                JOIN units u ON i.unit_id = u.id
+                LEFT JOIN (
+                    SELECT item_id, COALESCE(SUM(quantity_in - quantity_out), 0) as stock_qty
+                    FROM stock_ledger 
+                    GROUP BY item_id
+                ) sl_total ON i.id = sl_total.item_id
+                WHERE $v_where_sql
+                ORDER BY stock_value DESC
+            ";
+            $stmt = $db->prepare($query);
+            $stmt->execute($v_params);
+            $stock_data = $stmt->fetchAll();
+        }
+        
+        // Get recent movements if needed
+        if ($view_mode === 'movements') {
+            $stmt = $db->query("
+                SELECT 
+                    sl.transaction_date,
+                    i.code as item_code,
+                    i.name as item_name,
+                    l.name as location_name,
+                    sl.transaction_type,
+                    sl.reference_no,
+                    sl.quantity_in,
+                    sl.quantity_out,
+                    sl.balance,
+                    u.symbol as unit_symbol
+                FROM stock_ledger sl
+                JOIN items i ON sl.item_id = i.id
+                JOIN locations l ON sl.location_id = l.id
+                JOIN units u ON i.unit_id = u.id
+                WHERE sl.transaction_date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+                ORDER BY sl.transaction_date DESC, sl.id DESC
+                LIMIT 100
+            ");
+            $recent_movements = $stmt->fetchAll();
+        }
+        
+        // Generate PDF HTML
+        $html = '<!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <title>Stock Report</title>
+            <style>
+                body { font-family: Arial, sans-serif; font-size: 12px; margin: 20px; }
+                h1 { text-align: center; color: #333; margin-bottom: 20px; }
+                h2 { color: #555; font-size: 16px; margin: 15px 0 8px 0; }
+                table { width: 100%; border-collapse: collapse; margin: 10px 0; font-size: 11px; }
+                th, td { border: 1px solid #ddd; padding: 6px; text-align: left; }
+                th { background-color: #f2f2f2; font-weight: bold; }
+                .text-right { text-align: right; }
+                .summary-box { background: #f9f9f9; padding: 15px; margin: 10px 0; border-radius: 5px; }
+                .low-stock { background-color: #ffebee; }
+                .normal-stock { background-color: #e8f5e8; }
+            </style>
+        </head>
+        <body>
+            <h1>Stock Report - ' . ucfirst(str_replace('_', ' ', $view_mode)) . ' View</h1>
+            <p><strong>Generated:</strong> ' . date('Y-m-d H:i:s') . '</p>
+            
+            <div class="summary-box">
+                <h2>Summary Statistics</h2>
+                <p><strong>Total Stock Value:</strong> Rs. ' . number_format($summary_stats['total_stock_value'], 2) . '</p>
+                <p><strong>Total Items:</strong> ' . $summary_stats['total_items'] . '</p>
+                <p><strong>Total Quantity:</strong> ' . number_format($summary_stats['total_quantity'], 3) . '</p>
+                <p><strong>Low Stock Items:</strong> ' . $summary_stats['low_stock_items'] . '</p>
+            </div>';
+            
+        if ($view_mode === 'summary') {
+            $html .= '<h2>Location Summary</h2>
+                <table>
+                    <tr>
+                        <th>Location</th>
+                        <th>Total Items</th>
+                        <th>Raw Materials</th>
+                        <th>Semi-Finished</th>
+                        <th>Finished Goods</th>
+                        <th class="text-right">Total Value</th>
+                    </tr>';
+            
+            foreach ($location_summary as $location) {
+                $html .= '<tr>
+                    <td>' . htmlspecialchars($location['name']) . '</td>
+                    <td class="text-right">' . $location['items'] . '</td>
+                    <td class="text-right">' . $location['raw'] . '</td>
+                    <td class="text-right">' . $location['semi_finished'] . '</td>
+                    <td class="text-right">' . $location['finished'] . '</td>
+                    <td class="text-right">Rs. ' . number_format($location['total_value'], 2) . '</td>
+                </tr>';
+            }
+            $html .= '</table>';
+        }
+        
+        if ($view_mode === 'detailed') {
+            foreach ($detailed_data_by_loc as $locationId => $items) {
+                $location_name = $detailed_location_names[$locationId] ?? 'Location #'.$locationId;
+                $html .= '<h2>Location: ' . htmlspecialchars($location_name) . '</h2>';
+                $html .= '<table>
+                    <tr>
+                        <th>Item</th>
+                        <th>Type</th>
+                        <th>Stock</th>
+                        <th>Unit Cost</th>
+                        <th>Stock Value</th>
+                        <th>Status</th>
+                    </tr>';
+                
+                foreach ($items as $item) {
+                    $status = $item['current_stock'] <= 10 ? 'Low Stock' : 'Normal';
+                    $status_class = $item['current_stock'] <= 10 ? 'low-stock' : 'normal-stock';
+                    $html .= '<tr class="' . $status_class . '">
+                        <td>' . htmlspecialchars($item['name'] . ' (' . $item['code'] . ')') . '</td>
+                        <td>' . str_replace('_', ' ', $item['type']) . '</td>
+                        <td class="text-right">' . number_format($item['current_stock'], 3) . ' ' . $item['unit_symbol'] . '</td>
+                        <td class="text-right">Rs. ' . number_format($item['cost_price'], 2) . '</td>
+                        <td class="text-right">Rs. ' . number_format($item['stock_value'], 2) . '</td>
+                        <td>' . $status . '</td>
+                    </tr>';
+                }
+                $html .= '</table>';
+            }
+        }
+        
+        if ($view_mode === 'value_analysis') {
+            $html .= '<h2>Value Analysis (Highest Value First)</h2>
+                <table>
+                    <tr>
+                        <th>Item</th>
+                        <th>Type</th>
+                        <th>Stock</th>
+                        <th>Unit Cost</th>
+                        <th>Stock Value</th>
+                        <th>Status</th>
+                    </tr>';
+            
+            foreach ($stock_data as $item) {
+                $status = $item['current_stock'] <= 10 ? 'Low Stock' : 'Normal';
+                $status_class = $item['current_stock'] <= 10 ? 'low-stock' : 'normal-stock';
+                $html .= '<tr class="' . $status_class . '">
+                    <td>' . htmlspecialchars($item['name'] . ' (' . $item['code'] . ')') . '</td>
+                    <td>' . str_replace('_', ' ', $item['type']) . '</td>
+                    <td class="text-right">' . number_format($item['current_stock'], 3) . ' ' . $item['unit_symbol'] . '</td>
+                    <td class="text-right">Rs. ' . number_format($item['cost_price'], 2) . '</td>
+                    <td class="text-right">Rs. ' . number_format($item['stock_value'], 2) . '</td>
+                    <td>' . $status . '</td>
+                </tr>';
+            }
+            $html .= '</table>';
+        }
+        
+        if ($view_mode === 'movements') {
+            $html .= '<h2>Recent Movements (Last 30 Days)</h2>
+                <table>
+                    <tr>
+                        <th>Date</th>
+                        <th>Item</th>
+                        <th>Location</th>
+                        <th>Type</th>
+                        <th>Reference</th>
+                        <th>Qty In</th>
+                        <th>Qty Out</th>
+                        <th>Balance</th>
+                    </tr>';
+            
+            foreach ($recent_movements as $mv) {
+                $html .= '<tr>
+                    <td>' . htmlspecialchars(date('Y-m-d', strtotime($mv['transaction_date']))) . '</td>
+                    <td>' . htmlspecialchars($mv['item_name'] . ' (' . $mv['item_code'] . ')') . '</td>
+                    <td>' . htmlspecialchars($mv['location_name']) . '</td>
+                    <td>' . htmlspecialchars($mv['transaction_type']) . '</td>
+                    <td>' . htmlspecialchars($mv['reference_no'] ?? '-') . '</td>
+                    <td class="text-right">' . ($mv['quantity_in'] > 0 ? number_format($mv['quantity_in'], 3) : '-') . '</td>
+                    <td class="text-right">' . ($mv['quantity_out'] > 0 ? number_format($mv['quantity_out'], 3) : '-') . '</td>
+                    <td class="text-right">' . number_format($mv['balance'], 3) . '</td>
+                </tr>';
+            }
+            $html .= '</table>';
+        }
+        
+        $html .= '</body></html>';
+        
+        // Add print JavaScript for print mode
+        if ($is_print_mode) {
+            // Insert print script before closing body tag
+            $html = str_replace('</body>', '
+            <script>
+                window.onload = function() {
+                    window.print();
+                    // Optional: close window after printing (uncomment if needed)
+                    // window.onafterprint = function() { window.close(); };
+                };
+            </script>
+            </body>', $html);
+        }
+        
+        // Set headers based on mode
+        header('Content-Type: text/html; charset=UTF-8');
+        
+        if ($is_print_mode) {
+            // For print mode, use inline disposition
+            header('Content-Disposition: inline; filename="stock_report_' . $view_mode . '_' . date('Y-m-d') . '.html"');
+        } else {
+            // For download mode, use attachment disposition
+            header('Content-Disposition: attachment; filename="stock_report_' . $view_mode . '_' . date('Y-m-d') . '.html"');
+        }
+        
+        // Output the HTML
+        echo $html;
+        exit;
+        
+    } catch (Exception $e) {
+        header('Content-Type: text/plain');
+        echo "Error generating PDF: " . $e->getMessage();
+        exit;
+    }
+}
+
 include 'header.php';
 
 // Get filters
@@ -252,11 +637,22 @@ try {
                 <option value="value_analysis" <?php echo $view_mode === 'value_analysis' ? 'selected' : ''; ?>>💰 Value Analysis</option>
                 <option value="movements" <?php echo $view_mode === 'movements' ? 'selected' : ''; ?>>Recent Movements</option>
             </select>
+
+            <!-- PDF Export buttons (preserves current filters) -->
+            <button
+                onclick="location.href='?view=<?php echo urlencode($view_mode); ?><?php echo $location_filter!=='' ? '&location='.urlencode($location_filter) : ''; ?><?php echo $item_type_filter!=='' ? '&item_type='.urlencode($item_type_filter) : ''; ?><?php echo $low_stock_only ? '&low_stock=1' : ''; ?>&download=pdf'"
+                class="bg-rose-600 text-white px-4 py-2 rounded-md hover:bg-rose-700 transition-colors">
+                ⬇️ Download PDF
+            </button>
+            
+            <button
+                onclick="window.open('?view=<?php echo urlencode($view_mode); ?><?php echo $location_filter!=='' ? '&location='.urlencode($location_filter) : ''; ?><?php echo $item_type_filter!=='' ? '&item_type='.urlencode($item_type_filter) : ''; ?><?php echo $low_stock_only ? '&low_stock=1' : ''; ?>&print=pdf', '_blank')"
+                class="bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700 transition-colors">
+                🖨️ Print PDF
+            </button>
+
             <button onclick="exportToCSV()" class="bg-green-600 text-white px-4 py-2 rounded-md hover:bg-green-700 transition-colors">
                 📊 Export CSV
-            </button>
-            <button onclick="window.print()" class="bg-gray-500 text-white px-4 py-2 rounded-md hover:bg-gray-600 transition-colors">
-                🖨️ Print Report
             </button>
         </div>
     </div>
@@ -323,7 +719,7 @@ try {
             <div class="flex items-center">
                 <div class="p-3 rounded-full bg-green-100">
                     <svg class="w-6 h-6 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2z"/>
                     </svg>
                 </div>
                 <div class="ml-4">
