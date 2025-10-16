@@ -21,35 +21,63 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                 case 'create_peetu':
                     $peetu_item_id = as_int_or_zero($_POST['peetu_item_id'] ?? null);
                     $raw_ids       = safe_arr($_POST['raw_material_id'] ?? []);
+                    $category_ids  = safe_arr($_POST['category_id'] ?? []);
                     $qtys          = safe_arr($_POST['quantity'] ?? []);
 
                     if ($peetu_item_id <= 0) {
                         throw new Exception("Please select a Semi-Finished (Peetu) item.");
                     }
-                    if (empty($raw_ids)) {
-                        throw new Exception("Please add at least one raw material row.");
+                    
+                    // Filter out empty values and get count of valid entries
+                    $raw_ids_clean = array_filter($raw_ids, function($v) { return !empty($v); });
+                    $category_ids_clean = array_filter($category_ids, function($v) { return !empty($v); });
+                    
+                    if (empty($raw_ids_clean) && empty($category_ids_clean)) {
+                        throw new Exception("Please add at least one raw material or category row.");
                     }
 
                     $db->beginTransaction();
                     $inserted = 0;
 
-                    for ($i = 0; $i < count($raw_ids); $i++) {
-                        $rid = as_int_or_zero($raw_ids[$i] ?? 0);
+                    // Process each quantity entry
+                    $num_rows = count($qtys);
+                    for ($i = 0; $i < $num_rows; $i++) {
+                        $rid = isset($raw_ids[$i]) && !empty($raw_ids[$i]) ? as_int_or_zero($raw_ids[$i]) : 0;
+                        $cid = isset($category_ids[$i]) && !empty($category_ids[$i]) ? as_int_or_zero($category_ids[$i]) : 0;
                         $q   = as_float_or_zero($qtys[$i] ?? 0);
-                        if ($rid > 0 && $q > 0) {
-                            // Upsert by (peetu_item_id, raw_material_id)
-                            $stmt = $db->prepare("SELECT id FROM bom_peetu WHERE peetu_item_id = ? AND raw_material_id = ?");
-                            $stmt->execute([$peetu_item_id, $rid]);
-                            $exists = $stmt->fetch(PDO::FETCH_ASSOC);
+                        
+                        // Each row must have either a raw material OR a category (not both)
+                        if (($rid > 0 || $cid > 0) && $q > 0) {
+                            // Upsert by (peetu_item_id, raw_material_id or category_id)
+                            if ($rid > 0) {
+                                // Raw material entry
+                                $stmt = $db->prepare("SELECT id FROM bom_peetu WHERE peetu_item_id = ? AND raw_material_id = ? AND category_id IS NULL");
+                                $stmt->execute([$peetu_item_id, $rid]);
+                                $exists = $stmt->fetch(PDO::FETCH_ASSOC);
 
-                            if ($exists) {
-                                $stmt = $db->prepare("UPDATE bom_peetu SET quantity = ? WHERE id = ?");
-                                $stmt->execute([$q, $exists['id']]);
-                            } else {
-                                $stmt = $db->prepare("INSERT INTO bom_peetu (peetu_item_id, raw_material_id, quantity) VALUES (?, ?, ?)");
-                                $stmt->execute([$peetu_item_id, $rid, $q]);
+                                if ($exists) {
+                                    $stmt = $db->prepare("UPDATE bom_peetu SET quantity = ? WHERE id = ?");
+                                    $stmt->execute([$q, $exists['id']]);
+                                } else {
+                                    $stmt = $db->prepare("INSERT INTO bom_peetu (peetu_item_id, raw_material_id, category_id, quantity) VALUES (?, ?, NULL, ?)");
+                                    $stmt->execute([$peetu_item_id, $rid, $q]);
+                                }
+                                $inserted++;
+                            } else if ($cid > 0) {
+                                // Category entry
+                                $stmt = $db->prepare("SELECT id FROM bom_peetu WHERE peetu_item_id = ? AND category_id = ? AND raw_material_id IS NULL");
+                                $stmt->execute([$peetu_item_id, $cid]);
+                                $exists = $stmt->fetch(PDO::FETCH_ASSOC);
+
+                                if ($exists) {
+                                    $stmt = $db->prepare("UPDATE bom_peetu SET quantity = ? WHERE id = ?");
+                                    $stmt->execute([$q, $exists['id']]);
+                                } else {
+                                    $stmt = $db->prepare("INSERT INTO bom_peetu (peetu_item_id, raw_material_id, category_id, quantity) VALUES (?, NULL, ?, ?)");
+                                    $stmt->execute([$peetu_item_id, $cid, $q]);
+                                }
+                                $inserted++;
                             }
-                            $inserted++;
                         }
                     }
 
@@ -227,29 +255,54 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                     $finished_item_id = as_int_or_zero($_POST['finished_item_id'] ?? 0);
                     $finished_unit_qty = as_float_or_zero($_POST['finished_unit_qty'] ?? 1.0);
                     $raw_ids = safe_arr($_POST['raw_material_id'] ?? []);
+                    $category_ids = safe_arr($_POST['category_id'] ?? []);
                     $qtys = safe_arr($_POST['quantity'] ?? []);
 
                     if ($finished_item_id <= 0) throw new Exception("Please select a Finished item.");
                     if ($finished_unit_qty <= 0) throw new Exception("Please enter a valid unit quantity for the finished product.");
-                    if (empty($raw_ids)) throw new Exception("Please add at least one raw material row.");
+                    
+                    // Filter out empty values
+                    $raw_ids_clean = array_filter($raw_ids, function($v) { return !empty($v); });
+                    $category_ids_clean = array_filter($category_ids, function($v) { return !empty($v); });
+                    
+                    if (empty($raw_ids_clean) && empty($category_ids_clean)) {
+                        throw new Exception("Please add at least one raw material or category row.");
+                    }
 
                     $db->beginTransaction();
                     $added = 0;
-                    for ($i = 0; $i < count($raw_ids); $i++) {
-                        $rid = as_int_or_zero($raw_ids[$i] ?? 0);
+                    $num_rows = count($qtys);
+                    for ($i = 0; $i < $num_rows; $i++) {
+                        $rid = isset($raw_ids[$i]) && !empty($raw_ids[$i]) ? as_int_or_zero($raw_ids[$i]) : 0;
+                        $cid = isset($category_ids[$i]) && !empty($category_ids[$i]) ? as_int_or_zero($category_ids[$i]) : 0;
                         $q = as_float_or_zero($qtys[$i] ?? 0);
-                        if ($rid > 0 && $q > 0) {
-                            // Upsert by (finished_item_id, raw_material_id)
-                            $chk = $db->prepare("SELECT id FROM bom_direct WHERE finished_item_id = ? AND raw_material_id = ?");
-                            $chk->execute([$finished_item_id, $rid]);
-                            if ($row = $chk->fetch(PDO::FETCH_ASSOC)) {
-                                $upd = $db->prepare("UPDATE bom_direct SET quantity = ?, finished_unit_qty = ? WHERE id = ?");
-                                $upd->execute([$q, $finished_unit_qty, $row['id']]);
-                            } else {
-                                $ins = $db->prepare("INSERT INTO bom_direct (finished_item_id, finished_unit_qty, raw_material_id, quantity) VALUES (?, ?, ?, ?)");
-                                $ins->execute([$finished_item_id, $finished_unit_qty, $rid, $q]);
+                        
+                        if (($rid > 0 || $cid > 0) && $q > 0) {
+                            if ($rid > 0) {
+                                // Raw material entry
+                                $chk = $db->prepare("SELECT id FROM bom_direct WHERE finished_item_id = ? AND raw_material_id = ? AND category_id IS NULL");
+                                $chk->execute([$finished_item_id, $rid]);
+                                if ($row = $chk->fetch(PDO::FETCH_ASSOC)) {
+                                    $upd = $db->prepare("UPDATE bom_direct SET quantity = ?, finished_unit_qty = ? WHERE id = ?");
+                                    $upd->execute([$q, $finished_unit_qty, $row['id']]);
+                                } else {
+                                    $ins = $db->prepare("INSERT INTO bom_direct (finished_item_id, finished_unit_qty, raw_material_id, category_id, quantity) VALUES (?, ?, ?, NULL, ?)");
+                                    $ins->execute([$finished_item_id, $finished_unit_qty, $rid, $q]);
+                                }
+                                $added++;
+                            } else if ($cid > 0) {
+                                // Category entry
+                                $chk = $db->prepare("SELECT id FROM bom_direct WHERE finished_item_id = ? AND category_id = ? AND raw_material_id IS NULL");
+                                $chk->execute([$finished_item_id, $cid]);
+                                if ($row = $chk->fetch(PDO::FETCH_ASSOC)) {
+                                    $upd = $db->prepare("UPDATE bom_direct SET quantity = ?, finished_unit_qty = ? WHERE id = ?");
+                                    $upd->execute([$q, $finished_unit_qty, $row['id']]);
+                                } else {
+                                    $ins = $db->prepare("INSERT INTO bom_direct (finished_item_id, finished_unit_qty, raw_material_id, category_id, quantity) VALUES (?, ?, NULL, ?, ?)");
+                                    $ins->execute([$finished_item_id, $finished_unit_qty, $cid, $q]);
+                                }
+                                $added++;
                             }
-                            $added++;
                         }
                     }
                     $db->commit();
@@ -289,6 +342,33 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
 
 /* ============================ Fetch data ============================ */
 
+/* Categories for BOM - FETCH FIRST (needed for peetu_rows processing) */
+$categories = [];
+try {
+    $stmt = $db->query("SELECT id, name FROM categories ORDER BY name");
+    $categories = $stmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
+} catch(PDOException $e) {
+    $error = "Error fetching categories: " . $e->getMessage();
+    $categories = [];
+}
+
+/* Category stocks - FETCH FIRST (needed for peetu_rows processing) */
+$category_stocks = [];
+try {
+    $stmt = $db->query("
+        SELECT c.id, c.name, COALESCE(SUM(
+            COALESCE((SELECT SUM(sl.quantity_in - sl.quantity_out) FROM stock_ledger sl WHERE sl.item_id = i.id), 0)
+        ), 0) as total_stock
+        FROM categories c
+        LEFT JOIN items i ON i.category_id = c.id AND i.type = 'raw'
+        GROUP BY c.id, c.name
+    ");
+    $category_stocks = $stmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
+} catch(PDOException $e) {
+    $error = "Error fetching category stocks: " . $e->getMessage();
+    $category_stocks = [];
+}
+
 /* Peetu rows (semi-finished + raw requirements) */
 $peetu_rows = [];
 try {
@@ -297,20 +377,39 @@ try {
         SELECT bp.*,
                fi.name  AS peetu_name,  fi.code AS peetu_code,  fu.symbol AS peetu_unit,
                rm.name  AS raw_material_name, rm.code AS raw_material_code, ru.symbol AS raw_unit,
+               cat.name AS category_name,
                COALESCE((SELECT SUM(sl.quantity_in - sl.quantity_out)
                          FROM stock_ledger sl
                          WHERE sl.item_id = rm.id), 0) AS raw_material_stock
         FROM bom_peetu bp
         JOIN items fi ON bp.peetu_item_id = fi.id AND fi.type = 'semi_finished'
         JOIN units fu ON fi.unit_id = fu.id
-        JOIN items rm ON bp.raw_material_id = rm.id
-        JOIN units ru ON rm.unit_id = ru.id
+        LEFT JOIN items rm ON bp.raw_material_id = rm.id
+        LEFT JOIN units ru ON rm.unit_id = ru.id
+        LEFT JOIN categories cat ON bp.category_id = cat.id
         ORDER BY fi.name, rm.name
     ");
     $peetu_rows = $stmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
 } catch(PDOException $e) {
     $error = "Error fetching Peetu entries: " . $e->getMessage();
     $peetu_rows = [];
+}
+
+// Adjust for category rows
+foreach ($peetu_rows as &$r) {
+    if ($r['category_id'] && !$r['raw_material_id']) {
+        $cat = null;
+        foreach ($category_stocks as $c) {
+            if ($c['id'] == $r['category_id']) {
+                $cat = $c;
+                break;
+            }
+        }
+        $r['raw_material_stock'] = $cat ? (float)$cat['total_stock'] : 0;
+        $r['raw_material_name'] = $r['category_name'];
+        $r['raw_material_code'] = '';
+        $r['raw_unit'] = 'units';
+    }
 }
 
 /* Semi-finished items (dropdowns) */
@@ -333,10 +432,10 @@ try {
     $finished_items = [];
 }
 
-/* Raw materials (dropdown for Peetu create) */
+/* Raw materials (dropdown for Peetu create) - includes category_id and using_category */
 $raw_materials = [];
 try {
-    $stmt = $db->query("SELECT i.*, u.symbol FROM items i JOIN units u ON i.unit_id = u.id WHERE i.type = 'raw' ORDER BY i.name");
+    $stmt = $db->query("SELECT i.*, u.symbol, i.category_id, i.using_category FROM items i JOIN units u ON i.unit_id = u.id WHERE i.type = 'raw' ORDER BY i.name");
     $raw_materials = $stmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
 } catch(PDOException $e) {
     $error = "Error fetching raw materials: " . $e->getMessage();
@@ -416,6 +515,7 @@ try {
         SELECT bd.*,
                f.name AS finished_name, f.code AS finished_code, fu.symbol AS finished_unit,
                r.name AS raw_name, r.code AS raw_code, ru.symbol AS raw_unit,
+               cat.name AS category_name,
                COALESCE((
                    SELECT SUM(sl.quantity_in - sl.quantity_out)
                    FROM stock_ledger sl
@@ -424,14 +524,32 @@ try {
         FROM bom_direct bd
         JOIN items f  ON f.id = bd.finished_item_id AND f.type = 'finished'
         JOIN units fu ON fu.id = f.unit_id
-        JOIN items r  ON r.id = bd.raw_material_id AND r.type = 'raw'
-        JOIN units ru ON ru.id = r.unit_id
+        LEFT JOIN items r  ON r.id = bd.raw_material_id AND r.type = 'raw'
+        LEFT JOIN units ru ON ru.id = r.unit_id
+        LEFT JOIN categories cat ON bd.category_id = cat.id
         ORDER BY f.name, r.name
     ");
     $direct_bom_rows = $stmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
 } catch(PDOException $e) {
     $error = "Error fetching Direct BOM entries: " . $e->getMessage();
     $direct_bom_rows = [];
+}
+
+// Adjust for category rows in Direct BOM
+foreach ($direct_bom_rows as &$r) {
+    if ($r['category_id'] && !$r['raw_material_id']) {
+        $cat = null;
+        foreach ($category_stocks as $c) {
+            if ($c['id'] == $r['category_id']) {
+                $cat = $c;
+                break;
+            }
+        }
+        $r['raw_stock'] = $cat ? (float)$cat['total_stock'] : 0;
+        $r['raw_name'] = $r['category_name'];
+        $r['raw_code'] = '';
+        $r['raw_unit'] = 'units';
+    }
 }
 
 /* Group Direct BOM by finished item */
@@ -810,16 +928,19 @@ foreach ($direct_bom_rows as $r) {
                     <table class="min-w-full border border-gray-300" id="peetuRawTable">
                         <thead class="bg-gray-50">
                             <tr>
-                                <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase border">Raw Material</th>
+                                <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase border">Raw Material / Category</th>
                                 <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase border">Qty</th>
-                                <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase border">Unit</th>
+                                <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase border">Unit / Stock</th>
                                 <th class="px-3 py-2 text-center text-xs font-medium text-gray-500 uppercase border">Action</th>
                             </tr>
                         </thead>
                         <tbody></tbody>
                     </table>
                 </div>
-                <p class="text-xs text-gray-500 mt-1">Tip: add as many raw materials as needed for one unit of the selected Peetu.</p>
+                <p class="text-xs text-gray-500 mt-1">
+                    <strong>Tip:</strong> Add as many raw materials as needed. If a raw material has "Use Category for BOM" enabled, 
+                    it will automatically switch to category selection.
+                </p>
             </div>
 
             <div class="flex justify-end gap-3 pt-2">
@@ -1038,7 +1159,7 @@ foreach ($direct_bom_rows as $r) {
                     <table class="min-w-full border border-gray-300" id="directBomTable">
                         <thead class="bg-gray-50">
                             <tr>
-                                <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase border">Raw Material</th>
+                                <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase border">Raw Material / Category</th>
                                 <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase border">Qty</th>
                                 <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase border">Unit</th>
                                 <th class="px-3 py-2 text-center text-xs font-medium text-gray-500 uppercase border">Action</th>
@@ -1047,7 +1168,10 @@ foreach ($direct_bom_rows as $r) {
                         <tbody></tbody>
                     </table>
                 </div>
-                <p class="text-xs text-gray-500 mt-1">Add raw materials needed to make 1 piece of the finished product (with specified weight).</p>
+                <p class="text-xs text-gray-500 mt-1">
+                    Add raw materials needed to make 1 piece of the finished product. 
+                    If a raw material has "Use Category for BOM" enabled, it will switch to category selection.
+                </p>
             </div>
 
             <div class="flex justify-end gap-3 pt-2">
@@ -1100,15 +1224,56 @@ foreach ($direct_bom_rows as $r) {
 <script>
 /* ---------- Peetu (Semi-Finished → Raw) ---------- */
 const RAWS = <?php echo json_encode($raw_materials ?? []); ?>;
+const CATEGORIES = <?php echo json_encode($categories ?? []); ?>;
+const CATEGORY_STOCKS = <?php echo json_encode($category_stocks ?? []); ?>;
 
 function rawSelectHTML() {
-    let opts = '<option value="">Select Raw Material</option>';
+    // Build dropdown showing categories directly for category-enabled items
+    let opts = '<option value="">Select Material / Category</option>';
+    
+    // Group items by category
+    const categorizedItems = new Map();
+    const nonCategorizedItems = [];
+    
     (RAWS || []).forEach(r => {
-        const label = `${r.name || ''} (${r.code || ''}) - ${r.symbol || ''}`;
-        opts += `<option value="${r.id}" data-unit="${r.symbol||''}">${escapeHtml(label)}</option>`;
+        const useCat = parseInt(r.using_category || 0);
+        const catId = parseInt(r.category_id || 0);
+        
+        if (useCat === 1 && catId > 0) {
+            // This item uses category - group it
+            if (!categorizedItems.has(catId)) {
+                categorizedItems.set(catId, []);
+            }
+            categorizedItems.get(catId).push(r);
+        } else {
+            // Regular item - add to non-categorized
+            nonCategorizedItems.push(r);
+        }
     });
+    
+    // Add categories first (for category-enabled items)
+    categorizedItems.forEach((items, catId) => {
+        const cat = (CATEGORIES || []).find(c => parseInt(c.id) === catId);
+        if (cat) {
+            const stock = (CATEGORY_STOCKS.find(cs => parseInt(cs.id) === catId) || {}).total_stock || 0;
+            const label = `${cat.name} (Category - Stock: ${parseFloat(stock).toFixed(3)})`;
+            opts += `<option value="cat_${catId}" data-type="category" data-category_id="${catId}" data-stock="${stock}">${escapeHtml(label)}</option>`;
+        }
+    });
+    
+    // Add separator if we have both categories and materials
+    if (categorizedItems.size > 0 && nonCategorizedItems.length > 0) {
+        opts += `<option disabled>──────────────────────</option>`;
+    }
+    
+    // Add non-categorized items
+    nonCategorizedItems.forEach(r => {
+        const label = `${r.name || ''} (${r.code || ''}) - ${r.symbol || ''}`;
+        opts += `<option value="${r.id}" data-type="material" data-unit="${r.symbol||''}">${escapeHtml(label)}</option>`;
+    });
+    
     return `
-        <select name="raw_material_id[]" class="w-full px-2 py-1 border border-gray-300 rounded text-sm raw-select" onchange="syncRowUnit(this)" required>
+        <select class="w-full px-2 py-1 border border-gray-300 rounded text-sm raw-select" onchange="handleMaterialOrCategorySelect(this)" required>
             ${opts}
         </select>
     `;
@@ -1118,20 +1283,19 @@ function addRawRow() {
     const tb = document.querySelector('#peetuRawTable tbody');
     const tr = document.createElement('tr');
     tr.innerHTML = `
-        <td class="px-3 py-2 border">${rawSelectHTML()}</td>
+        <td class="px-3 py-2 border material-selection-cell">${rawSelectHTML()}</td>
         <td class="px-3 py-2 border">
             <input type="number" name="quantity[]" step="0.001" class="w-full px-2 py-1 border border-gray-300 rounded text-sm" placeholder="0.000" required>
         </td>
         <td class="px-3 py-2 border">
-            <span class="inline-block text-xs text-gray-600 unit-badge"></span>
+            <span class="inline-block text-xs text-gray-600 unit-stock-badge"></span>
         </td>
         <td class="px-3 py-2 border text-center">
             <button type="button" class="text-red-600 hover:text-red-800 text-sm" onclick="removeRawRow(this)">Remove</button>
         </td>
     `;
     tb.appendChild(tr);
-    const select = tr.querySelector('.raw-select');
-    if (select) syncRowUnit(select);
+    // Name attribute will be set by handleMaterialOrCategorySelect when user makes selection
 }
 
 function removeRawRow(btn) {
@@ -1141,21 +1305,114 @@ function removeRawRow(btn) {
 }
 
 function syncRowUnit(select) {
-    const unit = select.options[select.selectedIndex]?.getAttribute('data-unit') || '';
+    const unit = select.selectedOptions[0]?.getAttribute('data-unit') || '';
     const row = select.closest('tr');
-    row.querySelector('.unit-badge').textContent = unit;
+    const badge = row.querySelector('.unit-stock-badge') || row.querySelector('.unit-badge');
+    if (badge) {
+        badge.textContent = unit;
+    }
+}
+
+function categorySelectHTML() {
+    let opts = '<option value="">Select Category</option>';
+    (CATEGORIES || []).forEach(c => {
+        const stock = (CATEGORY_STOCKS.find(cs => cs.id == c.id) || {}).total_stock || 0;
+        opts += `<option value="${c.id}" data-stock="${stock}">${escapeHtml(c.name)}</option>`;
+    });
+    return `
+        <select class="w-full px-2 py-1 border border-gray-300 rounded text-sm category-select" onchange="syncCategoryStock(this)" required>
+            ${opts}
+        </select>
+    `;
+}
+
+function handleMaterialOrCategorySelect(select) {
+    const selectedOption = select.selectedOptions[0];
+    if (!selectedOption) return;
+    
+    const selectedValue = select.value;
+    const dataType = selectedOption.getAttribute('data-type');
+    const row = select.closest('tr');
+    const td = select.closest('td');
+    
+    // Clear any existing hidden inputs
+    const existingHiddenInputs = td.querySelectorAll('input[type="hidden"]');
+    existingHiddenInputs.forEach(input => input.remove());
+    
+    if (dataType === 'category') {
+        // Category selected - extract category ID from value (cat_5 -> 5)
+        const categoryId = selectedValue.replace('cat_', '');
+        const stock = selectedOption.getAttribute('data-stock') || '0';
+        
+        // Create hidden input for category
+        const hiddenInput = document.createElement('input');
+        hiddenInput.type = 'hidden';
+        hiddenInput.name = 'category_id[]';
+        hiddenInput.className = 'category-id-input';
+        hiddenInput.value = categoryId;
+        td.appendChild(hiddenInput);
+        
+        // Clear the select name (data comes from hidden input)
+        select.name = '';
+        
+        // Update stock display
+        const badge = row.querySelector('.unit-stock-badge') || row.querySelector('.unit-badge');
+        if (badge) {
+            badge.textContent = `Stock: ${parseFloat(stock).toFixed(3)} units`;
+        }
+    } else if (dataType === 'material') {
+        // Material selected
+        const unit = selectedOption.getAttribute('data-unit') || '';
+        
+        // Set the select name for material
+        select.name = 'raw_material_id[]';
+        
+        // Update unit display
+        const badge = row.querySelector('.unit-stock-badge') || row.querySelector('.unit-badge');
+        if (badge) {
+            badge.textContent = unit;
+        }
+    }
+}
+
+// Keep the old function for backward compatibility
+function updateMaterialSelect(select) {
+    handleMaterialOrCategorySelect(select);
+}
+
+function syncCategoryStock(select) {
+    const stock = select.selectedOptions[0]?.getAttribute('data-stock') || '0';
+    const row = select.closest('tr');
+    row.querySelector('.unit-stock-badge').textContent = `Stock: ${parseFloat(stock).toFixed(3)} units`;
 }
 
 function validatePeetuForm() {
     const peetu = document.getElementById('create_peetu_item_id').value;
     if (!peetu) { alert('Please select a Semi-Finished (Peetu) item.'); return false; }
-    const raws = document.querySelectorAll('#peetuRawTable tbody tr');
-    if (!raws.length) { alert('Please add at least one raw material row.'); return false; }
-    for (const r of raws) {
-        const sel = r.querySelector('.raw-select');
-        const qty = r.querySelector('input[name="quantity[]"]');
-        if (!sel.value || !qty.value || parseFloat(qty.value) <= 0) {
-            alert('Each row must have a raw material and a positive quantity.');
+    const rows = document.querySelectorAll('#peetuRawTable tbody tr');
+    if (!rows.length) { alert('Please add at least one raw material row.'); return false; }
+    
+    for (const row of rows) {
+        const td = row.querySelector('.material-selection-cell');
+        const qty = row.querySelector('input[name="quantity[]"]');
+        
+        // Check if selection dropdown has a value
+        const select = td.querySelector('.raw-select');
+        const categoryInput = td.querySelector('input[name="category_id[]"]');
+        
+        let hasValidSelection = false;
+        if (select && select.value && select.value !== '') {
+            // Either material or category option selected
+            hasValidSelection = true;
+        }
+        
+        if (!hasValidSelection) {
+            alert('Each row must have a material or category selected.');
+            return false;
+        }
+        
+        if (!qty.value || parseFloat(qty.value) <= 0) {
+            alert('Each row must have a positive quantity.');
             return false;
         }
     }
@@ -1395,7 +1652,7 @@ function addDirectBomRow() {
     const tb = document.querySelector('#directBomTable tbody');
     const tr = document.createElement('tr');
     tr.innerHTML = `
-        <td class="px-3 py-2 border">${rawSelectHTML()}</td>
+        <td class="px-3 py-2 border material-selection-cell">${rawSelectHTML()}</td>
         <td class="px-3 py-2 border">
             <input type="number" name="quantity[]" step="0.001" class="w-full px-2 py-1 border border-gray-300 rounded text-sm" placeholder="0.000" required>
         </td>
@@ -1407,8 +1664,7 @@ function addDirectBomRow() {
         </td>
     `;
     tb.appendChild(tr);
-    const select = tr.querySelector('.raw-select');
-    if (select) syncRowUnit(select);
+    // Name attribute will be set by handleMaterialOrCategorySelect when user makes selection
 }
 
 function removeDirectBomRow(btn) {
@@ -1429,11 +1685,27 @@ function validateDirectBomForm() {
     
     const rows = document.querySelectorAll('#directBomTable tbody tr');
     if (!rows.length) { alert('Please add at least one raw material row.'); return false; }
-    for (const r of rows) {
-        const sel = r.querySelector('.raw-select');
-        const qty = r.querySelector('input[name="quantity[]"]');
-        if (!sel.value || !qty.value || parseFloat(qty.value) <= 0) {
-            alert('Each row must have a raw material and a positive quantity.');
+    
+    for (const row of rows) {
+        const td = row.querySelector('.material-selection-cell');
+        const qty = row.querySelector('input[name="quantity[]"]');
+        
+        // Check if selection dropdown has a value
+        const select = td.querySelector('.raw-select');
+        
+        let hasValidSelection = false;
+        if (select && select.value && select.value !== '') {
+            // Either material or category option selected
+            hasValidSelection = true;
+        }
+        
+        if (!hasValidSelection) {
+            alert('Each row must have a material or category selected.');
+            return false;
+        }
+        
+        if (!qty.value || parseFloat(qty.value) <= 0) {
+            alert('Each row must have a positive quantity.');
             return false;
         }
     }

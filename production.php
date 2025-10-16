@@ -138,9 +138,11 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                         
                         // Validate RAW availability for direct production
                         $stmt = $db->prepare("
-                            SELECT bd.raw_material_id, bd.quantity AS per_unit_qty, bd.finished_unit_qty, i.name AS raw_name
+                            SELECT bd.raw_material_id, bd.category_id, bd.quantity AS per_unit_qty, bd.finished_unit_qty, 
+                                   COALESCE(i.name, c.name) AS raw_name
                             FROM bom_direct bd
-                            JOIN items i ON i.id = bd.raw_material_id
+                            LEFT JOIN items i ON i.id = bd.raw_material_id
+                            LEFT JOIN categories c ON c.id = bd.category_id
                             WHERE bd.finished_item_id = ?
                         ");
                         $stmt->execute([$item_id]);
@@ -153,12 +155,24 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                             $units_to_produce = $planned_qty / $finished_unit_qty; // How many units we're making
                             $req = (float)$rw['per_unit_qty'] * $units_to_produce;
                             
-                            $s = $db->prepare("
-                                SELECT COALESCE(SUM(quantity_in - quantity_out),0)
-                                FROM stock_ledger
-                                WHERE item_id=? AND location_id=?
-                            ");
-                            $s->execute([(int)$rw['raw_material_id'], $location_id]);
+                            if ($rw['category_id']) {
+                                // Category-based: sum stock across all items in category
+                                $s = $db->prepare("
+                                    SELECT COALESCE(SUM(sl.quantity_in - sl.quantity_out),0)
+                                    FROM stock_ledger sl
+                                    JOIN items i ON i.id = sl.item_id
+                                    WHERE i.category_id=? AND sl.location_id=?
+                                ");
+                                $s->execute([(int)$rw['category_id'], $location_id]);
+                            } else {
+                                // Regular raw material
+                                $s = $db->prepare("
+                                    SELECT COALESCE(SUM(quantity_in - quantity_out),0)
+                                    FROM stock_ledger
+                                    WHERE item_id=? AND location_id=?
+                                ");
+                                $s->execute([(int)$rw['raw_material_id'], $location_id]);
+                            }
                             $have = (float)$s->fetchColumn();
                             if ($have + 1e-9 < $req) {
                                 $need = number_format($req, 3);
@@ -190,9 +204,11 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                         // Validate RAW availability to make that many Peetu
                         //   Need: sum(raw per 1 peetu) * peetu_qty  (from bom_peetu)
                         $stmt = $db->prepare("
-                            SELECT bp.raw_material_id, bp.quantity AS per_peetu_qty, i.name AS raw_name
+                            SELECT bp.raw_material_id, bp.category_id, bp.quantity AS per_peetu_qty, 
+                                   COALESCE(i.name, c.name) AS raw_name
                             FROM bom_peetu bp
-                            JOIN items i ON i.id = bp.raw_material_id
+                            LEFT JOIN items i ON i.id = bp.raw_material_id
+                            LEFT JOIN categories c ON c.id = bp.category_id
                             WHERE bp.peetu_item_id = ?
                         ");
                         $stmt->execute([$peetu_item_id]);
@@ -204,12 +220,24 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                         foreach ($raws as $rw) {
                             $req = (float)$rw['per_peetu_qty'] * $peetu_qty;
 
-                            $s = $db->prepare("
-                                SELECT COALESCE(SUM(quantity_in - quantity_out),0)
-                                FROM stock_ledger
-                                WHERE item_id=? AND location_id=?
-                            ");
-                            $s->execute([(int)$rw['raw_material_id'], $location_id]);
+                            if ($rw['category_id']) {
+                                // Category-based: sum stock across all items in category
+                                $s = $db->prepare("
+                                    SELECT COALESCE(SUM(sl.quantity_in - sl.quantity_out),0)
+                                    FROM stock_ledger sl
+                                    JOIN items i ON i.id = sl.item_id
+                                    WHERE i.category_id=? AND sl.location_id=?
+                                ");
+                                $s->execute([(int)$rw['category_id'], $location_id]);
+                            } else {
+                                // Regular raw material
+                                $s = $db->prepare("
+                                    SELECT COALESCE(SUM(quantity_in - quantity_out),0)
+                                    FROM stock_ledger
+                                    WHERE item_id=? AND location_id=?
+                                ");
+                                $s->execute([(int)$rw['raw_material_id'], $location_id]);
+                            }
                             $have = (float)$s->fetchColumn();
 
                             if ($have + 1e-9 < $req) {
@@ -225,9 +253,11 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                     if ($planned_qty<=0) throw new Exception("Planned quantity must be greater than 0");
                     // Validate RAW availability for that many Peetu
                     $stmt = $db->prepare("
-                        SELECT bp.raw_material_id, bp.quantity AS per_peetu_qty, i.name AS raw_name
+                        SELECT bp.raw_material_id, bp.category_id, bp.quantity AS per_peetu_qty, 
+                               COALESCE(i.name, c.name) AS raw_name
                         FROM bom_peetu bp
-                        JOIN items i ON i.id = bp.raw_material_id
+                        LEFT JOIN items i ON i.id = bp.raw_material_id
+                        LEFT JOIN categories c ON c.id = bp.category_id
                         WHERE bp.peetu_item_id = ?
                     ");
                     $stmt->execute([$item_id]);
@@ -236,12 +266,25 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
 
                     foreach ($raws as $rw) {
                         $req = (float)$rw['per_peetu_qty'] * $planned_qty;
-                        $s = $db->prepare("
-                            SELECT COALESCE(SUM(quantity_in - quantity_out),0)
-                            FROM stock_ledger
-                            WHERE item_id=? AND location_id=?
-                        ");
-                        $s->execute([(int)$rw['raw_material_id'], $location_id]);
+                        
+                        if ($rw['category_id']) {
+                            // Category-based: sum stock across all items in category
+                            $s = $db->prepare("
+                                SELECT COALESCE(SUM(sl.quantity_in - sl.quantity_out),0)
+                                FROM stock_ledger sl
+                                JOIN items i ON i.id = sl.item_id
+                                WHERE i.category_id=? AND sl.location_id=?
+                            ");
+                            $s->execute([(int)$rw['category_id'], $location_id]);
+                        } else {
+                            // Regular raw material
+                            $s = $db->prepare("
+                                SELECT COALESCE(SUM(quantity_in - quantity_out),0)
+                                FROM stock_ledger
+                                WHERE item_id=? AND location_id=?
+                            ");
+                            $s->execute([(int)$rw['raw_material_id'], $location_id]);
+                        }
                         $have = (float)$s->fetchColumn();
                         if ($have + 1e-9 < $req) {
                             $need = number_format($req, 3);
@@ -318,9 +361,11 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                 if ($prod['item_type']==='finished') {
                     // Check if this finished item has direct BOM (raw materials) first
                     $stmt = $db->prepare("
-                        SELECT bd.raw_material_id, bd.quantity AS per_unit_qty, bd.finished_unit_qty, i.name AS raw_name
+                        SELECT bd.raw_material_id, bd.category_id, bd.quantity AS per_unit_qty, bd.finished_unit_qty, 
+                               COALESCE(i.name, c.name) AS raw_name
                         FROM bom_direct bd
-                        JOIN items i ON i.id = bd.raw_material_id
+                        LEFT JOIN items i ON i.id = bd.raw_material_id
+                        LEFT JOIN categories c ON c.id = bd.category_id
                         WHERE bd.finished_item_id = ?
                     ");
                     $stmt->execute([(int)$prod['item_id']]);
@@ -335,7 +380,8 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                             $raw_consumed = (float)$rw['per_unit_qty'] * $units_produced;
                             
                             $components[] = [
-                                'raw_id'   => (int)$rw['raw_material_id'],
+                                'raw_id'   => (int)($rw['raw_material_id'] ?: 0),
+                                'category_id' => (int)($rw['category_id'] ?: 0),
                                 'raw_name' => $rw['raw_name'],
                                 'qty'      => $raw_consumed
                             ];
@@ -363,9 +409,11 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
 
                         // RAW per peetu
                         $stmt = $db->prepare("
-                            SELECT bp.raw_material_id, bp.quantity AS per_peetu_qty, i.name AS raw_name
+                            SELECT bp.raw_material_id, bp.category_id, bp.quantity AS per_peetu_qty, 
+                                   COALESCE(i.name, c.name) AS raw_name
                             FROM bom_peetu bp
-                            JOIN items i ON i.id = bp.raw_material_id
+                            LEFT JOIN items i ON i.id = bp.raw_material_id
+                            LEFT JOIN categories c ON c.id = bp.category_id
                             WHERE bp.peetu_item_id = ?
                         ");
                         $stmt->execute([$peetu_id]);
@@ -374,7 +422,8 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
 
                         foreach ($raws as $rw) {
                             $components[] = [
-                                'raw_id'   => (int)$rw['raw_material_id'],
+                                'raw_id'   => (int)($rw['raw_material_id'] ?: 0),
+                                'category_id' => (int)($rw['category_id'] ?: 0),
                                 'raw_name' => $rw['raw_name'],
                                 'qty'      => (float)$rw['per_peetu_qty'] * $actual_peetu_qty
                             ];
@@ -383,9 +432,11 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                 } else {
                     // semi_finished: RAW = per_peetu_raw * actual_qty
                     $stmt = $db->prepare("
-                        SELECT bp.raw_material_id, bp.quantity AS per_peetu_qty, i.name AS raw_name
+                        SELECT bp.raw_material_id, bp.category_id, bp.quantity AS per_peetu_qty, 
+                               COALESCE(i.name, c.name) AS raw_name
                         FROM bom_peetu bp
-                        JOIN items i ON i.id = bp.raw_material_id
+                        LEFT JOIN items i ON i.id = bp.raw_material_id
+                        LEFT JOIN categories c ON c.id = bp.category_id
                         WHERE bp.peetu_item_id = ?
                     ");
                     $stmt->execute([(int)$prod['item_id']]);
@@ -394,7 +445,8 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
 
                     foreach ($raws as $rw) {
                         $components[] = [
-                            'raw_id'   => (int)$rw['raw_material_id'],
+                            'raw_id'   => (int)($rw['raw_material_id'] ?: 0),
+                            'category_id' => (int)($rw['category_id'] ?: 0),
                             'raw_name' => $rw['raw_name'],
                             'qty'      => (float)$rw['per_peetu_qty'] * $actual_qty
                         ];
@@ -403,12 +455,24 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
 
                 // Availability check @ location
                 foreach ($components as $c) {
-                    $s = $db->prepare("
-                        SELECT COALESCE(SUM(quantity_in - quantity_out),0)
-                        FROM stock_ledger
-                        WHERE item_id=? AND location_id=?
-                    ");
-                    $s->execute([$c['raw_id'], (int)$prod['location_id']]);
+                    if (!empty($c['category_id'])) {
+                        // Category-based: check total stock across all items in category
+                        $s = $db->prepare("
+                            SELECT COALESCE(SUM(sl.quantity_in - sl.quantity_out),0)
+                            FROM stock_ledger sl
+                            JOIN items i ON i.id = sl.item_id
+                            WHERE i.category_id=? AND sl.location_id=?
+                        ");
+                        $s->execute([$c['category_id'], (int)$prod['location_id']]);
+                    } else {
+                        // Regular raw material
+                        $s = $db->prepare("
+                            SELECT COALESCE(SUM(quantity_in - quantity_out),0)
+                            FROM stock_ledger
+                            WHERE item_id=? AND location_id=?
+                        ");
+                        $s->execute([$c['raw_id'], (int)$prod['location_id']]);
+                    }
                     $have = (float)$s->fetchColumn();
                     if ($have + 1e-9 < $c['qty']) {
                         $need = number_format($c['qty'],3);
@@ -419,24 +483,79 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
 
                 // Consume RAW
                 foreach ($components as $c) {
-                    $s = $db->prepare("
-                        SELECT COALESCE(SUM(quantity_in - quantity_out),0)
-                        FROM stock_ledger
-                        WHERE item_id=? AND location_id=?
-                    ");
-                    $s->execute([$c['raw_id'], (int)$prod['location_id']]);
-                    $bal = (float)$s->fetchColumn();
-                    $new_bal = $bal - $c['qty'];
+                    if (!empty($c['category_id'])) {
+                        // Category-based: deduct from items in category using FIFO
+                        $remaining = $c['qty'];
+                        
+                        // Get items in category with stock, ordered by oldest first (FIFO)
+                        $items_stmt = $db->prepare("
+                            SELECT i.id, i.name, COALESCE(SUM(sl.quantity_in - sl.quantity_out),0) AS stock
+                            FROM items i
+                            LEFT JOIN stock_ledger sl ON sl.item_id = i.id AND sl.location_id = ?
+                            WHERE i.category_id = ?
+                            GROUP BY i.id, i.name
+                            HAVING stock > 0
+                            ORDER BY i.id
+                        ");
+                        $items_stmt->execute([(int)$prod['location_id'], $c['category_id']]);
+                        $category_items = $items_stmt->fetchAll(PDO::FETCH_ASSOC);
+                        
+                        foreach ($category_items as $cat_item) {
+                            if ($remaining <= 0) break;
+                            
+                            $item_id = (int)$cat_item['id'];
+                            $available = (float)$cat_item['stock'];
+                            $deduct = min($remaining, $available);
+                            
+                            // Get current balance
+                            $s = $db->prepare("
+                                SELECT COALESCE(SUM(quantity_in - quantity_out),0)
+                                FROM stock_ledger
+                                WHERE item_id=? AND location_id=?
+                            ");
+                            $s->execute([$item_id, (int)$prod['location_id']]);
+                            $bal = (float)$s->fetchColumn();
+                            $new_bal = $bal - $deduct;
 
-                    $ins = $db->prepare("
-                        INSERT INTO stock_ledger
-                          (item_id, location_id, transaction_type, reference_id, reference_no, transaction_date, quantity_out, balance, created_at)
-                        VALUES (?, ?, 'production_out', ?, ?, ?, ?, ?, NOW())
-                    ");
-                    $ins->execute([$c['raw_id'], (int)$prod['location_id'], (int)$prod['id'], $prod['batch_no'], $prod['production_date'], $c['qty'], $new_bal]);
+                            // Insert stock ledger entry
+                            $ins = $db->prepare("
+                                INSERT INTO stock_ledger
+                                  (item_id, location_id, transaction_type, reference_id, reference_no, transaction_date, quantity_out, balance, created_at)
+                                VALUES (?, ?, 'production_out', ?, ?, ?, ?, ?, NOW())
+                            ");
+                            $ins->execute([$item_id, (int)$prod['location_id'], (int)$prod['id'], $prod['batch_no'], $prod['production_date'], $deduct, $new_bal]);
 
-                    $upd = $db->prepare("UPDATE items SET current_stock = current_stock - ? WHERE id=?");
-                    $upd->execute([$c['qty'], $c['raw_id']]);
+                            // Update item current_stock
+                            $upd = $db->prepare("UPDATE items SET current_stock = current_stock - ? WHERE id=?");
+                            $upd->execute([$deduct, $item_id]);
+                            
+                            $remaining -= $deduct;
+                        }
+                        
+                        if ($remaining > 0.001) {
+                            throw new Exception("Could not fully deduct category {$c['raw_name']}. Remaining: " . number_format($remaining, 3));
+                        }
+                    } else {
+                        // Regular raw material
+                        $s = $db->prepare("
+                            SELECT COALESCE(SUM(quantity_in - quantity_out),0)
+                            FROM stock_ledger
+                            WHERE item_id=? AND location_id=?
+                        ");
+                        $s->execute([$c['raw_id'], (int)$prod['location_id']]);
+                        $bal = (float)$s->fetchColumn();
+                        $new_bal = $bal - $c['qty'];
+
+                        $ins = $db->prepare("
+                            INSERT INTO stock_ledger
+                              (item_id, location_id, transaction_type, reference_id, reference_no, transaction_date, quantity_out, balance, created_at)
+                            VALUES (?, ?, 'production_out', ?, ?, ?, ?, ?, NOW())
+                        ");
+                        $ins->execute([$c['raw_id'], (int)$prod['location_id'], (int)$prod['id'], $prod['batch_no'], $prod['production_date'], $c['qty'], $new_bal]);
+
+                        $upd = $db->prepare("UPDATE items SET current_stock = current_stock - ? WHERE id=?");
+                        $upd->execute([$c['qty'], $c['raw_id']]);
+                    }
                 }
 
                 // Receive finished / semi-finished
