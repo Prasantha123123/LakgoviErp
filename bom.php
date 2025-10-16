@@ -353,14 +353,28 @@ try {
 }
 
 /* Category stocks - FETCH FIRST (needed for peetu_rows processing) */
+/* Now includes items from both items.category_id AND item_categories junction table */
 $category_stocks = [];
 try {
     $stmt = $db->query("
         SELECT c.id, c.name, COALESCE(SUM(
-            COALESCE((SELECT SUM(sl.quantity_in - sl.quantity_out) FROM stock_ledger sl WHERE sl.item_id = i.id), 0)
+            COALESCE((SELECT SUM(sl.quantity_in - sl.quantity_out) FROM stock_ledger sl WHERE sl.item_id = all_items.item_id), 0)
         ), 0) as total_stock
         FROM categories c
-        LEFT JOIN items i ON i.category_id = c.id AND i.type = 'raw'
+        LEFT JOIN (
+            -- Items with category_id (old way)
+            SELECT DISTINCT i.id as item_id, i.category_id as cat_id
+            FROM items i
+            WHERE i.type = 'raw' AND i.category_id IS NOT NULL
+            
+            UNION
+            
+            -- Items with category from junction table (new multi-category way)
+            SELECT DISTINCT ic.item_id, ic.category_id as cat_id
+            FROM item_categories ic
+            JOIN items i ON i.id = ic.item_id
+            WHERE i.type = 'raw'
+        ) as all_items ON all_items.cat_id = c.id
         GROUP BY c.id, c.name
     ");
     $category_stocks = $stmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
@@ -435,8 +449,32 @@ try {
 /* Raw materials (dropdown for Peetu create) - includes category_id and using_category */
 $raw_materials = [];
 try {
-    $stmt = $db->query("SELECT i.*, u.symbol, i.category_id, i.using_category FROM items i JOIN units u ON i.unit_id = u.id WHERE i.type = 'raw' ORDER BY i.name");
+    $stmt = $db->query("
+        SELECT 
+            i.*, 
+            u.symbol, 
+            i.category_id, 
+            i.using_category,
+            GROUP_CONCAT(DISTINCT ic.category_id) AS all_category_ids,
+            GROUP_CONCAT(DISTINCT c.name SEPARATOR ', ') AS all_category_names
+        FROM items i 
+        JOIN units u ON i.unit_id = u.id 
+        LEFT JOIN item_categories ic ON ic.item_id = i.id
+        LEFT JOIN categories c ON c.id = ic.category_id
+        WHERE i.type = 'raw' 
+        GROUP BY i.id
+        ORDER BY i.name
+    ");
     $raw_materials = $stmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
+    
+    // Convert all_category_ids from string to array for each item
+    foreach ($raw_materials as &$raw) {
+        if (!empty($raw['all_category_ids'])) {
+            $raw['category_ids_array'] = explode(',', $raw['all_category_ids']);
+        } else {
+            $raw['category_ids_array'] = [];
+        }
+    }
 } catch(PDOException $e) {
     $error = "Error fetching raw materials: " . $e->getMessage();
     $raw_materials = [];
@@ -1229,40 +1267,59 @@ const CATEGORY_STOCKS = <?php echo json_encode($category_stocks ?? []); ?>;
 
 function rawSelectHTML() {
     // Build dropdown showing categories directly for category-enabled items
+    // Now supports items with multiple categories
     let opts = '<option value="">Select Material / Category</option>';
     
-    // Group items by category
-    const categorizedItems = new Map();
+    // Collect all unique categories from items that use categories
+    const categoryItemsMap = new Map(); // catId -> [items]
     const nonCategorizedItems = [];
     
     (RAWS || []).forEach(r => {
         const useCat = parseInt(r.using_category || 0);
-        const catId = parseInt(r.category_id || 0);
         
-        if (useCat === 1 && catId > 0) {
-            // This item uses category - group it
-            if (!categorizedItems.has(catId)) {
-                categorizedItems.set(catId, []);
+        if (useCat === 1) {
+            // This item uses category mode - get ALL its categories
+            const catIdsArray = r.category_ids_array || [];
+            
+            if (catIdsArray.length > 0) {
+                // Add this item to each of its categories
+                catIdsArray.forEach(catIdStr => {
+                    const catId = parseInt(catIdStr);
+                    if (catId > 0) {
+                        if (!categoryItemsMap.has(catId)) {
+                            categoryItemsMap.set(catId, []);
+                        }
+                        categoryItemsMap.get(catId).push(r);
+                    }
+                });
             }
-            categorizedItems.get(catId).push(r);
         } else {
-            // Regular item - add to non-categorized
+            // Regular item - not using category mode
             nonCategorizedItems.push(r);
         }
     });
     
-    // Add categories first (for category-enabled items)
-    categorizedItems.forEach((items, catId) => {
+    // Add categories first (show all categories that have items)
+    const sortedCategoryIds = Array.from(categoryItemsMap.keys()).sort((a, b) => {
+        const catA = (CATEGORIES || []).find(c => parseInt(c.id) === a);
+        const catB = (CATEGORIES || []).find(c => parseInt(c.id) === b);
+        const nameA = catA ? catA.name : '';
+        const nameB = catB ? catB.name : '';
+        return nameA.localeCompare(nameB);
+    });
+    
+    sortedCategoryIds.forEach(catId => {
         const cat = (CATEGORIES || []).find(c => parseInt(c.id) === catId);
         if (cat) {
             const stock = (CATEGORY_STOCKS.find(cs => parseInt(cs.id) === catId) || {}).total_stock || 0;
-            const label = `${cat.name} (Category - Stock: ${parseFloat(stock).toFixed(3)})`;
+            const itemCount = categoryItemsMap.get(catId).length;
+            const label = `${cat.name} (Category - ${itemCount} items, Stock: ${parseFloat(stock).toFixed(3)})`;
             opts += `<option value="cat_${catId}" data-type="category" data-category_id="${catId}" data-stock="${stock}">${escapeHtml(label)}</option>`;
         }
     });
     
     // Add separator if we have both categories and materials
-    if (categorizedItems.size > 0 && nonCategorizedItems.length > 0) {
+    if (categoryItemsMap.size > 0 && nonCategorizedItems.length > 0) {
         opts += `<option disabled>──────────────────────</option>`;
     }
     

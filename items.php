@@ -9,30 +9,68 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             switch ($_POST['action']) {
                 case 'create':
                     // now also saves category_id (nullable) and using_category flag
+                    // Plus support for multiple categories via item_categories junction table
+                    $db->beginTransaction();
+                    
                     $stmt = $db->prepare("INSERT INTO items (code, name, type, unit_id, category_id, using_category) VALUES (?, ?, ?, ?, ?, ?)");
+                    $primary_category = ($_POST['category_id'] ?? null) !== '' ? $_POST['category_id'] : null;
                     $stmt->execute([
                         $_POST['code'],
                         $_POST['name'],
                         $_POST['type'],
                         $_POST['unit_id'],
-                        ($_POST['category_id'] ?? null) !== '' ? $_POST['category_id'] : null,
+                        $primary_category,
                         isset($_POST['using_category']) ? 1 : 0
                     ]);
+                    $item_id = $db->lastInsertId();
+                    
+                    // Save multiple categories if provided
+                    if (!empty($_POST['category_ids']) && is_array($_POST['category_ids'])) {
+                        $stmt_cat = $db->prepare("INSERT IGNORE INTO item_categories (item_id, category_id) VALUES (?, ?)");
+                        foreach ($_POST['category_ids'] as $cat_id) {
+                            if ($cat_id !== '') {
+                                $stmt_cat->execute([$item_id, $cat_id]);
+                            }
+                        }
+                    }
+                    
+                    $db->commit();
                     $success = "Item created successfully!";
                     break;
 
                 case 'update':
                     // now also updates category_id (nullable) and using_category flag
+                    // Plus support for multiple categories via item_categories junction table
+                    $db->beginTransaction();
+                    
                     $stmt = $db->prepare("UPDATE items SET code = ?, name = ?, type = ?, unit_id = ?, category_id = ?, using_category = ? WHERE id = ?");
+                    $primary_category = ($_POST['category_id'] ?? null) !== '' ? $_POST['category_id'] : null;
                     $stmt->execute([
                         $_POST['code'],
                         $_POST['name'],
                         $_POST['type'],
                         $_POST['unit_id'],
-                        ($_POST['category_id'] ?? null) !== '' ? $_POST['category_id'] : null,
+                        $primary_category,
                         isset($_POST['using_category']) ? 1 : 0,
                         $_POST['id']
                     ]);
+                    
+                    // Update multiple categories
+                    // First delete existing mappings
+                    $stmt_del = $db->prepare("DELETE FROM item_categories WHERE item_id = ?");
+                    $stmt_del->execute([$_POST['id']]);
+                    
+                    // Then insert new ones
+                    if (!empty($_POST['category_ids']) && is_array($_POST['category_ids'])) {
+                        $stmt_cat = $db->prepare("INSERT IGNORE INTO item_categories (item_id, category_id) VALUES (?, ?)");
+                        foreach ($_POST['category_ids'] as $cat_id) {
+                            if ($cat_id !== '') {
+                                $stmt_cat->execute([$_POST['id'], $cat_id]);
+                            }
+                        }
+                    }
+                    
+                    $db->commit();
                     $success = "Item updated successfully!";
                     break;
 
@@ -80,13 +118,26 @@ try {
                 SELECT SUM(quantity_in - quantity_out) 
                 FROM stock_ledger 
                 WHERE item_id = i.id
-            ) AS total_stock
+            ) AS total_stock,
+            (
+                SELECT GROUP_CONCAT(cat.name SEPARATOR ', ')
+                FROM item_categories ic
+                JOIN categories cat ON cat.id = ic.category_id
+                WHERE ic.item_id = i.id
+            ) AS all_categories
         FROM items i 
         LEFT JOIN units u ON i.unit_id = u.id
         LEFT JOIN categories c ON c.id = i.category_id
         ORDER BY i.type, i.name
     ");
     $items = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    
+    // Fetch all category IDs for each item (for edit modal)
+    foreach ($items as &$item) {
+        $stmt_cats = $db->prepare("SELECT category_id FROM item_categories WHERE item_id = ?");
+        $stmt_cats->execute([$item['id']]);
+        $item['category_ids'] = $stmt_cats->fetchAll(PDO::FETCH_COLUMN);
+    }
 } catch(PDOException $e) {
     $error = "Error fetching items: " . $e->getMessage();
     $items = [];
@@ -227,7 +278,17 @@ if ($search_query !== '') {
                             <?php echo htmlspecialchars(str_replace('_', ' ', $item['type'])); ?>
                         </span>
                     </td>
-                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900"><?php echo htmlspecialchars($item['category_name'] ?? '—'); ?></td><!-- NEW -->
+                    <td class="px-6 py-4 text-sm text-gray-900">
+                        <?php if (!empty($item['all_categories'])): ?>
+                            <div class="flex flex-wrap gap-1">
+                                <?php foreach (explode(', ', $item['all_categories']) as $cat): ?>
+                                    <span class="bg-purple-100 text-purple-800 text-xs font-medium px-2 py-0.5 rounded"><?php echo htmlspecialchars($cat); ?></span>
+                                <?php endforeach; ?>
+                            </div>
+                        <?php else: ?>
+                            <span class="text-gray-400">—</span>
+                        <?php endif; ?>
+                    </td>
                     <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900"><?php echo htmlspecialchars($item['unit_symbol'] ?? ''); ?></td>
                     <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900 <?php echo (float)$item['current_stock'] < 50 ? 'text-red-600 font-medium' : ''; ?>">
                         <?php echo number_format((float)$item['current_stock'], 2); ?>
@@ -296,13 +357,26 @@ if ($search_query !== '') {
                 </select>
             </div>
             <div>
-                <label class="block text-sm font-medium text-gray-700 mb-1">Category</label>
+                <label class="block text-sm font-medium text-gray-700 mb-1">Primary Category</label>
                 <select name="category_id" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent">
                     <option value="">No Category</option>
                     <?php foreach ($categories as $cat): ?>
                         <option value="<?php echo (int)$cat['id']; ?>"><?php echo htmlspecialchars($cat['name']); ?></option>
                     <?php endforeach; ?>
                 </select>
+                <p class="text-xs text-gray-500 mt-1">Main category for this item</p>
+            </div>
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-1">Additional Categories (Multi-select)</label>
+                <div class="border border-gray-300 rounded-md p-2 max-h-32 overflow-y-auto">
+                    <?php foreach ($categories as $cat): ?>
+                        <label class="flex items-center py-1 hover:bg-gray-50 px-2 rounded">
+                            <input type="checkbox" name="category_ids[]" value="<?php echo (int)$cat['id']; ?>" class="form-checkbox">
+                            <span class="ml-2 text-sm text-gray-700"><?php echo htmlspecialchars($cat['name']); ?></span>
+                        </label>
+                    <?php endforeach; ?>
+                </div>
+                <p class="text-xs text-gray-500 mt-1">Select all categories this item belongs to</p>
             </div>
             <div>
                 <label class="inline-flex items-center mt-2">
@@ -359,13 +433,26 @@ if ($search_query !== '') {
                 </select>
             </div>
             <div>
-                <label class="block text-sm font-medium text-gray-700 mb-1">Category</label>
+                <label class="block text-sm font-medium text-gray-700 mb-1">Primary Category</label>
                 <select name="category_id" id="edit_item_category_id" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent">
                     <option value="">No Category</option>
                     <?php foreach ($categories as $cat): ?>
                         <option value="<?php echo (int)$cat['id']; ?>"><?php echo htmlspecialchars($cat['name']); ?></option>
                     <?php endforeach; ?>
                 </select>
+                <p class="text-xs text-gray-500 mt-1">Main category for this item</p>
+            </div>
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-1">Additional Categories (Multi-select)</label>
+                <div id="edit_categories_list" class="border border-gray-300 rounded-md p-2 max-h-32 overflow-y-auto">
+                    <?php foreach ($categories as $cat): ?>
+                        <label class="flex items-center py-1 hover:bg-gray-50 px-2 rounded">
+                            <input type="checkbox" name="category_ids[]" value="<?php echo (int)$cat['id']; ?>" class="form-checkbox edit-category-checkbox">
+                            <span class="ml-2 text-sm text-gray-700"><?php echo htmlspecialchars($cat['name']); ?></span>
+                        </label>
+                    <?php endforeach; ?>
+                </div>
+                <p class="text-xs text-gray-500 mt-1">Select all categories this item belongs to</p>
             </div>
             <div>
                 <label class="inline-flex items-center mt-2">
@@ -499,9 +586,25 @@ function editItem(item) {
     document.getElementById('edit_item_name').value = item.name;
     document.getElementById('edit_item_type').value = item.type;
     document.getElementById('edit_item_unit_id').value = item.unit_id;
-    // Set category in edit modal
+    // Set primary category in edit modal
     var catSel = document.getElementById('edit_item_category_id');
     if (catSel) catSel.value = item.category_id ? item.category_id : '';
+    
+    // Set multiple categories checkboxes
+    var checkboxes = document.querySelectorAll('.edit-category-checkbox');
+    checkboxes.forEach(function(cb) {
+        cb.checked = false; // Clear all first
+    });
+    if (item.category_ids && Array.isArray(item.category_ids)) {
+        item.category_ids.forEach(function(catId) {
+            checkboxes.forEach(function(cb) {
+                if (parseInt(cb.value) === parseInt(catId)) {
+                    cb.checked = true;
+                }
+            });
+        });
+    }
+    
     // Set using_category checkbox
     var usingCat = document.getElementById('edit_item_using_category');
     if (usingCat) usingCat.checked = item.using_category == 1;
