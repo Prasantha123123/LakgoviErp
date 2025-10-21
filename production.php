@@ -157,13 +157,18 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                             
                             if ($rw['category_id']) {
                                 // Category-based: sum stock across all items in category
+                                // Includes items from both items.category_id AND item_categories junction table
                                 $s = $db->prepare("
                                     SELECT COALESCE(SUM(sl.quantity_in - sl.quantity_out),0)
                                     FROM stock_ledger sl
-                                    JOIN items i ON i.id = sl.item_id
-                                    WHERE i.category_id=? AND sl.location_id=?
+                                    WHERE sl.item_id IN (
+                                        SELECT DISTINCT i.id 
+                                        FROM items i
+                                        LEFT JOIN item_categories ic ON ic.item_id = i.id
+                                        WHERE (i.category_id = ? OR ic.category_id = ?)
+                                    ) AND sl.location_id=?
                                 ");
-                                $s->execute([(int)$rw['category_id'], $location_id]);
+                                $s->execute([(int)$rw['category_id'], (int)$rw['category_id'], $location_id]);
                             } else {
                                 // Regular raw material
                                 $s = $db->prepare("
@@ -222,13 +227,18 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
 
                             if ($rw['category_id']) {
                                 // Category-based: sum stock across all items in category
+                                // Includes items from both items.category_id AND item_categories junction table
                                 $s = $db->prepare("
                                     SELECT COALESCE(SUM(sl.quantity_in - sl.quantity_out),0)
                                     FROM stock_ledger sl
-                                    JOIN items i ON i.id = sl.item_id
-                                    WHERE i.category_id=? AND sl.location_id=?
+                                    WHERE sl.item_id IN (
+                                        SELECT DISTINCT i.id 
+                                        FROM items i
+                                        LEFT JOIN item_categories ic ON ic.item_id = i.id
+                                        WHERE (i.category_id = ? OR ic.category_id = ?)
+                                    ) AND sl.location_id=?
                                 ");
-                                $s->execute([(int)$rw['category_id'], $location_id]);
+                                $s->execute([(int)$rw['category_id'], (int)$rw['category_id'], $location_id]);
                             } else {
                                 // Regular raw material
                                 $s = $db->prepare("
@@ -269,13 +279,18 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                         
                         if ($rw['category_id']) {
                             // Category-based: sum stock across all items in category
+                            // Includes items from both items.category_id AND item_categories junction table
                             $s = $db->prepare("
                                 SELECT COALESCE(SUM(sl.quantity_in - sl.quantity_out),0)
                                 FROM stock_ledger sl
-                                JOIN items i ON i.id = sl.item_id
-                                WHERE i.category_id=? AND sl.location_id=?
+                                WHERE sl.item_id IN (
+                                    SELECT DISTINCT i.id 
+                                    FROM items i
+                                    LEFT JOIN item_categories ic ON ic.item_id = i.id
+                                    WHERE (i.category_id = ? OR ic.category_id = ?)
+                                ) AND sl.location_id=?
                             ");
-                            $s->execute([(int)$rw['category_id'], $location_id]);
+                            $s->execute([(int)$rw['category_id'], (int)$rw['category_id'], $location_id]);
                         } else {
                             // Regular raw material
                             $s = $db->prepare("
@@ -457,13 +472,18 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                 foreach ($components as $c) {
                     if (!empty($c['category_id'])) {
                         // Category-based: check total stock across all items in category
+                        // Includes items from both items.category_id AND item_categories junction table
                         $s = $db->prepare("
                             SELECT COALESCE(SUM(sl.quantity_in - sl.quantity_out),0)
                             FROM stock_ledger sl
-                            JOIN items i ON i.id = sl.item_id
-                            WHERE i.category_id=? AND sl.location_id=?
+                            WHERE sl.item_id IN (
+                                SELECT DISTINCT i.id 
+                                FROM items i
+                                LEFT JOIN item_categories ic ON ic.item_id = i.id
+                                WHERE (i.category_id = ? OR ic.category_id = ?)
+                            ) AND sl.location_id=?
                         ");
-                        $s->execute([$c['category_id'], (int)$prod['location_id']]);
+                        $s->execute([$c['category_id'], $c['category_id'], (int)$prod['location_id']]);
                     } else {
                         // Regular raw material
                         $s = $db->prepare("
@@ -488,16 +508,18 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                         $remaining = $c['qty'];
                         
                         // Get items in category with stock, ordered by oldest first (FIFO)
+                        // Includes items from both items.category_id AND item_categories junction table
                         $items_stmt = $db->prepare("
                             SELECT i.id, i.name, COALESCE(SUM(sl.quantity_in - sl.quantity_out),0) AS stock
                             FROM items i
                             LEFT JOIN stock_ledger sl ON sl.item_id = i.id AND sl.location_id = ?
-                            WHERE i.category_id = ?
+                            LEFT JOIN item_categories ic ON ic.item_id = i.id
+                            WHERE (i.category_id = ? OR ic.category_id = ?)
                             GROUP BY i.id, i.name
                             HAVING stock > 0
                             ORDER BY i.id
                         ");
-                        $items_stmt->execute([(int)$prod['location_id'], $c['category_id']]);
+                        $items_stmt->execute([(int)$prod['location_id'], $c['category_id'], $c['category_id']]);
                         $category_items = $items_stmt->fetchAll(PDO::FETCH_ASSOC);
                         
                         foreach ($category_items as $cat_item) {

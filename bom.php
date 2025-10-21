@@ -38,6 +38,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
 
                     $db->beginTransaction();
                     $inserted = 0;
+                    $processed_materials = []; // Track processed materials to prevent duplicates
+                    $processed_categories = []; // Track processed categories to prevent duplicates
 
                     // Process each quantity entry
                     $num_rows = count($qtys);
@@ -48,6 +50,13 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         
                         // Each row must have either a raw material OR a category (not both)
                         if (($rid > 0 || $cid > 0) && $q > 0) {
+                            // Check for duplicates in the current submission
+                            if ($rid > 0 && in_array($rid, $processed_materials)) {
+                                continue; // Skip duplicate material
+                            }
+                            if ($cid > 0 && in_array($cid, $processed_categories)) {
+                                continue; // Skip duplicate category
+                            }
                             // Upsert by (peetu_item_id, raw_material_id or category_id)
                             if ($rid > 0) {
                                 // Raw material entry
@@ -62,6 +71,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                                     $stmt = $db->prepare("INSERT INTO bom_peetu (peetu_item_id, raw_material_id, category_id, quantity) VALUES (?, ?, NULL, ?)");
                                     $stmt->execute([$peetu_item_id, $rid, $q]);
                                 }
+                                $processed_materials[] = $rid; // Mark as processed
                                 $inserted++;
                             } else if ($cid > 0) {
                                 // Category entry
@@ -76,6 +86,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                                     $stmt = $db->prepare("INSERT INTO bom_peetu (peetu_item_id, raw_material_id, category_id, quantity) VALUES (?, NULL, ?, ?)");
                                     $stmt->execute([$peetu_item_id, $cid, $q]);
                                 }
+                                $processed_categories[] = $cid; // Mark as processed
                                 $inserted++;
                             }
                         }
@@ -386,24 +397,59 @@ try {
 /* Peetu rows (semi-finished + raw requirements) */
 $peetu_rows = [];
 try {
+    // First, let's see ALL bom_peetu entries for debugging
+    $debug_stmt = $db->query("SELECT * FROM bom_peetu WHERE peetu_item_id = 96 ORDER BY id");
+    $all_bom_entries = $debug_stmt->fetchAll(PDO::FETCH_ASSOC);
+    error_log("=== ALL BOM_PEETU ENTRIES FOR PEETU_ITEM_ID 96 ===");
+    foreach ($all_bom_entries as $entry) {
+        error_log("BOM ID={$entry['id']}, raw_material_id={$entry['raw_material_id']}, category_id={$entry['category_id']}, quantity={$entry['quantity']}");
+    }
+    
     // raw stock via stock_ledger (avoids relying on items.current_stock)
     $stmt = $db->query("
         SELECT bp.*,
-               fi.name  AS peetu_name,  fi.code AS peetu_code,  fu.symbol AS peetu_unit,
-               rm.name  AS raw_material_name, rm.code AS raw_material_code, ru.symbol AS raw_unit,
+               fi.name  AS peetu_name,  fi.code AS peetu_code,  COALESCE(fu.symbol, 'units') AS peetu_unit,
+               rm.name  AS raw_material_name, rm.code AS raw_material_code, COALESCE(ru.symbol, 'units') AS raw_unit,
                cat.name AS category_name,
                COALESCE((SELECT SUM(sl.quantity_in - sl.quantity_out)
                          FROM stock_ledger sl
                          WHERE sl.item_id = rm.id), 0) AS raw_material_stock
         FROM bom_peetu bp
         JOIN items fi ON bp.peetu_item_id = fi.id AND fi.type = 'semi_finished'
-        JOIN units fu ON fi.unit_id = fu.id
+        LEFT JOIN units fu ON fi.unit_id = fu.id
         LEFT JOIN items rm ON bp.raw_material_id = rm.id
-        LEFT JOIN units ru ON rm.unit_id = ru.id
+        LEFT JOIN units ru ON ru.id = rm.unit_id
         LEFT JOIN categories cat ON bp.category_id = cat.id
-        ORDER BY fi.name, rm.name
+        ORDER BY fi.name, rm.name, bp.id
     ");
     $peetu_rows = $stmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
+    
+    // Debug: Check for duplicates in database
+    $debug_duplicates = [];
+    $seen_ids = [];
+    foreach ($peetu_rows as $row) {
+        // Check if this exact ID has been seen before (which would be a PHP bug)
+        if (in_array($row['id'], $seen_ids)) {
+            error_log("ERROR: Same BOM entry ID appearing multiple times in result set: ID={$row['id']}");
+        }
+        $seen_ids[] = $row['id'];
+        
+        // Check for duplicate combinations in database
+        $key = $row['peetu_item_id'] . '_' . ($row['raw_material_id'] ?: 'NULL') . '_' . ($row['category_id'] ?: 'NULL');
+        if (isset($debug_duplicates[$key])) {
+            error_log("DUPLICATE COMBINATION in database: Peetu ID={$row['peetu_item_id']}, Raw Material ID={$row['raw_material_id']}, Category ID={$row['category_id']}, BOM IDs: {$debug_duplicates[$key]} and {$row['id']}");
+        }
+        $debug_duplicates[$key] = $row['id'];
+    }
+    
+    error_log("Total peetu_rows fetched: " . count($peetu_rows));
+    
+    // Debug: Check for rows with missing item data
+    foreach ($peetu_rows as $row) {
+        if ($row['raw_material_id'] && empty($row['raw_material_name'])) {
+            error_log("WARNING: BOM entry ID={$row['id']} has raw_material_id={$row['raw_material_id']} but no material name (item might not exist or have no unit)");
+        }
+    }
 } catch(PDOException $e) {
     $error = "Error fetching Peetu entries: " . $e->getMessage();
     $peetu_rows = [];
@@ -424,7 +470,16 @@ foreach ($peetu_rows as &$r) {
         $r['raw_material_code'] = '';
         $r['raw_unit'] = 'units';
     }
+    // Handle rows where raw_material_id exists but item lookup failed
+    elseif ($r['raw_material_id'] && empty($r['raw_material_name'])) {
+        error_log("FIXING MISSING ITEM: BOM ID={$r['id']}, raw_material_id={$r['raw_material_id']}");
+        $r['raw_material_name'] = "Missing Item (ID: {$r['raw_material_id']})";
+        $r['raw_material_code'] = 'MISSING';
+        $r['raw_unit'] = 'units';
+        $r['raw_material_stock'] = 0;
+    }
 }
+unset($r); // CRITICAL: Break the reference to prevent bugs
 
 /* Semi-finished items (dropdowns) */
 $semi_finished_items = [];
@@ -482,8 +537,16 @@ try {
 
 /* Group Peetu rows by peetu (semi-finished) */
 $grouped_peetu = [];
+// Debug: Log the raw rows before grouping
+error_log("=== PEETU ROWS BEFORE GROUPING ===");
+foreach ($peetu_rows as $idx => $row) {
+    error_log("Row $idx: ID={$row['id']}, Peetu={$row['peetu_item_id']}, Material={$row['raw_material_id']}, Name={$row['raw_material_name']}");
+}
+
 foreach ($peetu_rows as $r) {
     $key = $r['peetu_item_id'];
+    error_log("GROUPING: Processing row ID={$r['id']}, Material={$r['raw_material_id']}, Name={$r['raw_material_name']}");
+    
     if (!isset($grouped_peetu[$key])) {
         $grouped_peetu[$key] = [
             'item_id'         => $r['peetu_item_id'],
@@ -497,10 +560,50 @@ foreach ($peetu_rows as $r) {
     }
     $grouped_peetu[$key]['materials'][] = $r;
     $grouped_peetu[$key]['total_materials']++;
+    error_log("  -> Added to grouped_peetu[$key], now has " . count($grouped_peetu[$key]['materials']) . " materials");
+    
     if ((float)$r['raw_material_stock'] < (float)$r['quantity']) {
         $grouped_peetu[$key]['can_produce'] = false;
     }
 }
+
+// Debug: Log grouped materials
+error_log("=== GROUPED MATERIALS ===");
+foreach ($grouped_peetu as $peetu_id => $peetu_data) {
+    error_log("Peetu ID $peetu_id ({$peetu_data['item_name']}): " . count($peetu_data['materials']) . " materials");
+    foreach ($peetu_data['materials'] as $mat) {
+        error_log("  - ID={$mat['id']}, Material={$mat['raw_material_id']}, Name={$mat['raw_material_name']}");
+    }
+}
+
+// IMPORTANT FIX: Remove any duplicate IDs from the materials array
+foreach ($grouped_peetu as $key => &$peetu_data) {
+    $seen_bom_ids = [];
+    $unique_materials = [];
+    
+    error_log("Processing Peetu ID $key: " . count($peetu_data['materials']) . " materials before dedup");
+    
+    foreach ($peetu_data['materials'] as $material) {
+        $bom_id = $material['id'];
+        error_log("  Checking BOM ID={$bom_id}, Material={$material['raw_material_id']}, Name={$material['raw_material_name']}");
+        
+        // Only add if we haven't seen this BOM entry ID before
+        if (!in_array($bom_id, $seen_bom_ids)) {
+            $unique_materials[] = $material;
+            $seen_bom_ids[] = $bom_id;
+            error_log("    -> ADDED (unique)");
+        } else {
+            error_log("    -> SKIPPED (duplicate BOM ID)");
+        }
+    }
+    
+    error_log("After dedup: " . count($unique_materials) . " unique materials");
+    
+    // Replace materials array with deduplicated version
+    $peetu_data['materials'] = $unique_materials;
+    $peetu_data['total_materials'] = count($unique_materials);
+}
+unset($peetu_data); // Break reference
 
 /* Peetu stats */
 $peetu_stats = [
@@ -589,6 +692,7 @@ foreach ($direct_bom_rows as &$r) {
         $r['raw_unit'] = 'units';
     }
 }
+unset($r); // CRITICAL: Break the reference to prevent bugs
 
 /* Group Direct BOM by finished item */
 $grouped_direct_bom = [];
@@ -728,7 +832,9 @@ foreach ($direct_bom_rows as $r) {
                         <?php foreach ($item_bom['materials'] as $material): ?>
                         <div class="flex justify-between items-center p-3 <?php echo ((float)$material['raw_material_stock'] < (float)$material['quantity']) ? 'bg-red-50 border border-red-200' : 'bg-gray-50'; ?> rounded-md">
                             <div class="flex-1">
-                                <p class="font-medium text-gray-900"><?php echo htmlspecialchars($material['raw_material_name']); ?></p>
+                                <p class="font-medium text-gray-900"><?php echo htmlspecialchars($material['raw_material_name']); ?> 
+                                    <span class="text-xs text-gray-400">[ID: <?php echo (int)$material['id']; ?>, Material: <?php echo (int)$material['raw_material_id']; ?>]</span>
+                                </p>
                                 <p class="text-sm text-gray-600"><?php echo htmlspecialchars($material['raw_material_code']); ?></p>
                                 <p class="text-xs <?php echo ((float)$material['raw_material_stock'] < (float)$material['quantity']) ? 'text-red-600' : 'text-gray-500'; ?>">
                                     Available: <?php echo number_format((float)$material['raw_material_stock'], 3); ?> <?php echo $material['raw_unit']; ?>
@@ -1392,25 +1498,32 @@ function handleMaterialOrCategorySelect(select) {
     const row = select.closest('tr');
     const td = select.closest('td');
     
-    // Clear any existing hidden inputs
+    // Clear any existing hidden inputs in this cell
     const existingHiddenInputs = td.querySelectorAll('input[type="hidden"]');
     existingHiddenInputs.forEach(input => input.remove());
+    
+    // Clear the select name to prevent it from being submitted
+    select.removeAttribute('name');
     
     if (dataType === 'category') {
         // Category selected - extract category ID from value (cat_5 -> 5)
         const categoryId = selectedValue.replace('cat_', '');
         const stock = selectedOption.getAttribute('data-stock') || '0';
         
-        // Create hidden input for category
-        const hiddenInput = document.createElement('input');
-        hiddenInput.type = 'hidden';
-        hiddenInput.name = 'category_id[]';
-        hiddenInput.className = 'category-id-input';
-        hiddenInput.value = categoryId;
-        td.appendChild(hiddenInput);
+        // Create hidden input for category_id[]
+        const categoryInput = document.createElement('input');
+        categoryInput.type = 'hidden';
+        categoryInput.name = 'category_id[]';
+        categoryInput.className = 'category-id-input';
+        categoryInput.value = categoryId;
+        td.appendChild(categoryInput);
         
-        // Clear the select name (data comes from hidden input)
-        select.name = '';
+        // Create hidden input for raw_material_id[] with empty value to maintain array alignment
+        const rawInput = document.createElement('input');
+        rawInput.type = 'hidden';
+        rawInput.name = 'raw_material_id[]';
+        rawInput.value = '';
+        td.appendChild(rawInput);
         
         // Update stock display
         const badge = row.querySelector('.unit-stock-badge') || row.querySelector('.unit-badge');
@@ -1421,8 +1534,19 @@ function handleMaterialOrCategorySelect(select) {
         // Material selected
         const unit = selectedOption.getAttribute('data-unit') || '';
         
-        // Set the select name for material
-        select.name = 'raw_material_id[]';
+        // Create hidden input for raw_material_id[]
+        const rawInput = document.createElement('input');
+        rawInput.type = 'hidden';
+        rawInput.name = 'raw_material_id[]';
+        rawInput.value = selectedValue;
+        td.appendChild(rawInput);
+        
+        // Create hidden input for category_id[] with empty value to maintain array alignment
+        const categoryInput = document.createElement('input');
+        categoryInput.type = 'hidden';
+        categoryInput.name = 'category_id[]';
+        categoryInput.value = '';
+        td.appendChild(categoryInput);
         
         // Update unit display
         const badge = row.querySelector('.unit-stock-badge') || row.querySelector('.unit-badge');
@@ -1449,18 +1573,55 @@ function validatePeetuForm() {
     const rows = document.querySelectorAll('#peetuRawTable tbody tr');
     if (!rows.length) { alert('Please add at least one raw material row.'); return false; }
     
+    // Debug: Log form data
+    console.log('=== Form Validation Debug ===');
+    console.log('Peetu ID:', peetu);
+    console.log('Number of rows:', rows.length);
+    
+    const usedMaterials = new Set();
+    const usedCategories = new Set();
+    
     for (const row of rows) {
         const td = row.querySelector('.material-selection-cell');
         const qty = row.querySelector('input[name="quantity[]"]');
         
-        // Check if selection dropdown has a value
+        // Check if selection dropdown has a value OR if hidden inputs exist
         const select = td.querySelector('.raw-select');
+        const rawInput = td.querySelector('input[name="raw_material_id[]"]');
         const categoryInput = td.querySelector('input[name="category_id[]"]');
         
+        console.log('Row:', {
+            selectValue: select?.value,
+            rawInputValue: rawInput?.value,
+            categoryInputValue: categoryInput?.value,
+            quantity: qty?.value
+        });
+        
         let hasValidSelection = false;
+        let selectedId = null;
+        let selectedType = null;
+        
+        // Check if dropdown has a value (before user interacts)
         if (select && select.value && select.value !== '') {
-            // Either material or category option selected
             hasValidSelection = true;
+            if (select.value.startsWith('cat_')) {
+                selectedType = 'category';
+                selectedId = select.value;
+            } else {
+                selectedType = 'material';
+                selectedId = select.value;
+            }
+        }
+        // Or check if hidden inputs have values (after handleMaterialOrCategorySelect is called)
+        else if (rawInput && rawInput.value) {
+            hasValidSelection = true;
+            selectedType = 'material';
+            selectedId = rawInput.value;
+        }
+        else if (categoryInput && categoryInput.value) {
+            hasValidSelection = true;
+            selectedType = 'category';
+            selectedId = 'cat_' + categoryInput.value;
         }
         
         if (!hasValidSelection) {
@@ -1468,11 +1629,30 @@ function validatePeetuForm() {
             return false;
         }
         
+        // Check for duplicates
+        if (selectedType === 'material' && usedMaterials.has(selectedId)) {
+            alert('You have selected the same raw material multiple times. Please remove duplicate rows.');
+            return false;
+        }
+        if (selectedType === 'category' && usedCategories.has(selectedId)) {
+            alert('You have selected the same category multiple times. Please remove duplicate rows.');
+            return false;
+        }
+        
+        // Add to used sets
+        if (selectedType === 'material') {
+            usedMaterials.add(selectedId);
+        } else {
+            usedCategories.add(selectedId);
+        }
+        
         if (!qty.value || parseFloat(qty.value) <= 0) {
             alert('Each row must have a positive quantity.');
             return false;
         }
     }
+    
+    console.log('=== Validation Passed ===');
     return true;
 }
 
@@ -1743,22 +1923,65 @@ function validateDirectBomForm() {
     const rows = document.querySelectorAll('#directBomTable tbody tr');
     if (!rows.length) { alert('Please add at least one raw material row.'); return false; }
     
+    const usedMaterials = new Set();
+    const usedCategories = new Set();
+    
     for (const row of rows) {
         const td = row.querySelector('.material-selection-cell');
         const qty = row.querySelector('input[name="quantity[]"]');
         
-        // Check if selection dropdown has a value
+        // Check if selection dropdown has a value OR if hidden inputs exist
         const select = td.querySelector('.raw-select');
+        const rawInput = td.querySelector('input[name="raw_material_id[]"]');
+        const categoryInput = td.querySelector('input[name="category_id[]"]');
         
         let hasValidSelection = false;
+        let selectedId = null;
+        let selectedType = null;
+        
+        // Check if dropdown has a value (before user interacts)
         if (select && select.value && select.value !== '') {
-            // Either material or category option selected
             hasValidSelection = true;
+            if (select.value.startsWith('cat_')) {
+                selectedType = 'category';
+                selectedId = select.value;
+            } else {
+                selectedType = 'material';
+                selectedId = select.value;
+            }
+        }
+        // Or check if hidden inputs have values (after handleMaterialOrCategorySelect is called)
+        else if (rawInput && rawInput.value) {
+            hasValidSelection = true;
+            selectedType = 'material';
+            selectedId = rawInput.value;
+        }
+        else if (categoryInput && categoryInput.value) {
+            hasValidSelection = true;
+            selectedType = 'category';
+            selectedId = 'cat_' + categoryInput.value;
         }
         
         if (!hasValidSelection) {
             alert('Each row must have a material or category selected.');
             return false;
+        }
+        
+        // Check for duplicates
+        if (selectedType === 'material' && usedMaterials.has(selectedId)) {
+            alert('You have selected the same raw material multiple times. Please remove duplicate rows.');
+            return false;
+        }
+        if (selectedType === 'category' && usedCategories.has(selectedId)) {
+            alert('You have selected the same category multiple times. Please remove duplicate rows.');
+            return false;
+        }
+        
+        // Add to used sets
+        if (selectedType === 'material') {
+            usedMaterials.add(selectedId);
+        } else {
+            usedCategories.add(selectedId);
         }
         
         if (!qty.value || parseFloat(qty.value) <= 0) {
@@ -1781,19 +2004,64 @@ function editDirectBom(row) {
 /* ---------- Utils ---------- */
 function escapeHtml(s){return String(s).replace(/[&<>"']/g,m=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[m]));}
 
-document.addEventListener('DOMContentLoaded', function () {
-    // Ensure at least one row appears in create tables on first open
-    const tb1 = document.querySelector('#peetuRawTable tbody');
-    if (tb1 && !tb1.children.length) addRawRow();
-    const tb2 = document.querySelector('#bomProdTable tbody');
-    if (tb2 && !tb2.children.length) addBomProdRow();
-    const tb3 = document.querySelector('#directBomTable tbody');
-    if (tb3 && !tb3.children.length) addDirectBomRow();
+/* ---------- View Filter (All | Peetu | Direct BOM | BOM Product) ---------- */
+function setBomView(view) {
+    const secPeetu = document.getElementById('section-peetu');
+    const secDirect = document.getElementById('section-direct');
+    const secBomProd = document.getElementById('section-bomprod');
+    const pageTitle = document.getElementById('pageTitle');
+    const btnPeetu = document.querySelectorAll('.action-peetu');
+    const btnDirect = document.querySelectorAll('.action-direct');
+    const btnBomProd = document.querySelectorAll('.action-bomprod');
 
+    function show(el, yes) { if (!el) return; el.classList.toggle('hidden', !yes); }
+    function toggleList(list, yes) { list.forEach(el => el.classList.toggle('hidden', !yes)); }
+
+    const v = (view || 'all');
+    show(secPeetu, v === 'all' || v === 'peetu');
+    show(secDirect, v === 'all' || v === 'direct');
+    show(secBomProd, v === 'all' || v === 'bom_product');
+
+    toggleList(btnPeetu, v === 'all' || v === 'peetu');
+    toggleList(btnDirect, v === 'all' || v === 'direct');
+    toggleList(btnBomProd, v === 'all' || v === 'bom_product');
+
+    if (pageTitle) {
+        if (v === 'all') pageTitle.textContent = 'BOM Overview';
+        else if (v === 'peetu') pageTitle.textContent = 'Peetu (Semi-Finished) Map';
+        else if (v === 'direct') pageTitle.textContent = 'Direct BOM';
+        else if (v === 'bom_product') pageTitle.textContent = 'BOM Product';
+    }
+
+    try {
+        const url = new URL(window.location.href);
+        url.searchParams.set('view', v);
+        window.history.replaceState({}, '', url.toString());
+    } catch (_) {}
+
+    const sel = document.getElementById('bomViewSelect');
+    if (sel && sel.value !== v) sel.value = v;
+}
+
+document.addEventListener('DOMContentLoaded', function () {
+    // Don't add rows on page load - only when modals are opened
+    // This prevents duplicate rows when opening modals
+    
     // Re-prefill all visible rows when finished item changes
     document.getElementById('bp_finished_item_id')?.addEventListener('change', () => {
       document.querySelectorAll('#bomProdTable tbody tr').forEach(tr => prefillRowFromSelections(tr));
     });
+
+    // Initialize view from URL parameter or default to 'all'
+    try {
+        const params = new URLSearchParams(window.location.search);
+        const view = params.get('view') || 'all';
+        const sel = document.getElementById('bomViewSelect');
+        if (sel) sel.value = view;
+        setBomView(view);
+    } catch (_) {
+        setBomView('all');
+    }
 });
 </script>
 
