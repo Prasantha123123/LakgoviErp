@@ -2,9 +2,9 @@
 // database.php - Database connection and setup
 class Database {
     private $host = 'localhost';
-    private $db_name = 'factory_erp';
-    private $username = 'root';
-    private $password = '';
+    private $db_name = 'lakgovi_erp';
+    private $username = 'dbuser';
+    private $password = 'L{582Phb1Lh5';
     private $conn;
 
     public function getConnection() {
