@@ -647,6 +647,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
 try {
     $stmt = $db->query("
         SELECT p.*, i.name AS item_name, i.code AS item_code, u.symbol AS unit_symbol,
+               i.unit_weight_kg,
                l.name AS location_name,
                pi.name AS peetu_name
         FROM production p
@@ -746,10 +747,40 @@ try {
                     <td class="px-6 py-4 text-sm text-gray-900"><?php echo htmlspecialchars($p['location_name']); ?></td>
                     <td class="px-6 py-4 text-sm text-gray-900"><?php echo date('M d, Y', strtotime($p['production_date'])); ?></td>
                     <td class="px-6 py-4 text-sm text-gray-900 font-medium">
-                        <?php echo number_format((float)$p['planned_qty'],3).' '.htmlspecialchars($p['unit_symbol']); ?>
+                        <?php 
+                        $planned_qty = (float)$p['planned_qty'];
+                        $unit_weight = (float)$p['unit_weight_kg'];
+                        
+                        if ($unit_weight > 0) {
+                            // Show pieces and total weight
+                            $total_weight = $planned_qty * $unit_weight;
+                            echo number_format($planned_qty, 0) . ' ' . htmlspecialchars($p['unit_symbol']) . '<br>';
+                            echo '<span class="text-xs text-gray-600">(' . number_format($total_weight, 3) . ' kg total)</span>';
+                        } else {
+                            // No weight info, show quantity only
+                            echo number_format($planned_qty, 3) . ' ' . htmlspecialchars($p['unit_symbol']);
+                        }
+                        ?>
                     </td>
                     <td class="px-6 py-4 text-sm text-gray-900 font-medium">
-                        <?php echo $p['actual_qty']? number_format((float)$p['actual_qty'],3).' '.htmlspecialchars($p['unit_symbol']) : '-'; ?>
+                        <?php 
+                        if ($p['actual_qty']) {
+                            $actual_qty = (float)$p['actual_qty'];
+                            $unit_weight = (float)$p['unit_weight_kg'];
+                            
+                            if ($unit_weight > 0) {
+                                // Show pieces and total weight
+                                $total_weight = $actual_qty * $unit_weight;
+                                echo number_format($actual_qty, 0) . ' ' . htmlspecialchars($p['unit_symbol']) . '<br>';
+                                echo '<span class="text-xs text-gray-600">(' . number_format($total_weight, 3) . ' kg total)</span>';
+                            } else {
+                                // No weight info, show quantity only
+                                echo number_format($actual_qty, 3) . ' ' . htmlspecialchars($p['unit_symbol']);
+                            }
+                        } else {
+                            echo '-';
+                        }
+                        ?>
                     </td>
                     <td class="px-6 py-4 text-sm">
                         <span class="<?php
