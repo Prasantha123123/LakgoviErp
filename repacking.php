@@ -27,8 +27,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         $next_code = 'RP000001';
                     }
                     
-                    // Get source item details
-                    $stmt = $db->prepare("SELECT unit_id FROM items WHERE id = ?");
+                    // Get source item details with unit info
+                    $stmt = $db->prepare("SELECT i.*, u.symbol AS unit_symbol FROM items i JOIN units u ON u.id = i.unit_id WHERE i.id = ?");
                     $stmt->execute([$_POST['source_item_id']]);
                     $source_item = $stmt->fetch();
                     
@@ -37,7 +37,6 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                     $stmt->execute([$_POST['repack_item_id']]);
                     $repack_item = $stmt->fetch();
                     
-                    // Calculate repack quantity
                     $source_quantity = floatval($_POST['source_quantity']);
                     $repack_unit_size = floatval($_POST['repack_unit_size']);
                     
@@ -45,8 +44,53 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         throw new Exception("Repack unit size must be greater than zero");
                     }
                     
-                    // Calculate how many packs can be made
-                    $repack_quantity = floor($source_quantity / $repack_unit_size);
+                    // CONVERT PCS TO KG if unit is 'pcs'
+                    $source_quantity_kg = $source_quantity; // Default: assume already in kg
+                    
+                    if (strtolower($source_item['unit_symbol']) == 'pcs') {
+                        // Unit is PCS, need to convert to KG using BOM tables
+                        $total_kg = 0;
+                        
+                        // Try bom_product first (finished items made via Peetu)
+                        $stmt = $db->prepare("
+                            SELECT product_unit_qty, total_quantity, quantity 
+                            FROM bom_product 
+                            WHERE finished_item_id = ? 
+                            LIMIT 1
+                        ");
+                        $stmt->execute([$_POST['source_item_id']]);
+                        $bom_product = $stmt->fetch();
+                        
+                        if ($bom_product && $bom_product['product_unit_qty'] > 0) {
+                            // Calculate kg per piece from bom_product
+                            // Example: product_unit_qty = 4 kg (per pack), quantity = 8 pcs => 1 pc = 4 kg
+                            $kg_per_piece = floatval($bom_product['product_unit_qty']);
+                            $total_kg = $source_quantity * $kg_per_piece;
+                            $source_quantity_kg = $total_kg;
+                        } else {
+                            // Try bom_direct (finished items made directly from raw)
+                            $stmt = $db->prepare("
+                                SELECT finished_unit_qty 
+                                FROM bom_direct 
+                                WHERE finished_item_id = ? 
+                                LIMIT 1
+                            ");
+                            $stmt->execute([$_POST['source_item_id']]);
+                            $bom_direct = $stmt->fetch();
+                            
+                            if ($bom_direct && $bom_direct['finished_unit_qty'] > 0) {
+                                // finished_unit_qty is in kg
+                                $kg_per_piece = floatval($bom_direct['finished_unit_qty']);
+                                $total_kg = $source_quantity * $kg_per_piece;
+                                $source_quantity_kg = $total_kg;
+                            } else {
+                                throw new Exception("Cannot determine kg per piece for this item. Please set up BOM data.");
+                            }
+                        }
+                    }
+                    
+                    // Calculate how many packs can be made using kg
+                    $repack_quantity = floor($source_quantity_kg / $repack_unit_size);
                     
                     if ($repack_quantity <= 0) {
                         throw new Exception("Source quantity is too small to create any repack units");
@@ -226,13 +270,18 @@ try {
     $repacking_records = [];
 }
 
-// Fetch finished items for source selection
+// Fetch finished items for source selection with BOM data
 try {
     $stmt = $db->query("
-        SELECT i.id, i.code, i.name, u.symbol AS unit_symbol
+        SELECT i.id, i.code, i.name, u.symbol AS unit_symbol,
+               bp.product_unit_qty, bp.total_quantity,
+               bd.finished_unit_qty
         FROM items i
         JOIN units u ON u.id = i.unit_id
+        LEFT JOIN bom_product bp ON bp.finished_item_id = i.id
+        LEFT JOIN bom_direct bd ON bd.finished_item_id = i.id
         WHERE i.type = 'finished'
+        GROUP BY i.id
         ORDER BY i.name
     ");
     $finished_items = $stmt->fetchAll();
@@ -422,11 +471,15 @@ try {
                 <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
                     <div class="md:col-span-2">
                         <label class="block text-sm font-medium text-gray-700 mb-1">Source Finished Product *</label>
-                        <select name="source_item_id" id="source_item_id" required
+                        <select name="source_item_id" id="source_item_id" required onchange="updateSourceItemInfo()"
                                 class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary">
                             <option value="">-- Select Source Product --</option>
-                            <?php foreach ($finished_items as $item): ?>
-                                <option value="<?php echo $item['id']; ?>" data-unit="<?php echo htmlspecialchars($item['unit_symbol']); ?>">
+                            <?php foreach ($finished_items as $item): 
+                                $kg_per_pc = $item['product_unit_qty'] ?: ($item['finished_unit_qty'] ?: 0);
+                            ?>
+                                <option value="<?php echo $item['id']; ?>" 
+                                        data-unit="<?php echo htmlspecialchars($item['unit_symbol']); ?>"
+                                        data-kg-per-pc="<?php echo $kg_per_pc; ?>">
                                     <?php echo htmlspecialchars($item['name']); ?> (<?php echo htmlspecialchars($item['code']); ?>)
                                 </option>
                             <?php endforeach; ?>
@@ -436,11 +489,15 @@ try {
                         <label class="block text-sm font-medium text-gray-700 mb-1">Source Quantity *</label>
                         <div class="flex">
                             <input type="number" name="source_quantity" id="source_quantity" step="0.001" min="0.001" required
-                                   onchange="calculateRepackQty()"
+                                   oninput="calculateRepackQty()"
                                    class="w-full px-3 py-2 border border-gray-300 rounded-l-md focus:outline-none focus:ring-2 focus:ring-primary">
                             <span id="source_unit_display" class="px-3 py-2 bg-gray-100 border border-l-0 border-gray-300 rounded-r-md text-gray-600 text-sm">
                                 kg
                             </span>
+                        </div>
+                        <!-- Conversion info -->
+                        <div id="conversion_info" class="hidden mt-1 p-2 bg-blue-50 border border-blue-200 rounded text-xs">
+                            <span id="conversion_text" class="text-blue-800"></span>
                         </div>
                     </div>
                 </div>
@@ -534,6 +591,8 @@ try {
 
 <script>
 let materialRowIndex = 0;
+let currentKgPerPc = 0;
+let currentSourceUnit = 'kg';
 
 function openModal(modalId) {
     document.getElementById(modalId).classList.remove('hidden');
@@ -543,13 +602,33 @@ function closeModal(modalId) {
     document.getElementById(modalId).classList.add('hidden');
 }
 
-// Update unit displays when items are selected
-document.getElementById('source_item_id')?.addEventListener('change', function() {
-    const selectedOption = this.options[this.selectedIndex];
+function updateSourceItemInfo() {
+    const sourceSelect = document.getElementById('source_item_id');
+    const selectedOption = sourceSelect.options[sourceSelect.selectedIndex];
     const unit = selectedOption.getAttribute('data-unit') || 'kg';
+    const kgPerPc = parseFloat(selectedOption.getAttribute('data-kg-per-pc')) || 0;
+    
+    currentSourceUnit = unit.toLowerCase();
+    currentKgPerPc = kgPerPc;
+    
     document.getElementById('source_unit_display').textContent = unit;
+    
+    // Show conversion info if unit is pcs
+    const conversionInfo = document.getElementById('conversion_info');
+    const conversionText = document.getElementById('conversion_text');
+    
+    if (currentSourceUnit === 'pcs' && kgPerPc > 0) {
+        conversionInfo.classList.remove('hidden');
+        conversionText.textContent = `1 pc = ${kgPerPc} kg`;
+    } else {
+        conversionInfo.classList.add('hidden');
+    }
+    
     calculateRepackQty();
-});
+}
+
+// Update unit displays when items are selected
+document.getElementById('source_item_id')?.addEventListener('change', updateSourceItemInfo);
 
 document.getElementById('repack_item_id')?.addEventListener('change', function() {
     const selectedOption = this.options[this.selectedIndex];
@@ -559,12 +638,30 @@ document.getElementById('repack_item_id')?.addEventListener('change', function()
 });
 
 function calculateRepackQty() {
-    const sourceQty = parseFloat(document.getElementById('source_quantity').value) || 0;
+    let sourceQty = parseFloat(document.getElementById('source_quantity').value) || 0;
     const repackSize = parseFloat(document.getElementById('repack_unit_size').value) || 0;
     
-    if (sourceQty > 0 && repackSize > 0) {
-        const packs = Math.floor(sourceQty / repackSize);
+    // Convert pcs to kg if needed
+    let sourceQtyKg = sourceQty;
+    if (currentSourceUnit === 'pcs' && currentKgPerPc > 0) {
+        sourceQtyKg = sourceQty * currentKgPerPc;
+        
+        // Update conversion info
+        const conversionText = document.getElementById('conversion_text');
+        conversionText.textContent = `${sourceQty} pcs × ${currentKgPerPc} kg/pc = ${sourceQtyKg.toFixed(3)} kg total`;
+    }
+    
+    if (sourceQtyKg > 0 && repackSize > 0) {
+        const packs = Math.floor(sourceQtyKg / repackSize);
         document.getElementById('calculated_packs').textContent = packs.toLocaleString();
+        
+        // Update formula display
+        const formulaDiv = document.querySelector('.text-xs.text-gray-500');
+        if (currentSourceUnit === 'pcs' && currentKgPerPc > 0) {
+            formulaDiv.textContent = `Formula: ${sourceQtyKg.toFixed(3)} kg ÷ ${repackSize} kg per pack`;
+        } else {
+            formulaDiv.textContent = `Formula: ${sourceQty} kg ÷ ${repackSize} kg per pack`;
+        }
     } else {
         document.getElementById('calculated_packs').textContent = '0';
     }
