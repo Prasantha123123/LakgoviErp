@@ -796,6 +796,10 @@ try {
                             <button type="submit" class="text-blue-600 hover:text-blue-900">Start</button>
                           </form>
                         <?php endif; ?>
+                        <?php if ($p['status']==='completed'): ?>
+                          <button class="text-blue-600 hover:text-blue-900"
+                                  onclick='viewProductionDetails(<?php echo (int)$p['id']; ?>)'>View Details</button>
+                        <?php endif; ?>
                         <?php if ($p['status']==='in_progress'): ?>
                           <button class="text-green-600 hover:text-green-900"
                                   onclick='completeProduction(<?php echo json_encode([
@@ -910,6 +914,61 @@ try {
         <button type="submit" class="px-4 py-2 bg-primary text-white rounded-md hover:bg-blue-600">Create Batch</button>
       </div>
     </form>
+  </div>
+</div>
+
+<!-- Production Details Modal -->
+<div id="productionDetailsModal" class="fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full modal-backdrop hidden z-50">
+  <div class="relative top-10 mx-auto p-6 border w-full max-w-4xl shadow-lg rounded-md bg-white mb-10">
+    <div class="flex justify-between items-center mb-4">
+      <h3 class="text-2xl font-bold text-gray-900">Production Details</h3>
+      <button onclick="closeModal('productionDetailsModal')" class="text-gray-400 hover:text-gray-600">
+        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+      </button>
+    </div>
+    
+    <div class="space-y-6">
+      <!-- Production Batch Info -->
+      <div class="grid grid-cols-2 gap-4 pb-4 border-b">
+        <div>
+          <p class="text-sm text-gray-600">Batch Number</p>
+          <p class="text-lg font-semibold" id="pd_batch"></p>
+        </div>
+        <div>
+          <p class="text-sm text-gray-600">Item</p>
+          <p class="text-lg font-semibold" id="pd_item"></p>
+        </div>
+        <div>
+          <p class="text-sm text-gray-600">Planned Quantity</p>
+          <p class="text-lg font-semibold" id="pd_planned"></p>
+        </div>
+        <div>
+          <p class="text-sm text-gray-600">Actual Quantity</p>
+          <p class="text-lg font-semibold" id="pd_actual"></p>
+        </div>
+      </div>
+
+      <!-- Repacking Tab -->
+      <div class="border-t pt-4">
+        <h4 class="text-lg font-bold text-gray-900 mb-3">Repacking</h4>
+        <div id="pd_repacking" class="bg-gray-50 p-4 rounded-lg">
+          <p class="text-sm text-gray-500">Loading repacking data...</p>
+        </div>
+      </div>
+
+      <!-- Rolls Tab -->
+      <div class="border-t pt-4">
+        <h4 class="text-lg font-bold text-gray-900 mb-3">Rolls Production</h4>
+        <div id="pd_rolls" class="bg-gray-50 p-4 rounded-lg">
+          <p class="text-sm text-gray-500">Loading rolls data...</p>
+        </div>
+      </div>
+
+      <!-- Close Button -->
+      <div class="flex justify-end pt-4 border-t">
+        <button onclick="closeModal('productionDetailsModal')" class="px-4 py-2 border border-gray-300 rounded-md text-gray-700 hover:bg-gray-50">Close</button>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -1049,7 +1108,53 @@ function completeProduction(p){
   document.getElementById('cm_batch').value = p.batch_no;
   document.getElementById('cm_item').value = `${p.item_name} (${p.item_code})`;
   document.getElementById('cm_planned').value = `${Number(p.planned_qty).toFixed(3)} ${p.unit_symbol}`;
+  // Auto-fill actual quantity with planned quantity
+  document.querySelector('input[name="actual_qty"]').value = Number(p.planned_qty).toFixed(3);
   openModal('completeProductionModal');
+}
+
+function viewProductionDetails(productionId) {
+  openModal('productionDetailsModal');
+  
+  // Fetch production details and related repacking/rolls data
+  fetch(`/Jann%20Network/lakgovi-erp/api/production_details.php?id=${productionId}`)
+    .then(response => response.json())
+    .then(data => {
+      // Populate production info
+      document.getElementById('pd_batch').textContent = data.production.batch_no;
+      document.getElementById('pd_item').textContent = `${data.production.item_name} (${data.production.item_code})`;
+      document.getElementById('pd_planned').textContent = `${Number(data.production.planned_qty).toFixed(3)} ${data.production.unit_symbol}`;
+      document.getElementById('pd_actual').textContent = `${Number(data.production.actual_qty).toFixed(3)} ${data.production.unit_symbol}`;
+      
+      // Populate repacking data
+      if (data.repacking && data.repacking.length > 0) {
+        let repackHTML = '<div class="overflow-x-auto"><table class="min-w-full text-sm"><thead class="bg-gray-200"><tr><th class="px-3 py-2 text-left">Code</th><th class="px-3 py-2 text-left">Date</th><th class="px-3 py-2 text-left">Status</th><th class="px-3 py-2 text-right">Source Qty</th><th class="px-3 py-2 text-right">Packs Created</th></tr></thead><tbody>';
+        data.repacking.forEach(r => {
+          repackHTML += `<tr class="border-b"><td class="px-3 py-2">${r.batch_code}</td><td class="px-3 py-2">${new Date(r.batch_date).toLocaleDateString()}</td><td class="px-3 py-2"><span class="px-2 py-1 rounded text-xs font-semibold ${r.status === 'completed' ? 'bg-green-100 text-green-800' : 'bg-blue-100 text-blue-800'}">${r.status}</span></td><td class="px-3 py-2 text-right">${Number(r.source_quantity).toFixed(3)}</td><td class="px-3 py-2 text-right font-bold">${r.bundle_quantity}</td></tr>`;
+        });
+        repackHTML += '</tbody></table></div>';
+        document.getElementById('pd_repacking').innerHTML = repackHTML;
+      } else {
+        document.getElementById('pd_repacking').innerHTML = '<p class="text-sm text-gray-500">No repacking records found</p>';
+      }
+      
+      // Populate rolls data
+      if (data.rolls && data.rolls.length > 0) {
+        let rollsHTML = '<div class="overflow-x-auto"><table class="min-w-full text-sm"><thead class="bg-gray-200"><tr><th class="px-3 py-2 text-left">Code</th><th class="px-3 py-2 text-left">Date</th><th class="px-3 py-2 text-left">Status</th><th class="px-3 py-2 text-left">Materials Used</th><th class="px-3 py-2 text-right">Rolls Created</th></tr></thead><tbody>';
+        data.rolls.forEach(r => {
+          rollsHTML += `<tr class="border-b"><td class="px-3 py-2">${r.batch_code}</td><td class="px-3 py-2">${new Date(r.batch_date).toLocaleDateString()}</td><td class="px-3 py-2"><span class="px-2 py-1 rounded text-xs font-semibold ${r.status === 'completed' ? 'bg-green-100 text-green-800' : 'bg-blue-100 text-blue-800'}">${r.status}</span></td><td class="px-3 py-2">${r.total_materials_used} items</td><td class="px-3 py-2 text-right font-bold">${r.rolls_quantity}</td></tr>`;
+        });
+        rollsHTML += '</tbody></table></div>';
+        document.getElementById('pd_rolls').innerHTML = rollsHTML;
+      } else {
+        document.getElementById('pd_rolls').innerHTML = '<p class="text-sm text-gray-500">No rolls records found</p>';
+      }
+    })
+    .catch(error => {
+      console.error('Error loading details:', error);
+      document.getElementById('pd_repacking').innerHTML = '<p class="text-red-500">Error loading repacking data</p>';
+      document.getElementById('pd_rolls').innerHTML = '<p class="text-red-500">Error loading rolls data</p>';
+    });
 }
 </script>
 

@@ -141,12 +141,81 @@ if ((isset($_GET['download']) && $_GET['download'] === 'pdf') || (isset($_GET['p
                 ORDER BY i.name
             ";
             
+            // Initialize arrays for repacking and rolls data
+            $repacking_data_by_loc = [];
+            $rolls_data_by_loc = [];
+            $bundles_data_by_loc = [];
+            
             foreach ($locations_to_show as $locId) {
                 $params = array_merge([$locId], $extra_params);
                 $stmt = $db->prepare($sql);
                 $stmt->execute($params);
                 $detailed_data_by_loc[$locId] = $stmt->fetchAll();
                 $detailed_location_names[$locId] = $location_map[$locId] ?? ("Location #" . $locId);
+                
+                // Get repacking records for this location
+                $repack_sql = "
+                    SELECT 
+                        r.id, r.repack_code, r.repack_date as created_at,
+                        i1.name as source_item_name, i1.code as source_item_code,
+                        i2.name as repack_item_name, i2.code as repack_item_code,
+                        r.source_quantity, r.repack_quantity, r.repack_unit_size,
+                        u1.symbol as source_unit_symbol, u2.symbol as repack_unit_symbol,
+                        COUNT(DISTINCT b.id) as used_in_bundles
+                    FROM repacking r
+                    JOIN items i1 ON r.source_item_id = i1.id
+                    JOIN items i2 ON r.repack_item_id = i2.id
+                    JOIN units u1 ON r.source_unit_id = u1.id
+                    JOIN units u2 ON r.repack_unit_id = u2.id
+                    LEFT JOIN bundles b ON r.repack_item_id = b.source_item_id
+                    WHERE r.location_id = ?
+                    GROUP BY r.id, r.repack_code, r.repack_date, i1.name, i1.code, i2.name, i2.code, r.source_quantity, r.repack_quantity, r.repack_unit_size, u1.symbol, u2.symbol
+                    ORDER BY r.repack_date DESC
+                ";
+                $stmt = $db->prepare($repack_sql);
+                $stmt->execute([$locId]);
+                $repacking_data_by_loc[$locId] = $stmt->fetchAll();
+                
+                // Get rolls records for this location
+                $rolls_sql = "
+                    SELECT 
+                        rb.id, rb.batch_code, rb.created_at,
+                        i.name as item_name, i.code as item_code,
+                        rb.rolls_quantity, rb.status,
+                        COUNT(rm.id) as material_count
+                    FROM rolls_batches rb
+                    JOIN items i ON rb.rolls_item_id = i.id
+                    LEFT JOIN rolls_materials rm ON rb.id = rm.batch_id
+                    WHERE rb.location_id = ?
+                    GROUP BY rb.id, rb.batch_code, rb.created_at, i.name, i.code, rb.rolls_quantity, rb.status
+                    ORDER BY rb.created_at DESC
+                ";
+                $stmt = $db->prepare($rolls_sql);
+                $stmt->execute([$locId]);
+                $rolls_data_by_loc[$locId] = $stmt->fetchAll();
+                
+                // Get bundles records for this location
+                $bundles_sql = "
+                    SELECT 
+                        bn.id, bn.bundle_code, bn.bundle_date as created_at,
+                        i1.name as source_item_name, i1.code as source_item_code,
+                        i2.name as bundle_item_name, i2.code as bundle_item_code,
+                        bn.source_quantity, bn.bundle_quantity, bn.packs_per_bundle,
+                        u1.symbol as source_unit_symbol, u2.symbol as bundle_unit_symbol,
+                        COUNT(bm.id) as material_count
+                    FROM bundles bn
+                    JOIN items i1 ON bn.source_item_id = i1.id
+                    JOIN items i2 ON bn.bundle_item_id = i2.id
+                    JOIN units u1 ON bn.source_unit_id = u1.id
+                    JOIN units u2 ON bn.bundle_unit_id = u2.id
+                    LEFT JOIN bundle_materials bm ON bn.id = bm.bundle_id
+                    WHERE bn.location_id = ?
+                    GROUP BY bn.id, bn.bundle_code, bn.bundle_date, i1.name, i1.code, i2.name, i2.code, bn.source_quantity, bn.bundle_quantity, bn.packs_per_bundle, u1.symbol, u2.symbol
+                    ORDER BY bn.bundle_date DESC
+                ";
+                $stmt = $db->prepare($bundles_sql);
+                $stmt->execute([$locId]);
+                $bundles_data_by_loc[$locId] = $stmt->fetchAll();
             }
         }
         
@@ -288,6 +357,89 @@ if ((isset($_GET['download']) && $_GET['download'] === 'pdf') || (isset($_GET['p
                     </tr>';
                 }
                 $html .= '</table>';
+                
+                // Add Repacking Records for this location
+                if ((int)$locationId == $PRODUCTION_ID && !empty($repacking_data_by_loc[$locationId])) {
+                    $html .= '<h3>Repacking Records</h3>
+                        <table>
+                            <tr>
+                                <th>Repack Code</th>
+                                <th>Date</th>
+                                <th>Source Item</th>
+                                <th>Source Qty</th>
+                                <th>Repack Item</th>
+                                <th>Packs Created</th>
+                                <th>Status</th>
+                            </tr>';
+                    
+                    foreach ($repacking_data_by_loc[$locationId] as $repack) {
+                        $status = $repack['used_in_bundles'] > 0 ? 'Used in Bundle' : 'Not Used';
+                        $html .= '<tr>
+                            <td>' . htmlspecialchars($repack['repack_code']) . '</td>
+                            <td>' . date('M d, Y', strtotime($repack['created_at'])) . '</td>
+                            <td>' . htmlspecialchars($repack['source_item_name'] . ' (' . $repack['source_item_code'] . ')') . '</td>
+                            <td class="text-right">' . number_format($repack['source_quantity'], 3) . ' ' . htmlspecialchars($repack['source_unit_symbol']) . '</td>
+                            <td>' . htmlspecialchars($repack['repack_item_name'] . ' (' . $repack['repack_item_code'] . ')') . '</td>
+                            <td class="text-right">' . number_format($repack['repack_quantity'], 3) . '</td>
+                            <td>' . htmlspecialchars($status) . '</td>
+                        </tr>';
+                    }
+                    $html .= '</table>';
+                }
+                
+                // Add Rolls Records for this location
+                if ((int)$locationId == $PRODUCTION_ID && !empty($rolls_data_by_loc[$locationId])) {
+                    $html .= '<h3>Rolls Records</h3>
+                        <table>
+                            <tr>
+                                <th>Batch Code</th>
+                                <th>Date</th>
+                                <th>Rolls Item</th>
+                                <th>Materials</th>
+                                <th>Rolls Qty</th>
+                                <th>Status</th>
+                            </tr>';
+                    
+                    foreach ($rolls_data_by_loc[$locationId] as $rolls) {
+                        $html .= '<tr>
+                            <td>' . htmlspecialchars($rolls['batch_code']) . '</td>
+                            <td>' . date('M d, Y', strtotime($rolls['created_at'])) . '</td>
+                            <td>' . htmlspecialchars($rolls['item_name'] . ' (' . $rolls['item_code'] . ')') . '</td>
+                            <td class="text-right">' . $rolls['material_count'] . ' item(s)</td>
+                            <td class="text-right">' . number_format($rolls['rolls_quantity'], 0) . '</td>
+                            <td>' . ucfirst(htmlspecialchars($rolls['status'])) . '</td>
+                        </tr>';
+                    }
+                    $html .= '</table>';
+                }
+                
+                // Add Bundle Records for this location
+                if ((int)$locationId == $PRODUCTION_ID && !empty($bundles_data_by_loc[$locationId])) {
+                    $html .= '<h3>Bundle Records</h3>
+                        <table>
+                            <tr>
+                                <th>Bundle Code</th>
+                                <th>Date</th>
+                                <th>Source Item</th>
+                                <th>Source Qty</th>
+                                <th>Bundle Item</th>
+                                <th>Bundles Created</th>
+                                <th>Packs/Bundle</th>
+                            </tr>';
+                    
+                    foreach ($bundles_data_by_loc[$locationId] as $bundle) {
+                        $html .= '<tr>
+                            <td>' . htmlspecialchars($bundle['bundle_code']) . '</td>
+                            <td>' . date('M d, Y', strtotime($bundle['created_at'])) . '</td>
+                            <td>' . htmlspecialchars($bundle['source_item_name'] . ' (' . $bundle['source_item_code'] . ')') . '</td>
+                            <td class="text-right">' . number_format($bundle['source_quantity'], 3) . ' ' . htmlspecialchars($bundle['source_unit_symbol']) . '</td>
+                            <td>' . htmlspecialchars($bundle['bundle_item_name'] . ' (' . $bundle['bundle_item_code'] . ')') . '</td>
+                            <td class="text-right">' . number_format($bundle['bundle_quantity'], 0) . '</td>
+                            <td class="text-right">' . htmlspecialchars($bundle['packs_per_bundle']) . ' packs</td>
+                        </tr>';
+                    }
+                    $html .= '</table>';
+                }
             }
         }
         
@@ -411,6 +563,9 @@ $value_summary = ['raw' => 0, 'semi_finished' => 0, 'finished' => 0];
 $stock_data = []; // used for value_analysis view
 $detailed_data_by_loc = []; // used for detailed view: [location_id => rows]
 $detailed_location_names = []; // [location_id => name]
+$repacking_data_by_loc = []; // used for detailed view: [location_id => rows]
+$rolls_data_by_loc = []; // used for detailed view: [location_id => rows]
+$bundles_data_by_loc = []; // used for detailed view: [location_id => rows]
 $recent_movements = [];
 
 try {
@@ -513,6 +668,10 @@ try {
             ORDER BY i.name
         ";
 
+        // Initialize arrays for repacking and rolls data
+        $repacking_data_by_loc = [];
+        $rolls_data_by_loc = [];
+        
         foreach ($locations_to_show as $locId) {
             $params = array_merge([$locId], $extra_params);
             $stmt = $db->prepare($sql);
@@ -521,6 +680,70 @@ try {
             if (!isset($detailed_location_names[$locId])) {
                 $detailed_location_names[$locId] = $location_map[$locId] ?? ("Location #" . $locId);
             }
+            
+            // Get repacking records for this location
+            $repack_sql = "
+                SELECT 
+                    r.id, r.repack_code, r.repack_date as created_at,
+                    i1.name as source_item_name, i1.code as source_item_code,
+                    i2.name as repack_item_name, i2.code as repack_item_code,
+                    r.source_quantity, r.repack_quantity, r.repack_unit_size,
+                    u1.symbol as source_unit_symbol, u2.symbol as repack_unit_symbol,
+                    COUNT(DISTINCT b.id) as used_in_bundles
+                FROM repacking r
+                JOIN items i1 ON r.source_item_id = i1.id
+                JOIN items i2 ON r.repack_item_id = i2.id
+                JOIN units u1 ON r.source_unit_id = u1.id
+                JOIN units u2 ON r.repack_unit_id = u2.id
+                LEFT JOIN bundles b ON r.repack_item_id = b.source_item_id
+                WHERE r.location_id = ?
+                GROUP BY r.id, r.repack_code, r.repack_date, i1.name, i1.code, i2.name, i2.code, r.source_quantity, r.repack_quantity, r.repack_unit_size, u1.symbol, u2.symbol
+                ORDER BY r.repack_date DESC
+            ";
+            $stmt = $db->prepare($repack_sql);
+            $stmt->execute([$locId]);
+            $repacking_data_by_loc[$locId] = $stmt->fetchAll();
+            
+            // Get rolls records for this location
+            $rolls_sql = "
+                SELECT 
+                    rb.id, rb.batch_code, rb.created_at,
+                    i.name as item_name, i.code as item_code,
+                    rb.rolls_quantity, rb.status,
+                    COUNT(rm.id) as material_count
+                FROM rolls_batches rb
+                JOIN items i ON rb.rolls_item_id = i.id
+                LEFT JOIN rolls_materials rm ON rb.id = rm.batch_id
+                WHERE rb.location_id = ?
+                GROUP BY rb.id, rb.batch_code, rb.created_at, i.name, i.code, rb.rolls_quantity, rb.status
+                ORDER BY rb.created_at DESC
+            ";
+            $stmt = $db->prepare($rolls_sql);
+            $stmt->execute([$locId]);
+            $rolls_data_by_loc[$locId] = $stmt->fetchAll();
+            
+            // Get bundles records for this location
+            $bundles_sql = "
+                SELECT 
+                    bn.id, bn.bundle_code, bn.bundle_date as created_at,
+                    i1.name as source_item_name, i1.code as source_item_code,
+                    i2.name as bundle_item_name, i2.code as bundle_item_code,
+                    bn.source_quantity, bn.bundle_quantity, bn.packs_per_bundle,
+                    u1.symbol as source_unit_symbol, u2.symbol as bundle_unit_symbol,
+                    COUNT(bm.id) as material_count
+                FROM bundles bn
+                JOIN items i1 ON bn.source_item_id = i1.id
+                JOIN items i2 ON bn.bundle_item_id = i2.id
+                JOIN units u1 ON bn.source_unit_id = u1.id
+                JOIN units u2 ON bn.bundle_unit_id = u2.id
+                LEFT JOIN bundle_materials bm ON bn.id = bm.bundle_id
+                WHERE bn.location_id = ?
+                GROUP BY bn.id, bn.bundle_code, bn.bundle_date, i1.name, i1.code, i2.name, i2.code, bn.source_quantity, bn.bundle_quantity, bn.packs_per_bundle, u1.symbol, u2.symbol
+                ORDER BY bn.bundle_date DESC
+            ";
+            $stmt = $db->prepare($bundles_sql);
+            $stmt->execute([$locId]);
+            $bundles_data_by_loc[$locId] = $stmt->fetchAll();
         }
     }
 
@@ -924,6 +1147,171 @@ try {
                 </div>
                 <?php endif; ?>
             </div>
+            
+            <!-- Repacking Records for Production Floor -->
+            <?php if ((int)$locId == $PRODUCTION_ID && !empty($repacking_data_by_loc[$locId])): ?>
+            <div class="mt-6 px-6 py-4 border-t border-gray-200">
+                <h4 class="text-md font-medium text-gray-900 mb-4">📦 Repacking Records (Production Floor)</h4>
+                <div class="overflow-x-auto">
+                    <table class="min-w-full divide-y divide-gray-200">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Repack Code</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Date</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Source Item</th>
+                                <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Source Qty</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Repack Item</th>
+                                <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Packs Created</th>
+                                <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                            </tr>
+                        </thead>
+                        <tbody class="bg-white divide-y divide-gray-200">
+                            <?php foreach ($repacking_data_by_loc[$locId] as $repack): ?>
+                            <tr class="hover:bg-gray-50">
+                                <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-blue-600">
+                                    <?php echo htmlspecialchars($repack['repack_code']); ?>
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600">
+                                    <?php echo date('M d, Y', strtotime($repack['created_at'])); ?>
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap">
+                                    <div class="text-sm font-medium text-gray-900"><?php echo htmlspecialchars($repack['source_item_name']); ?></div>
+                                    <div class="text-sm text-gray-500"><?php echo htmlspecialchars($repack['source_item_code']); ?></div>
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap text-sm text-right">
+                                    <div class="text-gray-900 font-medium"><?php echo number_format($repack['source_quantity'], 3); ?></div>
+                                    <div class="text-xs text-gray-500"><?php echo htmlspecialchars($repack['source_unit_symbol']); ?></div>
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap">
+                                    <div class="text-sm font-medium text-gray-900"><?php echo htmlspecialchars($repack['repack_item_name']); ?></div>
+                                    <div class="text-sm text-gray-500"><?php echo htmlspecialchars($repack['repack_item_code']); ?></div>
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap text-sm text-right">
+                                    <div class="text-gray-900 font-medium"><?php echo number_format($repack['repack_quantity'], 3); ?></div>
+                                    <div class="text-xs text-gray-500"><?php echo htmlspecialchars($repack['repack_unit_symbol']); ?></div>
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap text-center">
+                                    <?php if ($repack['used_in_bundles'] > 0): ?>
+                                        <span class="px-3 py-1 inline-flex text-xs leading-5 font-semibold rounded-full bg-green-100 text-green-800">
+                                            ✅ Used in Bundle
+                                        </span>
+                                    <?php else: ?>
+                                        <span class="px-3 py-1 inline-flex text-xs leading-5 font-semibold rounded-full bg-gray-100 text-gray-600">
+                                            ⚪ Not Used
+                                        </span>
+                                    <?php endif; ?>
+                                </td>
+                            </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            <?php endif; ?>
+            
+            <!-- Rolls Records for Production Floor -->
+            <?php if ((int)$locId == $PRODUCTION_ID && !empty($rolls_data_by_loc[$locId])): ?>
+            <div class="mt-6 px-6 py-4 border-t border-gray-200">
+                <h4 class="text-md font-medium text-gray-900 mb-4">🎯 Rolls Records (Production Floor)</h4>
+                <div class="overflow-x-auto">
+                    <table class="min-w-full divide-y divide-gray-200">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Batch Code</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Date</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Rolls Item</th>
+                                <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Materials</th>
+                                <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Rolls Qty</th>
+                                <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                            </tr>
+                        </thead>
+                        <tbody class="bg-white divide-y divide-gray-200">
+                            <?php foreach ($rolls_data_by_loc[$locId] as $rolls): ?>
+                            <tr class="hover:bg-gray-50">
+                                <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-purple-600">
+                                    <?php echo htmlspecialchars($rolls['batch_code']); ?>
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600">
+                                    <?php echo date('M d, Y', strtotime($rolls['created_at'])); ?>
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap">
+                                    <div class="text-sm font-medium text-gray-900"><?php echo htmlspecialchars($rolls['item_name']); ?></div>
+                                    <div class="text-sm text-gray-500"><?php echo htmlspecialchars($rolls['item_code']); ?></div>
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap text-center text-sm text-gray-900">
+                                    <?php echo $rolls['material_count']; ?> item(s)
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap text-sm text-right font-medium text-gray-900">
+                                    <?php echo number_format($rolls['rolls_quantity'], 0); ?>
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap text-center">
+                                    <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full
+                                        <?php echo $rolls['status'] === 'completed' ? 'bg-green-100 text-green-800' : 'bg-yellow-100 text-yellow-800'; ?>">
+                                        <?php echo ucfirst($rolls['status']); ?>
+                                    </span>
+                                </td>
+                            </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            <?php endif; ?>
+            
+            <!-- Bundles Records for Production Floor -->
+            <?php if ((int)$locId == $PRODUCTION_ID && !empty($bundles_data_by_loc[$locId])): ?>
+            <div class="mt-6 px-6 py-4 border-t border-gray-200">
+                <h4 class="text-md font-medium text-gray-900 mb-4">📦 Bundle Records (Production Floor)</h4>
+                <div class="overflow-x-auto">
+                    <table class="min-w-full divide-y divide-gray-200">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Bundle Code</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Date</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Source Item</th>
+                                <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Source Qty</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Bundle Item</th>
+                                <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Bundles Created</th>
+                                <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Packs/Bundle</th>
+                            </tr>
+                        </thead>
+                        <tbody class="bg-white divide-y divide-gray-200">
+                            <?php foreach ($bundles_data_by_loc[$locId] as $bundle): ?>
+                            <tr class="hover:bg-gray-50">
+                                <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-green-600">
+                                    <?php echo htmlspecialchars($bundle['bundle_code']); ?>
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-600">
+                                    <?php echo date('M d, Y', strtotime($bundle['created_at'])); ?>
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap">
+                                    <div class="text-sm font-medium text-gray-900"><?php echo htmlspecialchars($bundle['source_item_name']); ?></div>
+                                    <div class="text-sm text-gray-500"><?php echo htmlspecialchars($bundle['source_item_code']); ?></div>
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap text-sm text-right">
+                                    <div class="text-gray-900 font-medium"><?php echo number_format($bundle['source_quantity'], 3); ?></div>
+                                    <div class="text-xs text-gray-500"><?php echo htmlspecialchars($bundle['source_unit_symbol']); ?></div>
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap">
+                                    <div class="text-sm font-medium text-gray-900"><?php echo htmlspecialchars($bundle['bundle_item_name']); ?></div>
+                                    <div class="text-sm text-gray-500"><?php echo htmlspecialchars($bundle['bundle_item_code']); ?></div>
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap text-sm text-right">
+                                    <div class="text-gray-900 font-medium"><?php echo number_format($bundle['bundle_quantity'], 0); ?></div>
+                                    <div class="text-xs text-gray-500">bundles</div>
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap text-center">
+                                    <span class="px-2 py-1 inline-flex text-xs font-semibold rounded-full bg-blue-100 text-blue-800">
+                                        <?php echo htmlspecialchars($bundle['packs_per_bundle']); ?> packs
+                                    </span>
+                                </td>
+                            </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            <?php endif; ?>
         </div>
         <?php endforeach; ?>
 
