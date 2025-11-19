@@ -20,6 +20,23 @@ include 'header.php';
 function as_int($v){ return is_numeric($v)? (int)$v : 0; }
 function as_float($v){ return is_numeric($v)? (float)$v : 0.0; }
 
+/**
+ * Update item current_stock from stock_ledger (ALL locations)
+ * GLOBAL RULE: current_stock = total across all locations
+ */
+function updateItemCurrentStock($db, $item_id) {
+    $stmt = $db->prepare("
+        SELECT COALESCE(SUM(quantity_in - quantity_out), 0) as total_stock
+        FROM stock_ledger
+        WHERE item_id = ?
+    ");
+    $stmt->execute([$item_id]);
+    $total = floatval($stmt->fetchColumn());
+    
+    $upd = $db->prepare("UPDATE items SET current_stock = ? WHERE id = ?");
+    $upd->execute([$total, $item_id]);
+}
+
 $success = null;
 $error   = null;
 $transaction_started = false;
@@ -133,6 +150,11 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                     
                     if ($has_direct_bom) {
                         // Direct BOM: finished product made directly from raw materials
+                        // BOM LOGIC:
+                        // - finished_unit_qty = weight per piece (e.g., 20 kg for 1 pc Papadam)
+                        // - quantity = raw material needed for 1 piece
+                        // - planned_qty entered by user = NUMBER OF PIECES (not weight)
+                        // Example: User enters 1 pc → needs 2 kg Salt (as per BOM)
                         $planned_qty = as_float($_POST['planned_qty'] ?? 0);
                         if ($planned_qty <= 0) throw new Exception("Planned quantity must be greater than 0");
                         
@@ -150,10 +172,11 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                         if (empty($raws)) throw new Exception("No direct BOM recipe found for this finished item.");
 
                         foreach ($raws as $rw) {
-                            // Calculate required raw material based on finished unit quantity and planned quantity
-                            $finished_unit_qty = (float)$rw['finished_unit_qty'];
-                            $units_to_produce = $planned_qty / $finished_unit_qty; // How many units we're making
-                            $req = (float)$rw['per_unit_qty'] * $units_to_produce;
+                            // Calculate required raw material
+                            // Formula: req = planned_qty (pieces) × per_unit_qty (raw per piece)
+                            // Example: 1 pc × 2 kg Salt/pc = 2 kg Salt needed
+                            $per_unit_qty = (float)$rw['per_unit_qty'];
+                            $req = $planned_qty * $per_unit_qty;
                             
                             if ($rw['category_id']) {
                                 // Category-based: sum stock across all items in category
@@ -354,8 +377,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
             */
             case 'complete': {
                 $pid = as_int($_POST['id'] ?? 0);
-                $actual_qty = as_float($_POST['actual_qty'] ?? 0);
-                if ($pid<=0 || $actual_qty<=0) throw new Exception("Production ID and actual quantity are required");
+                if ($pid<=0) throw new Exception("Production ID is required");
 
                 $db->beginTransaction();
                 $transaction_started = true;
@@ -371,6 +393,23 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                 $stmt->execute([$pid]);
                 $prod = $stmt->fetch(PDO::FETCH_ASSOC);
                 if (!$prod) throw new Exception("Production not found or not in progress.");
+
+                // Use planned_qty from the production record
+                // Actual weight verification happens in trolley screen
+                $actual_qty = (float)$prod['planned_qty'];
+                if ($actual_qty <= 0) throw new Exception("Invalid planned quantity in production record.");
+
+                // For Direct BOM items, check if we need to convert pieces to weight
+                $finished_weight_kg = $actual_qty; // Default: assume planned_qty is already in correct unit
+                $stmt = $db->prepare("SELECT finished_unit_qty FROM bom_direct WHERE finished_item_id = ? LIMIT 1");
+                $stmt->execute([(int)$prod['item_id']]);
+                $finished_unit_qty = $stmt->fetchColumn();
+                if ($finished_unit_qty && (float)$finished_unit_qty > 0) {
+                    // BOM exists with finished_unit_qty (weight per piece)
+                    // actual_qty is number of pieces, convert to total weight
+                    // Example: 1 pc × 20 kg/pc = 20 kg total weight
+                    $finished_weight_kg = $actual_qty * (float)$finished_unit_qty;
+                }
 
                 $components = []; // array of [raw_id, raw_name, qty]
                 if ($prod['item_type']==='finished') {
@@ -388,11 +427,17 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                     
                     if (!empty($direct_raws)) {
                         // Direct BOM: finished item made directly from raw materials
+                        // BOM LOGIC FOR COMPLETION:
+                        // - finished_unit_qty = weight per piece (e.g., 20 kg for 1 pc Papadam)
+                        // - per_unit_qty = raw material needed for 1 piece
+                        // - actual_qty = NUMBER OF PIECES from planned_qty
+                        // Example: 1 pc × 2 kg Salt/pc = 2 kg Salt to deduct
                         foreach ($direct_raws as $rw) {
-                            // Calculate consumption based on finished unit quantity and actual production
-                            $finished_unit_qty = (float)$rw['finished_unit_qty'];
-                            $units_produced = $actual_qty / $finished_unit_qty; // How many units we produced
-                            $raw_consumed = (float)$rw['per_unit_qty'] * $units_produced;
+                            $per_unit_qty = (float)$rw['per_unit_qty'];
+                            
+                            // Calculate raw consumption based on number of pieces
+                            // actual_qty is number of pieces from planned_qty
+                            $raw_consumed = $actual_qty * $per_unit_qty;
                             
                             $components[] = [
                                 'raw_id'   => (int)($rw['raw_material_id'] ?: 0),
@@ -547,9 +592,8 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                             ");
                             $ins->execute([$item_id, (int)$prod['location_id'], (int)$prod['id'], $prod['batch_no'], $prod['production_date'], $deduct, $new_bal]);
 
-                            // Update item current_stock
-                            $upd = $db->prepare("UPDATE items SET current_stock = current_stock - ? WHERE id=?");
-                            $upd->execute([$deduct, $item_id]);
+                            // Update item current_stock (GLOBAL - all locations)
+                            updateItemCurrentStock($db, $item_id);
                             
                             $remaining -= $deduct;
                         }
@@ -575,12 +619,13 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                         ");
                         $ins->execute([$c['raw_id'], (int)$prod['location_id'], (int)$prod['id'], $prod['batch_no'], $prod['production_date'], $c['qty'], $new_bal]);
 
-                        $upd = $db->prepare("UPDATE items SET current_stock = current_stock - ? WHERE id=?");
-                        $upd->execute([$c['qty'], $c['raw_id']]);
+                        // Update item current_stock (GLOBAL - all locations)
+                        updateItemCurrentStock($db, $c['raw_id']);
                     }
                 }
 
                 // Receive finished / semi-finished
+                // Use finished_weight_kg for stock_ledger (total weight in kg)
                 $s = $db->prepare("
                     SELECT COALESCE(SUM(quantity_in - quantity_out),0)
                     FROM stock_ledger
@@ -588,17 +633,17 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                 ");
                 $s->execute([(int)$prod['item_id'], (int)$prod['location_id']]);
                 $bal = (float)$s->fetchColumn();
-                $new_bal = $bal + $actual_qty;
+                $new_bal = $bal + $finished_weight_kg;
 
                 $ins = $db->prepare("
                     INSERT INTO stock_ledger
                       (item_id, location_id, transaction_type, reference_id, reference_no, transaction_date, quantity_in, balance, created_at)
                     VALUES (?, ?, 'production_in', ?, ?, ?, ?, ?, NOW())
                 ");
-                $ins->execute([(int)$prod['item_id'], (int)$prod['location_id'], (int)$prod['id'], $prod['batch_no'], $prod['production_date'], $actual_qty, $new_bal]);
+                $ins->execute([(int)$prod['item_id'], (int)$prod['location_id'], (int)$prod['id'], $prod['batch_no'], $prod['production_date'], $finished_weight_kg, $new_bal]);
 
-                $upd = $db->prepare("UPDATE items SET current_stock = current_stock + ? WHERE id=?");
-                $upd->execute([$actual_qty, (int)$prod['item_id']]);
+                // Update item current_stock (GLOBAL - all locations)
+                updateItemCurrentStock($db, (int)$prod['item_id']);
 
                 $u = $db->prepare("UPDATE production SET actual_qty=?, status='completed' WHERE id=?");
                 $u->execute([$actual_qty, $pid]);
@@ -647,7 +692,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
 try {
     $stmt = $db->query("
         SELECT p.*, i.name AS item_name, i.code AS item_code, u.symbol AS unit_symbol,
-               i.unit_weight_kg,
+               COALESCE(bp.product_unit_qty, bd.finished_unit_qty, i.unit_weight_kg) as unit_weight_kg,
                l.name AS location_name,
                pi.name AS peetu_name
         FROM production p
@@ -655,6 +700,9 @@ try {
         JOIN units u  ON u.id = i.unit_id
         JOIN locations l ON l.id = p.location_id
         LEFT JOIN items pi ON pi.id = p.peetu_item_id
+        LEFT JOIN bom_product bp ON bp.finished_item_id = i.id
+        LEFT JOIN bom_direct bd ON bd.finished_item_id = i.id
+        GROUP BY p.id
         ORDER BY p.production_date DESC, p.id DESC
     ");
     $productions = $stmt->fetchAll(PDO::FETCH_ASSOC);
@@ -996,11 +1044,12 @@ try {
         <label class="block text-sm font-medium text-gray-700 mb-1">Planned Quantity</label>
         <input type="text" id="cm_planned" class="w-full px-3 py-2 border rounded-md bg-gray-100" readonly>
       </div>
-      <div>
-        <label class="block text-sm font-medium text-gray-700 mb-1">Actual Quantity Produced</label>
-        <input type="number" step="0.001" name="actual_qty" required 
-               class="w-full px-3 py-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-primary" 
-               placeholder="0.000" min="0.001">
+      
+      <div class="bg-blue-50 border border-blue-200 rounded-md p-3">
+        <p class="text-sm text-blue-800">
+          <svg class="w-4 h-4 inline mr-1" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clip-rule="evenodd"/></svg>
+          This will consume raw materials and create finished stock for the planned quantity. Actual weight verification happens in the Trolley screen.
+        </p>
       </div>
       
       <div class="flex justify-end space-x-3 pt-2">
@@ -1108,8 +1157,6 @@ function completeProduction(p){
   document.getElementById('cm_batch').value = p.batch_no;
   document.getElementById('cm_item').value = `${p.item_name} (${p.item_code})`;
   document.getElementById('cm_planned').value = `${Number(p.planned_qty).toFixed(3)} ${p.unit_symbol}`;
-  // Auto-fill actual quantity with planned quantity
-  document.querySelector('input[name="actual_qty"]').value = Number(p.planned_qty).toFixed(3);
   openModal('completeProductionModal');
 }
 

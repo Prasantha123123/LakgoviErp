@@ -9,6 +9,23 @@ $db = $database->getConnection();
 $auth = new SimpleAuth($db);
 $auth->requireAuth();
 
+/**
+ * Update item current_stock from stock_ledger (ALL locations)
+ * GLOBAL RULE: current_stock = total across all locations
+ */
+function updateItemCurrentStock($db, $item_id) {
+    $stmt = $db->prepare("
+        SELECT COALESCE(SUM(quantity_in - quantity_out), 0) as total_stock
+        FROM stock_ledger
+        WHERE item_id = ?
+    ");
+    $stmt->execute([$item_id]);
+    $total = floatval($stmt->fetchColumn());
+    
+    $upd = $db->prepare("UPDATE items SET current_stock = ? WHERE id = ?");
+    $upd->execute([$total, $item_id]);
+}
+
 // Handle form submissions BEFORE any output
 if ($_SERVER['REQUEST_METHOD'] == 'POST') {
     try {
@@ -145,6 +162,9 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                             $_POST['location_id'],
                             $material['quantity']
                         ]);
+                        
+                        // Update current_stock for material (GLOBAL - all locations)
+                        updateItemCurrentStock($db, $material['item_id']);
                     }
                     
                     $db->commit();
@@ -183,8 +203,30 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                     
                     $stmt->execute([$rolls_qty, $_POST['batch_id']]);
                     
-                    // Create a new "rolls" finished item if needed - for now we'll track in ledger
-                    // In future, you might want to create automatic SKU for rolls
+                    // **FIX:** Create rolls_in for finished rolls item
+                    $stmt_ledger = $db->prepare("
+                        INSERT INTO stock_ledger 
+                        (item_id, location_id, transaction_type, reference_id, reference_no, 
+                         transaction_date, quantity_in, quantity_out, balance)
+                        SELECT ?, ?, 'rolls_in', ?, ?, NOW(), ?, 0, 
+                               COALESCE((SELECT balance FROM stock_ledger 
+                                        WHERE item_id = ? AND location_id = ? 
+                                        ORDER BY id DESC LIMIT 1), 0) + ?
+                    ");
+                    
+                    $stmt_ledger->execute([
+                        $batch['rolls_item_id'],
+                        $batch['location_id'],
+                        $batch['id'],
+                        $batch['batch_code'],
+                        $rolls_qty,
+                        $batch['rolls_item_id'],
+                        $batch['location_id'],
+                        $rolls_qty
+                    ]);
+                    
+                    // Update current_stock for rolls item (GLOBAL - all locations)
+                    updateItemCurrentStock($db, $batch['rolls_item_id']);
                     
                     $db->commit();
                     $_SESSION['success_message'] = "Rolls production completed! {$rolls_qty} rolls created.";
@@ -207,6 +249,15 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         throw new Exception("Can only delete pending batches");
                     }
                     
+                    // Get affected items BEFORE deletion
+                    $stmt_items = $db->prepare("
+                        SELECT DISTINCT item_id 
+                        FROM stock_ledger 
+                        WHERE transaction_type IN ('rolls_in', 'rolls_out') AND reference_id = ?
+                    ");
+                    $stmt_items->execute([$_POST['batch_id']]);
+                    $affected_items = $stmt_items->fetchAll(PDO::FETCH_COLUMN);
+                    
                     // Delete stock ledger entries
                     $stmt = $db->prepare("DELETE FROM stock_ledger WHERE transaction_type IN ('rolls_in', 'rolls_out') AND reference_id = ?");
                     $stmt->execute([$_POST['batch_id']]);
@@ -214,6 +265,11 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                     // Delete materials and batch
                     $stmt = $db->prepare("DELETE FROM rolls_batches WHERE id = ?");
                     $stmt->execute([$_POST['batch_id']]);
+                    
+                    // Recalculate current_stock for all affected items
+                    foreach ($affected_items as $item_id) {
+                        updateItemCurrentStock($db, $item_id);
+                    }
                     
                     $db->commit();
                     $_SESSION['success_message'] = "Batch deleted successfully!";

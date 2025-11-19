@@ -154,8 +154,20 @@ $view_mode = $_GET['view'] ?? 'ledger';
                     <option value="">All Types</option>
                     <option value="grn" <?php echo $transaction_type_filter === 'grn' ? 'selected' : ''; ?>>GRN (In)</option>
                     <option value="mrn" <?php echo $transaction_type_filter === 'mrn' ? 'selected' : ''; ?>>MRN (Out)</option>
-                    <option value="production_in" <?php echo $transaction_type_filter === 'production_in' ? 'selected' : ''; ?>>Production (In)</option>
-                    <option value="production_out" <?php echo $transaction_type_filter === 'production_out' ? 'selected' : ''; ?>>Production (Out)</option>
+                    <option value="production_in" <?php echo $transaction_type_filter === 'production_in' ? 'selected' : ''; ?>>Production In</option>
+                    <option value="production_out" <?php echo $transaction_type_filter === 'production_out' ? 'selected' : ''; ?>>Production Out</option>
+                    <option value="repack_in" <?php echo $transaction_type_filter === 'repack_in' ? 'selected' : ''; ?>>Repack In</option>
+                    <option value="repack_out" <?php echo $transaction_type_filter === 'repack_out' ? 'selected' : ''; ?>>Repack Out</option>
+                    <option value="rolls_in" <?php echo $transaction_type_filter === 'rolls_in' ? 'selected' : ''; ?>>Rolls In</option>
+                    <option value="rolls_out" <?php echo $transaction_type_filter === 'rolls_out' ? 'selected' : ''; ?>>Rolls Out</option>
+                    <option value="trolley_movement_in" <?php echo $transaction_type_filter === 'trolley_movement_in' ? 'selected' : ''; ?>>Trolley In</option>
+                    <option value="trolley_movement_out" <?php echo $transaction_type_filter === 'trolley_movement_out' ? 'selected' : ''; ?>>Trolley Out</option>
+                    <option value="bundle_in" <?php echo $transaction_type_filter === 'bundle_in' ? 'selected' : ''; ?>>Bundle In</option>
+                    <option value="bundle_out" <?php echo $transaction_type_filter === 'bundle_out' ? 'selected' : ''; ?>>Bundle Out</option>
+                    <option value="opening_stock" <?php echo $transaction_type_filter === 'opening_stock' ? 'selected' : ''; ?>>Opening Stock</option>
+                    <option value="initial_stock" <?php echo $transaction_type_filter === 'initial_stock' ? 'selected' : ''; ?>>Initial Stock</option>
+                    <option value="sales" <?php echo $transaction_type_filter === 'sales' ? 'selected' : ''; ?>>Sales Out</option>
+                    <option value="sales_return" <?php echo $transaction_type_filter === 'sales_return' ? 'selected' : ''; ?>>Sales Return</option>
                 </select>
             </div>
             <div>
@@ -208,11 +220,21 @@ $view_mode = $_GET['view'] ?? 'ledger';
                         </td>
                         <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900"><?php echo htmlspecialchars($entry['location_name']); ?></td>
                         <td class="px-6 py-4 whitespace-nowrap text-sm">
-                            <span class="<?php 
-                                echo $entry['transaction_type'] === 'grn' ? 'bg-green-100 text-green-800' : 
-                                    ($entry['transaction_type'] === 'mrn' ? 'bg-red-100 text-red-800' : 
-                                    ($entry['transaction_type'] === 'production_in' ? 'bg-blue-100 text-blue-800' : 'bg-purple-100 text-purple-800')); 
-                            ?> text-xs font-medium px-2.5 py-0.5 rounded uppercase">
+                            <?php 
+                            // Transaction type badge color mapping
+                            $type = $entry['transaction_type'];
+                            $in_types = ['grn', 'production_in', 'repack_in', 'rolls_in', 'trolley_movement_in', 'bundle_in', 'opening_stock', 'initial_stock', 'sales_return'];
+                            $out_types = ['mrn', 'production_out', 'repack_out', 'rolls_out', 'trolley_movement_out', 'bundle_out', 'sales'];
+                            
+                            if (in_array($type, $in_types)) {
+                                $badge_class = 'bg-green-100 text-green-800';
+                            } elseif (in_array($type, $out_types)) {
+                                $badge_class = 'bg-red-100 text-red-800';
+                            } else {
+                                $badge_class = 'bg-blue-100 text-blue-800';
+                            }
+                            ?>
+                            <span class="<?php echo $badge_class; ?> text-xs font-medium px-2.5 py-0.5 rounded uppercase">
                                 <?php echo str_replace('_', ' ', $entry['transaction_type']); ?>
                             </span>
                         </td>

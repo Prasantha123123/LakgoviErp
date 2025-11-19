@@ -161,20 +161,24 @@ if ((isset($_GET['download']) && $_GET['download'] === 'pdf') || (isset($_GET['p
                         i2.name as repack_item_name, i2.code as repack_item_code,
                         r.source_quantity, r.repack_quantity, r.repack_unit_size,
                         u1.symbol as source_unit_symbol, u2.symbol as repack_unit_symbol,
-                        COUNT(DISTINCT b.id) as used_in_bundles
+                        COALESCE(SUM(b.source_quantity), 0) as packs_used_in_bundles,
+                        (r.repack_quantity - COALESCE(SUM(b.source_quantity), 0)) as balance_packs
                     FROM repacking r
                     JOIN items i1 ON r.source_item_id = i1.id
                     JOIN items i2 ON r.repack_item_id = i2.id
                     JOIN units u1 ON r.source_unit_id = u1.id
                     JOIN units u2 ON r.repack_unit_id = u2.id
-                    LEFT JOIN bundles b ON r.repack_item_id = b.source_item_id
+                    LEFT JOIN bundles b ON b.source_item_id = r.repack_item_id
                     WHERE r.location_id = ?
-                    GROUP BY r.id, r.repack_code, r.repack_date, i1.name, i1.code, i2.name, i2.code, r.source_quantity, r.repack_quantity, r.repack_unit_size, u1.symbol, u2.symbol
+                    GROUP BY r.id, r.repack_code, r.repack_date, 
+                             i1.name, i1.code, i2.name, i2.code, 
+                             r.source_quantity, r.repack_quantity, r.repack_unit_size, 
+                             u1.symbol, u2.symbol
                     ORDER BY r.repack_date DESC
                 ";
                 $stmt = $db->prepare($repack_sql);
                 $stmt->execute([$locId]);
-                $repacking_data_by_loc[$locId] = $stmt->fetchAll();
+                $repacking_data_by_loc[$locId] = $stmt->fetchAll(PDO::FETCH_ASSOC);
                 
                 // Get rolls records for this location
                 $rolls_sql = "
@@ -644,9 +648,8 @@ try {
         $extra_params = [];
         if ($item_type_filter) { $extra_where[] = "i.type = ?"; $extra_params[] = $item_type_filter; }
         if ($low_stock_only)  { $extra_where[] = "sl.stock_qty <= 10"; }
-        // Always require positive stock
-        array_unshift($extra_where, "sl.stock_qty > 0");
         $extra_where_sql = implode(' AND ', $extra_where);
+        $extra_where_sql = ($extra_where_sql ? ' AND ' . $extra_where_sql : '');
 
         // Prepared query (per location)
         $sql = "
@@ -662,9 +665,9 @@ try {
                 SELECT item_id, location_id, COALESCE(SUM(quantity_in - quantity_out), 0) as stock_qty
                 FROM stock_ledger 
                 GROUP BY item_id, location_id
-            ) sl ON sl.item_id = i.id
-            WHERE sl.location_id = ?
-              AND $extra_where_sql
+            ) sl ON sl.item_id = i.id AND sl.location_id = ?
+            WHERE sl.stock_qty > 0
+              $extra_where_sql
             ORDER BY i.name
         ";
 
@@ -689,15 +692,19 @@ try {
                     i2.name as repack_item_name, i2.code as repack_item_code,
                     r.source_quantity, r.repack_quantity, r.repack_unit_size,
                     u1.symbol as source_unit_symbol, u2.symbol as repack_unit_symbol,
-                    COUNT(DISTINCT b.id) as used_in_bundles
+                    COALESCE(SUM(b.source_quantity), 0) as packs_used_in_bundles,
+                    (r.repack_quantity - COALESCE(SUM(b.source_quantity), 0)) as balance_packs
                 FROM repacking r
                 JOIN items i1 ON r.source_item_id = i1.id
                 JOIN items i2 ON r.repack_item_id = i2.id
                 JOIN units u1 ON r.source_unit_id = u1.id
                 JOIN units u2 ON r.repack_unit_id = u2.id
-                LEFT JOIN bundles b ON r.repack_item_id = b.source_item_id
+                LEFT JOIN bundles b ON b.source_item_id = r.repack_item_id
                 WHERE r.location_id = ?
-                GROUP BY r.id, r.repack_code, r.repack_date, i1.name, i1.code, i2.name, i2.code, r.source_quantity, r.repack_quantity, r.repack_unit_size, u1.symbol, u2.symbol
+                GROUP BY r.id, r.repack_code, r.repack_date, 
+                         i1.name, i1.code, i2.name, i2.code, 
+                         r.source_quantity, r.repack_quantity, r.repack_unit_size, 
+                         u1.symbol, u2.symbol
                 ORDER BY r.repack_date DESC
             ";
             $stmt = $db->prepare($repack_sql);
@@ -1078,6 +1085,24 @@ try {
 
     <!-- DETAILED VIEW: TWO TABLES (Store & Production) or single if location selected -->
     <?php if ($view_mode === 'detailed'): ?>
+    
+    <!-- INFO BOX: Comprehensive Report Description -->
+    <div class="bg-blue-50 border-l-4 border-blue-500 p-6 mb-6 rounded-r-lg">
+        <div class="flex">
+            <div class="flex-shrink-0">
+                <svg class="h-6 w-6 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                </svg>
+            </div>
+            <div class="ml-3">
+                <h3 class="text-sm font-medium text-blue-800 mb-1">📋 Detailed Stock Inventory Report</h3>
+                <p class="text-sm text-blue-700">
+                    This report displays <strong>all available Raw Materials, Finished Goods, and Semi-Finished Items</strong> currently held in the <strong>Store and Production Floor</strong> with detailed quantity and value breakdown. Each item shows current stock quantity, unit cost, total stock value, and availability status.
+                </p>
+            </div>
+        </div>
+    </div>
+    
         <?php foreach ($detailed_data_by_loc as $locId => $rows): ?>
         <div class="bg-white rounded-lg shadow">
             <div class="px-6 py-4 border-b border-gray-200">
@@ -1162,6 +1187,7 @@ try {
                                 <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Source Qty</th>
                                 <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Repack Item</th>
                                 <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Packs Created</th>
+                                <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Balance Packs</th>
                                 <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
                             </tr>
                         </thead>
@@ -1190,8 +1216,29 @@ try {
                                     <div class="text-gray-900 font-medium"><?php echo number_format($repack['repack_quantity'], 3); ?></div>
                                     <div class="text-xs text-gray-500"><?php echo htmlspecialchars($repack['repack_unit_symbol']); ?></div>
                                 </td>
+                                <td class="px-6 py-4 whitespace-nowrap text-sm text-right">
+                                    <?php 
+                                    $balance = floatval($repack['balance_packs']);
+                                    $total = floatval($repack['repack_quantity']);
+                                    $percentage = $total > 0 ? ($balance / $total) * 100 : 0;
+                                    
+                                    if ($percentage >= 80) {
+                                        $color_class = 'text-green-600';
+                                    } elseif ($percentage >= 50) {
+                                        $color_class = 'text-yellow-600';
+                                    } elseif ($percentage > 0) {
+                                        $color_class = 'text-orange-600';
+                                    } else {
+                                        $color_class = 'text-gray-600';
+                                    }
+                                    ?>
+                                    <div class="font-medium <?php echo $color_class; ?>"><?php echo number_format($balance, 0); ?></div>
+                                    <?php if ($repack['packs_used_in_bundles'] > 0): ?>
+                                        <div class="text-xs text-gray-500">Used: <?php echo number_format($repack['packs_used_in_bundles'], 0); ?></div>
+                                    <?php endif; ?>
+                                </td>
                                 <td class="px-6 py-4 whitespace-nowrap text-center">
-                                    <?php if ($repack['used_in_bundles'] > 0): ?>
+                                    <?php if ($repack['packs_used_in_bundles'] > 0): ?>
                                         <span class="px-3 py-1 inline-flex text-xs leading-5 font-semibold rounded-full bg-green-100 text-green-800">
                                             ✅ Used in Bundle
                                         </span>

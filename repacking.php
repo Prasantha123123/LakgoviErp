@@ -1,10 +1,32 @@
 <?php
 // repacking.php - Repacking Module (Convert finished products into smaller units)
-include 'header.php';
 
+// Start session and initialize database before any output
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
+
+// Initialize database and process POST BEFORE outputting any content
 require_once 'database.php';
 $database = new Database();
 $db = $database->getConnection();
+
+/**
+ * Update item current_stock from stock_ledger (ALL locations)
+ * GLOBAL RULE: current_stock = total across all locations
+ */
+function updateItemCurrentStock($db, $item_id) {
+    $stmt = $db->prepare("
+        SELECT COALESCE(SUM(quantity_in - quantity_out), 0) as total_stock
+        FROM stock_ledger
+        WHERE item_id = ?
+    ");
+    $stmt->execute([$item_id]);
+    $total = floatval($stmt->fetchColumn());
+    
+    $upd = $db->prepare("UPDATE items SET current_stock = ? WHERE id = ?");
+    $upd->execute([$total, $item_id]);
+}
 
 $success = '';
 $error = '';
@@ -32,24 +54,30 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                     $stmt->execute([$_POST['source_item_id']]);
                     $source_item = $stmt->fetch();
                     
+                    if (!$source_item) {
+                        throw new Exception("Source item not found");
+                    }
+                    
                     // Get repack item details
                     $stmt = $db->prepare("SELECT unit_id FROM items WHERE id = ?");
                     $stmt->execute([$_POST['repack_item_id']]);
                     $repack_item = $stmt->fetch();
                     
-                    $source_quantity = floatval($_POST['source_quantity']);
-                    $repack_unit_size = floatval($_POST['repack_unit_size']);
-                    
-                    if ($repack_unit_size <= 0) {
-                        throw new Exception("Repack unit size must be greater than zero");
+                    if (!$repack_item) {
+                        throw new Exception("Repack item not found");
                     }
                     
-                    // CONVERT PCS TO KG if unit is 'pcs'
+                    $source_quantity = floatval($_POST['source_quantity']);
+                    $repack_unit_size = floatval($_POST['repack_unit_size']);
+                    $location_id = intval($_POST['location_id']);
+                    
+                    // CONVERT PCS TO KG if needed (BEFORE stock check)
+                    // Stock ledger stores everything in KG, but user may input in PCS
                     $source_quantity_kg = $source_quantity; // Default: assume already in kg
                     
-                    if (strtolower($source_item['unit_symbol']) == 'pcs') {
+                    if (strtolower($source_item['unit_symbol']) == 'pcs' || strtolower($source_item['unit_symbol']) == 'pc') {
                         // Unit is PCS, need to convert to KG using BOM tables
-                        $total_kg = 0;
+                        $kg_per_piece = 0;
                         
                         // Try bom_product first (finished items made via Peetu)
                         $stmt = $db->prepare("
@@ -63,10 +91,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         
                         if ($bom_product && $bom_product['product_unit_qty'] > 0) {
                             // Calculate kg per piece from bom_product
-                            // Example: product_unit_qty = 4 kg (per pack), quantity = 8 pcs => 1 pc = 4 kg
                             $kg_per_piece = floatval($bom_product['product_unit_qty']);
-                            $total_kg = $source_quantity * $kg_per_piece;
-                            $source_quantity_kg = $total_kg;
                         } else {
                             // Try bom_direct (finished items made directly from raw)
                             $stmt = $db->prepare("
@@ -79,14 +104,35 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                             $bom_direct = $stmt->fetch();
                             
                             if ($bom_direct && $bom_direct['finished_unit_qty'] > 0) {
-                                // finished_unit_qty is in kg
+                                // finished_unit_qty is kg per piece (e.g., 20 kg for 1 pc Papadam)
                                 $kg_per_piece = floatval($bom_direct['finished_unit_qty']);
-                                $total_kg = $source_quantity * $kg_per_piece;
-                                $source_quantity_kg = $total_kg;
                             } else {
                                 throw new Exception("Cannot determine kg per piece for this item. Please set up BOM data.");
                             }
                         }
+                        
+                        if ($kg_per_piece > 0) {
+                            $source_quantity_kg = $source_quantity * $kg_per_piece;
+                        } else {
+                            throw new Exception("Invalid BOM configuration: kg per piece is zero");
+                        }
+                    }
+                    
+                    // Check available stock in store location (stock is in KG)
+                    $stock_stmt = $db->prepare("
+                        SELECT COALESCE(SUM(quantity_in - quantity_out), 0) as available_stock 
+                        FROM stock_ledger 
+                        WHERE item_id = ? AND location_id = ?
+                    ");
+                    $stock_stmt->execute([$_POST['source_item_id'], $location_id]);
+                    $available_stock = floatval($stock_stmt->fetchColumn());
+                    
+                    if ($source_quantity_kg > $available_stock) {
+                        throw new Exception("Insufficient stock! Available: " . number_format($available_stock, 3) . " kg, Requested: " . number_format($source_quantity_kg, 3) . " kg (" . number_format($source_quantity, 0) . " " . $source_item['unit_symbol'] . ")");
+                    }
+                    
+                    if ($repack_unit_size <= 0) {
+                        throw new Exception("Repack unit size must be greater than zero");
                     }
                     
                     // Calculate how many packs can be made using kg
@@ -147,7 +193,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         }
                     }
                     
-                    // Update stock ledger - Reduce source item stock
+                    // Update stock ledger - Reduce source item stock (use KG amount)
                     $stmt = $db->prepare("
                         INSERT INTO stock_ledger 
                         (item_id, location_id, transaction_type, reference_id, reference_no, 
@@ -164,11 +210,14 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         $repacking_id,
                         $next_code,
                         $_POST['repack_date'],
-                        $source_quantity,
+                        $source_quantity_kg,
                         $_POST['source_item_id'],
                         $_POST['location_id'],
-                        $source_quantity
+                        $source_quantity_kg
                     ]);
+                    
+                    // Update current_stock for source item (GLOBAL - all locations)
+                    updateItemCurrentStock($db, $_POST['source_item_id']);
                     
                     // Update stock ledger - Increase repack item stock
                     $stmt = $db->prepare("
@@ -192,6 +241,9 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         $_POST['location_id'],
                         $repack_quantity
                     ]);
+                    
+                    // Update current_stock for repack item (GLOBAL - all locations)
+                    updateItemCurrentStock($db, $_POST['repack_item_id']);
                     
                     // Deduct additional materials from stock
                     if (!empty($_POST['material_items']) && is_array($_POST['material_items'])) {
@@ -220,13 +272,19 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                                     $_POST['location_id'],
                                     $material_qty
                                 ]);
+                                
+                                // Update current_stock for material (GLOBAL - all locations)
+                                updateItemCurrentStock($db, $material_id);
                             }
                         }
                     }
                     
                     $db->commit();
                     $success = "Repacking completed successfully! Code: {$next_code}, Packs Created: {$repack_quantity}";
-                    break;
+                    
+                    // Redirect to prevent duplicate submission on page reload
+                    header('Location: ' . $_SERVER['REQUEST_URI']);
+                    exit;
                     
                 case 'delete':
                     $db->beginTransaction();
@@ -240,6 +298,15 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         throw new Exception("Repacking record not found");
                     }
                     
+                    // Get affected items BEFORE deletion
+                    $stmt_items = $db->prepare("
+                        SELECT DISTINCT item_id 
+                        FROM stock_ledger 
+                        WHERE transaction_type IN ('repack_in', 'repack_out') AND reference_id = ?
+                    ");
+                    $stmt_items->execute([$_POST['repacking_id']]);
+                    $affected_items = $stmt_items->fetchAll(PDO::FETCH_COLUMN);
+                    
                     // Delete stock ledger entries
                     $stmt = $db->prepare("DELETE FROM stock_ledger WHERE transaction_type IN ('repack_in', 'repack_out') AND reference_id = ?");
                     $stmt->execute([$_POST['repacking_id']]);
@@ -248,9 +315,17 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                     $stmt = $db->prepare("DELETE FROM repacking WHERE id = ?");
                     $stmt->execute([$_POST['repacking_id']]);
                     
+                    // Recalculate current_stock for all affected items
+                    foreach ($affected_items as $item_id) {
+                        updateItemCurrentStock($db, $item_id);
+                    }
+                    
                     $db->commit();
                     $success = "Repacking record deleted successfully!";
-                    break;
+                    
+                    // Redirect to prevent duplicate submission on page reload
+                    header('Location: ' . $_SERVER['REQUEST_URI']);
+                    exit;
             }
         }
     } catch(Exception $e) {
@@ -261,9 +336,39 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
     }
 }
 
+// Now include header after POST processing
+include 'header.php';
+
 // Fetch all repacking records
 try {
-    $stmt = $db->query("SELECT * FROM v_repacking_details ORDER BY repack_date DESC, created_at DESC");
+    $stmt = $db->query("
+        SELECT 
+            r.id, r.repack_code, r.repack_date, r.source_item_id, r.repack_item_id,
+            r.source_quantity, r.repack_quantity, r.repack_unit_size,
+            r.source_unit_id, r.repack_unit_id, r.location_id, r.notes,
+            r.created_by, r.created_at, r.updated_at,
+            i1.code AS source_item_code, i1.name AS source_item_name, u1.symbol AS source_unit_symbol,
+            i2.code AS repack_item_code, i2.name AS repack_item_name, u2.symbol AS repack_unit_symbol,
+            l.name AS location_name,
+            au.full_name AS created_by_name,
+            COALESCE(SUM(b.source_quantity), 0) as packs_used_in_bundles,
+            r.repack_quantity - COALESCE(SUM(b.source_quantity), 0) as balance_packs
+        FROM repacking r
+        LEFT JOIN items i1 ON r.source_item_id = i1.id
+        LEFT JOIN items i2 ON r.repack_item_id = i2.id
+        LEFT JOIN units u1 ON r.source_unit_id = u1.id
+        LEFT JOIN units u2 ON r.repack_unit_id = u2.id
+        LEFT JOIN locations l ON r.location_id = l.id
+        LEFT JOIN admin_users au ON r.created_by = au.id
+        LEFT JOIN bundles b ON b.source_item_id = r.repack_item_id
+        GROUP BY r.id, r.repack_code, r.repack_date, r.source_item_id, r.repack_item_id,
+                 r.source_quantity, r.repack_quantity, r.repack_unit_size,
+                 r.source_unit_id, r.repack_unit_id, r.location_id, r.notes,
+                 r.created_by, r.created_at, r.updated_at,
+                 i1.code, i1.name, u1.symbol, i2.code, i2.name, u2.symbol,
+                 l.name, au.full_name
+        ORDER BY r.repack_date DESC, r.created_at DESC
+    ");
     $repacking_records = $stmt->fetchAll();
 } catch(PDOException $e) {
     $error = "Error fetching repacking records: " . $e->getMessage();
@@ -377,14 +482,16 @@ try {
                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Repack Product</th>
                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Packs Created</th>
                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Unit Size</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Balance Packs</th>
                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Location</th>
+                        <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
                     </tr>
                 </thead>
                 <tbody class="bg-white divide-y divide-gray-200">
                     <?php if (empty($repacking_records)): ?>
                         <tr>
-                            <td colspan="9" class="px-6 py-4 text-center text-gray-500">
+                            <td colspan="11" class="px-6 py-4 text-center text-gray-500">
                                 No repacking records found. Click "New Repacking" to create one.
                             </td>
                         </tr>
@@ -400,7 +507,7 @@ try {
                             <td class="px-6 py-4 whitespace-nowrap">
                                 <div class="text-sm font-medium text-gray-900"><?php echo htmlspecialchars($record['source_item_name']); ?></div>
                                 <div class="text-sm text-gray-500"><?php echo htmlspecialchars($record['source_item_code']); ?></div>
-                                <?php if ($record['source_batch_code']): ?>
+                                <?php if (isset($record['source_batch_code']) && $record['source_batch_code']): ?>
                                     <div class="text-xs text-blue-600">Batch: <?php echo htmlspecialchars($record['source_batch_code']); ?></div>
                                 <?php endif; ?>
                             </td>
@@ -419,8 +526,44 @@ try {
                             <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
                                 <?php echo number_format($record['repack_unit_size'], 3); ?> <?php echo htmlspecialchars($record['repack_unit_symbol']); ?>
                             </td>
+                            <td class="px-6 py-4 whitespace-nowrap">
+                                <?php 
+                                $balance = floatval($record['balance_packs']);
+                                $total = floatval($record['repack_quantity']);
+                                $percentage = $total > 0 ? ($balance / $total) * 100 : 0;
+                                
+                                if ($percentage >= 80) {
+                                    $color_class = 'bg-green-100 text-green-800';
+                                } elseif ($percentage >= 50) {
+                                    $color_class = 'bg-yellow-100 text-yellow-800';
+                                } elseif ($percentage > 0) {
+                                    $color_class = 'bg-orange-100 text-orange-800';
+                                } else {
+                                    $color_class = 'bg-gray-100 text-gray-800';
+                                }
+                                ?>
+                                <span class="px-2 py-1 text-sm font-semibold rounded-full <?php echo $color_class; ?>">
+                                    <?php echo number_format($balance, 0); ?> packs
+                                </span>
+                                <?php if ($balance < $total): ?>
+                                    <div class="text-xs text-gray-500 mt-1">
+                                        Used: <?php echo number_format($record['packs_used_in_bundles'], 0); ?>
+                                    </div>
+                                <?php endif; ?>
+                            </td>
                             <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
                                 <?php echo htmlspecialchars($record['location_name']); ?>
+                            </td>
+                            <td class="px-6 py-4 whitespace-nowrap text-center">
+                                <?php if ($record['packs_used_in_bundles'] > 0): ?>
+                                    <span class="px-3 py-1 inline-flex text-xs leading-5 font-semibold rounded-full bg-green-100 text-green-800">
+                                        ✅ Used in Bundle
+                                    </span>
+                                <?php else: ?>
+                                    <span class="px-3 py-1 inline-flex text-xs leading-5 font-semibold rounded-full bg-gray-100 text-gray-600">
+                                        ⚪ Not Used
+                                    </span>
+                                <?php endif; ?>
                             </td>
                             <td class="px-6 py-4 whitespace-nowrap text-sm font-medium">
                                 <button onclick="viewDetails(<?php echo $record['id']; ?>)" 

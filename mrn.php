@@ -36,21 +36,87 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                             if (!empty($item['item_id']) && !empty($item['quantity'])) {
                                 $requested_qty = floatval($item['quantity']);
                                 
-                                // Get current stock in STORE (source)
+                                // CONVERT PIECES TO KG if needed
+                                // Get item unit to check if conversion is needed
+                                $stmt = $db->prepare("SELECT i.*, u.symbol as unit_symbol FROM items i JOIN units u ON u.id = i.unit_id WHERE i.id = ?");
+                                $stmt->execute([$item['item_id']]);
+                                $item_data = $stmt->fetch(PDO::FETCH_ASSOC);
+                                
+                                if (!$item_data) {
+                                    throw new Exception("Item not found");
+                                }
+                                
+                                $requested_qty_kg = $requested_qty; // Default: assume already in kg
+                                
+                                // If unit is PCS/PC, convert to KG using BOM data
+                                if (strtolower($item_data['unit_symbol']) == 'pcs' || strtolower($item_data['unit_symbol']) == 'pc') {
+                                    $kg_per_piece = 0;
+                                    
+                                    // Try bom_product first
+                                    $stmt = $db->prepare("SELECT product_unit_qty FROM bom_product WHERE finished_item_id = ? LIMIT 1");
+                                    $stmt->execute([$item['item_id']]);
+                                    $bom_product = $stmt->fetch();
+                                    
+                                    if ($bom_product && $bom_product['product_unit_qty'] > 0) {
+                                        $kg_per_piece = floatval($bom_product['product_unit_qty']);
+                                    } else {
+                                        // Try bom_direct
+                                        $stmt = $db->prepare("SELECT finished_unit_qty FROM bom_direct WHERE finished_item_id = ? LIMIT 1");
+                                        $stmt->execute([$item['item_id']]);
+                                        $bom_direct = $stmt->fetch();
+                                        
+                                        if ($bom_direct && $bom_direct['finished_unit_qty'] > 0) {
+                                            $kg_per_piece = floatval($bom_direct['finished_unit_qty']);
+                                        }
+                                    }
+                                    
+                                    if ($kg_per_piece > 0) {
+                                        $requested_qty_kg = $requested_qty * $kg_per_piece;
+                                    } else {
+                                        // If no BOM data, treat as 1:1
+                                        $requested_qty_kg = $requested_qty;
+                                    }
+                                }
+                                
+                                // Use $requested_qty_kg for all stock operations (stock is stored in KG)
+                                
+                                // Get current stock in STORE (source) - from ledger
                                 $stmt = $db->prepare("
                                     SELECT COALESCE(SUM(quantity_in - quantity_out), 0) as current_balance 
                                     FROM stock_ledger 
                                     WHERE item_id = ? AND location_id = ?
                                 ");
                                 $stmt->execute([$item['item_id'], $source_location_id]);
-                                $source_balance = floatval($stmt->fetchColumn());
+                                $ledger_balance = floatval($stmt->fetchColumn());
                                 
-                                // Validate available stock in STORE
-                                if ($source_balance < $requested_qty) {
-                                    $stmt = $db->prepare("SELECT name FROM items WHERE id = ?");
+                                // If no ledger entry, check items.current_stock as fallback
+                                $source_balance = $ledger_balance;
+                                if ($source_balance == 0) {
+                                    $stmt = $db->prepare("SELECT COALESCE(current_stock, 0) as stock FROM items WHERE id = ?");
                                     $stmt->execute([$item['item_id']]);
-                                    $item_name = $stmt->fetchColumn();
-                                    throw new Exception("Insufficient stock in Store for {$item_name}. Available: {$source_balance}, Requested: {$requested_qty}");
+                                    $fallback_stock = floatval($stmt->fetchColumn());
+                                    if ($fallback_stock > 0) {
+                                        $source_balance = $fallback_stock;
+                                        // Create initial_stock entry for this item in Store to bootstrap the ledger
+                                        $stmt = $db->prepare("
+                                            INSERT INTO stock_ledger (
+                                                item_id, location_id, transaction_type, reference_id, reference_no,
+                                                transaction_date, quantity_in, quantity_out, balance, created_at
+                                            ) VALUES (?, ?, 'initial_stock', 0, 'FALLBACK', ?, ?, 0, ?, NOW())
+                                        ");
+                                        $stmt->execute([
+                                            $item['item_id'],
+                                            $source_location_id,
+                                            $_POST['mrn_date'],
+                                            $source_balance,
+                                            $source_balance
+                                        ]);
+                                    }
+                                }
+                                
+                                // Validate available stock in STORE (check KG amount)
+                                if ($source_balance < $requested_qty_kg) {
+                                    throw new Exception("Insufficient stock in Store for {$item_data['name']}. Available: " . number_format($source_balance, 3) . " kg, Requested: " . number_format($requested_qty_kg, 3) . " kg (" . number_format($requested_qty, 0) . " " . $item_data['unit_symbol'] . ")");
                                 }
                                 
                                 // Balance in PRODUCTION (dest)
@@ -62,15 +128,15 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                                 $stmt->execute([$item['item_id'], $destination_location_id]);
                                 $dest_balance = floatval($stmt->fetchColumn());
                                 
-                                $new_source_balance = $source_balance - $requested_qty;
-                                $new_dest_balance   = $dest_balance + $requested_qty;
+                                $new_source_balance = $source_balance - $requested_qty_kg;
+                                $new_dest_balance   = $dest_balance + $requested_qty_kg;
                                 
-                                // Insert MRN item (store destination for compatibility)
+                                // Insert MRN item (store requested qty in pieces for display, but stock ledger uses KG)
                                 $stmt = $db->prepare("INSERT INTO mrn_items (mrn_id, item_id, location_id, quantity) VALUES (?, ?, ?, ?)");
                                 $stmt->execute([$mrn_id, $item['item_id'], $destination_location_id, $requested_qty]);
                                 $items_inserted++;
                                 
-                                // 1) OUT from STORE
+                                // 1) OUT from STORE (use KG)
                                 $stmt = $db->prepare("
                                     INSERT INTO stock_ledger (
                                         item_id, location_id, transaction_type, reference_id, reference_no,
@@ -83,11 +149,11 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                                     $mrn_id, 
                                     $_POST['mrn_no'], 
                                     $_POST['mrn_date'], 
-                                    $requested_qty, 
+                                    $requested_qty_kg, 
                                     $new_source_balance
                                 ]);
                                 
-                                // 2) IN to PRODUCTION
+                                // 2) IN to PRODUCTION (use KG)
                                 $stmt = $db->prepare("
                                     INSERT INTO stock_ledger (
                                         item_id, location_id, transaction_type, reference_id, reference_no,
@@ -100,7 +166,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                                     $mrn_id, 
                                     $_POST['mrn_no'], 
                                     $_POST['mrn_date'], 
-                                    $requested_qty, 
+                                    $requested_qty_kg, 
                                     $new_dest_balance
                                 ]);
                             }
@@ -139,20 +205,82 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                             if (!empty($item['item_id']) && !empty($item['quantity'])) {
                                 $requested_qty = floatval($item['quantity']);
                                 
-                                // Stock in PRODUCTION (source)
+                                // CONVERT PIECES TO KG if needed
+                                $stmt = $db->prepare("SELECT i.*, u.symbol as unit_symbol FROM items i JOIN units u ON u.id = i.unit_id WHERE i.id = ?");
+                                $stmt->execute([$item['item_id']]);
+                                $item_data = $stmt->fetch(PDO::FETCH_ASSOC);
+                                
+                                if (!$item_data) {
+                                    throw new Exception("Item not found");
+                                }
+                                
+                                $requested_qty_kg = $requested_qty; // Default: assume already in kg
+                                
+                                // If unit is PCS/PC, convert to KG using BOM data
+                                if (strtolower($item_data['unit_symbol']) == 'pcs' || strtolower($item_data['unit_symbol']) == 'pc') {
+                                    $kg_per_piece = 0;
+                                    
+                                    // Try bom_product first
+                                    $stmt = $db->prepare("SELECT product_unit_qty FROM bom_product WHERE finished_item_id = ? LIMIT 1");
+                                    $stmt->execute([$item['item_id']]);
+                                    $bom_product = $stmt->fetch();
+                                    
+                                    if ($bom_product && $bom_product['product_unit_qty'] > 0) {
+                                        $kg_per_piece = floatval($bom_product['product_unit_qty']);
+                                    } else {
+                                        // Try bom_direct
+                                        $stmt = $db->prepare("SELECT finished_unit_qty FROM bom_direct WHERE finished_item_id = ? LIMIT 1");
+                                        $stmt->execute([$item['item_id']]);
+                                        $bom_direct = $stmt->fetch();
+                                        
+                                        if ($bom_direct && $bom_direct['finished_unit_qty'] > 0) {
+                                            $kg_per_piece = floatval($bom_direct['finished_unit_qty']);
+                                        }
+                                    }
+                                    
+                                    if ($kg_per_piece > 0) {
+                                        $requested_qty_kg = $requested_qty * $kg_per_piece;
+                                    } else {
+                                        $requested_qty_kg = $requested_qty;
+                                    }
+                                }
+                                
+                                // Stock in PRODUCTION (source) - from ledger
                                 $stmt = $db->prepare("
                                     SELECT COALESCE(SUM(quantity_in - quantity_out), 0) as current_balance 
                                     FROM stock_ledger 
                                     WHERE item_id = ? AND location_id = ?
                                 ");
                                 $stmt->execute([$item['item_id'], $source_location_id]);
-                                $source_balance = floatval($stmt->fetchColumn());
+                                $ledger_balance = floatval($stmt->fetchColumn());
                                 
-                                if ($source_balance < $requested_qty) {
-                                    $stmt = $db->prepare("SELECT name FROM items WHERE id = ?");
+                                // If no ledger entry, check items.current_stock as fallback
+                                $source_balance = $ledger_balance;
+                                if ($source_balance == 0) {
+                                    $stmt = $db->prepare("SELECT COALESCE(current_stock, 0) as stock FROM items WHERE id = ?");
                                     $stmt->execute([$item['item_id']]);
-                                    $item_name = $stmt->fetchColumn();
-                                    throw new Exception("Insufficient stock in Production for {$item_name}. Available: {$source_balance}, Requested: {$requested_qty}");
+                                    $fallback_stock = floatval($stmt->fetchColumn());
+                                    if ($fallback_stock > 0) {
+                                        $source_balance = $fallback_stock;
+                                        // Create initial_stock entry for this item in Production to bootstrap the ledger
+                                        $stmt = $db->prepare("
+                                            INSERT INTO stock_ledger (
+                                                item_id, location_id, transaction_type, reference_id, reference_no,
+                                                transaction_date, quantity_in, quantity_out, balance, created_at
+                                            ) VALUES (?, ?, 'initial_stock', 0, 'FALLBACK', ?, ?, 0, ?, NOW())
+                                        ");
+                                        $stmt->execute([
+                                            $item['item_id'],
+                                            $source_location_id,
+                                            $_POST['rtn_date'],
+                                            $source_balance,
+                                            $source_balance
+                                        ]);
+                                    }
+                                }
+                                
+                                if ($source_balance < $requested_qty_kg) {
+                                    throw new Exception("Insufficient stock in Production for {$item_data['name']}. Available: " . number_format($source_balance, 3) . " kg, Requested: " . number_format($requested_qty_kg, 3) . " kg (" . number_format($requested_qty, 0) . " " . $item_data['unit_symbol'] . ")");
                                 }
                                 
                                 // Stock in STORE (dest)
@@ -164,15 +292,15 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                                 $stmt->execute([$item['item_id'], $destination_location_id]);
                                 $dest_balance = floatval($stmt->fetchColumn());
                                 
-                                $new_source_balance = $source_balance - $requested_qty;
-                                $new_dest_balance   = $dest_balance + $requested_qty;
+                                $new_source_balance = $source_balance - $requested_qty_kg;
+                                $new_dest_balance   = $dest_balance + $requested_qty_kg;
                                 
-                                // Insert return item (store destination_id for compatibility)
+                                // Insert return item (store requested qty in pieces for display)
                                 $stmt = $db->prepare("INSERT INTO mrn_items (mrn_id, item_id, location_id, quantity) VALUES (?, ?, ?, ?)");
                                 $stmt->execute([$rtn_id, $item['item_id'], $destination_location_id, $requested_qty]);
                                 $items_inserted++;
                                 
-                                // 1) OUT from PRODUCTION  (transaction_type='mrn_return')
+                                // 1) OUT from PRODUCTION  (transaction_type='mrn_return', use KG)
                                 $stmt = $db->prepare("
                                     INSERT INTO stock_ledger (
                                         item_id, location_id, transaction_type, reference_id, reference_no,
@@ -185,11 +313,11 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                                     $rtn_id, 
                                     $_POST['rtn_no'], 
                                     $_POST['rtn_date'], 
-                                    $requested_qty, 
+                                    $requested_qty_kg, 
                                     $new_source_balance
                                 ]);
                                 
-                                // 2) IN to STORE        (transaction_type='mrn_return')
+                                // 2) IN to STORE        (transaction_type='mrn_return', use KG)
                                 $stmt = $db->prepare("
                                     INSERT INTO stock_ledger (
                                         item_id, location_id, transaction_type, reference_id, reference_no,
@@ -202,7 +330,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                                     $rtn_id, 
                                     $_POST['rtn_no'], 
                                     $_POST['rtn_date'], 
-                                    $requested_qty, 
+                                    $requested_qty_kg, 
                                     $new_dest_balance
                                 ]);
                             }
