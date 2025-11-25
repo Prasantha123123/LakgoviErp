@@ -150,16 +150,15 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                     // Get weight from BOM tables if available, fallback to unit_weight_kg
                     $stmt = $db->prepare("
                         SELECT p.*, i.name as item_name,
-                               COALESCE(bp.product_unit_qty, bd.finished_unit_qty, i.unit_weight_kg) as unit_weight_kg,
+                               COALESCE((SELECT product_unit_qty FROM bom_product WHERE finished_item_id = i.id LIMIT 1), 
+                                        (SELECT finished_unit_qty FROM bom_direct WHERE finished_item_id = i.id LIMIT 1), 
+                                        i.unit_weight_kg) as unit_weight_kg,
                                l.name as location_name,
-                               CASE WHEN bd.id IS NOT NULL THEN 1 ELSE 0 END as is_bom_direct
+                               CASE WHEN EXISTS (SELECT 1 FROM bom_direct WHERE finished_item_id = i.id) THEN 1 ELSE 0 END as is_bom_direct
                         FROM production p
                         JOIN items i ON p.item_id = i.id
                         JOIN locations l ON p.location_id = l.id
-                        LEFT JOIN bom_product bp ON bp.finished_item_id = i.id
-                        LEFT JOIN bom_direct bd ON bd.finished_item_id = i.id
                         WHERE p.id = ? AND p.status IN ('completed', 'partially_transferred')
-                        GROUP BY p.id
                     ");
                     $stmt->execute([$_POST['production_id']]);
                     $production = $stmt->fetch();
@@ -1056,21 +1055,20 @@ try {
     // Exclude batches that have verified remaining (they should only appear in VERIFIED_ALL option)
     $stmt = $db->query("
         SELECT p.*, i.name as item_name, i.code as item_code,
-               COALESCE(bp.product_unit_qty, bd.finished_unit_qty, i.unit_weight_kg) as unit_weight_kg,
+               COALESCE((SELECT product_unit_qty FROM bom_product WHERE finished_item_id = i.id LIMIT 1), 
+                        (SELECT finished_unit_qty FROM bom_direct WHERE finished_item_id = i.id LIMIT 1), 
+                        i.unit_weight_kg) as unit_weight_kg,
                l.name as location_name,
-               CASE WHEN bd.id IS NOT NULL THEN 1 ELSE 0 END as is_bom_direct
+               CASE WHEN EXISTS (SELECT 1 FROM bom_direct WHERE finished_item_id = i.id) THEN 1 ELSE 0 END as is_bom_direct
         FROM production p
         JOIN items i ON p.item_id = i.id  
         JOIN locations l ON p.location_id = l.id
-        LEFT JOIN bom_product bp ON bp.finished_item_id = i.id
-        LEFT JOIN bom_direct bd ON bd.finished_item_id = i.id
         WHERE p.status IN ('completed', 'partially_transferred')
         AND (p.remaining_qty IS NULL OR p.remaining_qty > 0)
         AND NOT EXISTS (
             SELECT 1 FROM production_remaining_completion prc 
             WHERE prc.production_id = p.id
         )
-        GROUP BY p.id
         ORDER BY p.created_at DESC
     ");
     $ready_productions = $stmt->fetchAll();
@@ -1079,7 +1077,9 @@ try {
     // These batches can be moved multiple times until fully transferred
     $stmt = $db->query("
         SELECT p.*, i.name as item_name, i.code as item_code,
-               COALESCE(bp.product_unit_qty, bd.finished_unit_qty, i.unit_weight_kg) as unit_weight_kg,
+               COALESCE((SELECT product_unit_qty FROM bom_product WHERE finished_item_id = i.id LIMIT 1), 
+                        (SELECT finished_unit_qty FROM bom_direct WHERE finished_item_id = i.id LIMIT 1), 
+                        i.unit_weight_kg) as unit_weight_kg,
                l.name as location_name,
                prc.id as remaining_completion_id,
                prc.actual_units_rounded as verified_remaining_qty,
@@ -1088,13 +1088,10 @@ try {
         FROM production p
         JOIN items i ON p.item_id = i.id  
         JOIN locations l ON p.location_id = l.id
-        LEFT JOIN bom_product bp ON bp.finished_item_id = i.id
-        LEFT JOIN bom_direct bd ON bd.finished_item_id = i.id
         JOIN production_remaining_completion prc ON prc.production_id = p.id
         WHERE p.status IN ('completed', 'partially_transferred')
         AND prc.actual_weight_measured > 0
         AND p.remaining_weight_kg > 0
-        GROUP BY p.id
         ORDER BY prc.completed_at DESC
     ");
     $verified_remaining_batches = $stmt->fetchAll();
