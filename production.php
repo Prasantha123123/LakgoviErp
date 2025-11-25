@@ -381,53 +381,20 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                 $db->beginTransaction();
                 $transaction_started = true;
 
-                // $stmt = $db->prepare("
-                //     SELECT p.*, i.name AS item_name, i.code AS item_code, i.type AS item_type,
-                //            l.name AS location_name,
-                //            COALESCE(bp.product_unit_qty, bd.finished_unit_qty, i.unit_weight_kg) as unit_weight_kg
-                //     FROM production p
-                //     JOIN items i ON i.id = p.item_id
-                //     JOIN locations l ON l.id = p.location_id
-                //     LEFT JOIN bom_product bp ON bp.finished_item_id = i.id
-                //     LEFT JOIN bom_direct bd ON bd.finished_item_id = i.id
-                //     WHERE p.id=? AND p.status='in_progress'
-                //     GROUP BY p.id
-                // ");
-
                 $stmt = $db->prepare("
-    SELECT 
-        p.*, 
-        i.name AS item_name, 
-        i.code AS item_code, 
-        i.type AS item_type,
-        l.name AS location_name,
-        COALESCE(bp.product_unit_qty, bd.finished_unit_qty, i.unit_weight_kg) AS unit_weight_kg
-    FROM production p
-    JOIN items i 
-        ON i.id = p.item_id
-    JOIN locations l 
-        ON l.id = p.location_id
-    LEFT JOIN (
-        SELECT 
-            finished_item_id, 
-            MAX(product_unit_qty) AS product_unit_qty
-        FROM bom_product
-        GROUP BY finished_item_id
-    ) bp 
-        ON bp.finished_item_id = i.id
-    LEFT JOIN (
-        SELECT 
-            finished_item_id, 
-            MAX(finished_unit_qty) AS finished_unit_qty
-        FROM bom_direct
-        GROUP BY finished_item_id
-    ) bd 
-        ON bd.finished_item_id = i.id
-    WHERE 
-        p.id = ? 
-        AND p.status = 'in_progress'
-");
+                    SELECT p.*, i.name AS item_name, i.code AS item_code, i.type AS item_type,
+                           l.name AS location_name,
+                           COALESCE(bp.product_unit_qty, bd.finished_unit_qty, i.unit_weight_kg) as unit_weight_kg
+                    FROM production p
+                    JOIN items i ON i.id = p.item_id
+                    JOIN locations l ON l.id = p.location_id
+                    LEFT JOIN bom_product bp ON bp.finished_item_id = i.id
+                    LEFT JOIN bom_direct bd ON bd.finished_item_id = i.id
+                    WHERE p.id=? AND p.status='in_progress'
+                    GROUP BY p.id
+                ");
 
+              
                 $stmt->execute([$pid]);
                 $prod = $stmt->fetch(PDO::FETCH_ASSOC);
                 if (!$prod) throw new Exception("Production not found or not in progress.");
@@ -829,11 +796,13 @@ try {
     $stmt = $db->query("
         SELECT p.*, i.name AS item_name, i.code AS item_code, 
                CASE 
-                   WHEN bd.id IS NOT NULL THEN 'pcs'
+                   WHEN EXISTS (SELECT 1 FROM bom_direct WHERE finished_item_id = i.id) THEN 'pcs'
                    ELSE u.symbol 
                END AS unit_symbol,
-               CASE WHEN bd.id IS NOT NULL THEN 1 ELSE 0 END AS is_bom_direct,
-               COALESCE(bp.product_unit_qty, bd.finished_unit_qty, i.unit_weight_kg) as unit_weight_kg,
+               CASE WHEN EXISTS (SELECT 1 FROM bom_direct WHERE finished_item_id = i.id) THEN 1 ELSE 0 END AS is_bom_direct,
+               COALESCE((SELECT product_unit_qty FROM bom_product WHERE finished_item_id = i.id LIMIT 1), 
+                        (SELECT finished_unit_qty FROM bom_direct WHERE finished_item_id = i.id LIMIT 1), 
+                        i.unit_weight_kg) as unit_weight_kg,
                l.name AS location_name,
                pi.name AS peetu_name,
                pw.total_actual_rounded_units, pw.total_wastage_units,
@@ -843,11 +812,8 @@ try {
         JOIN units u  ON u.id = i.unit_id
         JOIN locations l ON l.id = p.location_id
         LEFT JOIN items pi ON pi.id = p.peetu_item_id
-        LEFT JOIN bom_product bp ON bp.finished_item_id = i.id
-        LEFT JOIN bom_direct bd ON bd.finished_item_id = i.id
         LEFT JOIN production_wastage pw ON pw.production_id = p.id
         LEFT JOIN production_remaining_completion prc ON prc.production_id = p.id
-        GROUP BY p.id
         ORDER BY p.production_date DESC, p.id DESC
     ");
     $productions = $stmt->fetchAll(PDO::FETCH_ASSOC);
