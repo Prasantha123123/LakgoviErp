@@ -370,10 +370,9 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
             }
 
             /* Complete
-               - If finished: compute actual_peetu_qty = actual_qty / units_per_peetu (from bom_product with the chosen peetu)
-                 then consume RAW = per_peetu_raw * actual_peetu_qty.
-               - If semi_finished: consume RAW = per_peetu_raw * actual_qty.
-               - Receive produced qty for item.
+               IMPORTANT: Production completion now ONLY consumes raw materials.
+               NO finished stock is added here. Finished stock is added ONLY when
+               trolley weights are verified in trolley.php.
             */
             case 'complete': {
                 $pid = as_int($_POST['id'] ?? 0);
@@ -384,32 +383,25 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
 
                 $stmt = $db->prepare("
                     SELECT p.*, i.name AS item_name, i.code AS item_code, i.type AS item_type,
-                           l.name AS location_name
+                           l.name AS location_name,
+                           COALESCE(bp.product_unit_qty, bd.finished_unit_qty, i.unit_weight_kg) as unit_weight_kg
                     FROM production p
                     JOIN items i ON i.id = p.item_id
                     JOIN locations l ON l.id = p.location_id
+                    LEFT JOIN bom_product bp ON bp.finished_item_id = i.id
+                    LEFT JOIN bom_direct bd ON bd.finished_item_id = i.id
                     WHERE p.id=? AND p.status='in_progress'
+                    GROUP BY p.id
                 ");
                 $stmt->execute([$pid]);
                 $prod = $stmt->fetch(PDO::FETCH_ASSOC);
                 if (!$prod) throw new Exception("Production not found or not in progress.");
 
-                // Use planned_qty from the production record
-                // Actual weight verification happens in trolley screen
-                $actual_qty = (float)$prod['planned_qty'];
-                if ($actual_qty <= 0) throw new Exception("Invalid planned quantity in production record.");
-
-                // For Direct BOM items, check if we need to convert pieces to weight
-                $finished_weight_kg = $actual_qty; // Default: assume planned_qty is already in correct unit
-                $stmt = $db->prepare("SELECT finished_unit_qty FROM bom_direct WHERE finished_item_id = ? LIMIT 1");
-                $stmt->execute([(int)$prod['item_id']]);
-                $finished_unit_qty = $stmt->fetchColumn();
-                if ($finished_unit_qty && (float)$finished_unit_qty > 0) {
-                    // BOM exists with finished_unit_qty (weight per piece)
-                    // actual_qty is number of pieces, convert to total weight
-                    // Example: 1 pc × 20 kg/pc = 20 kg total weight
-                    $finished_weight_kg = $actual_qty * (float)$finished_unit_qty;
-                }
+                // Use planned_qty for raw material consumption calculation
+                $planned_qty = (float)$prod['planned_qty'];
+                if ($planned_qty <= 0) throw new Exception("Invalid planned quantity in production record.");
+                
+                $unit_weight = (float)$prod['unit_weight_kg'];
 
                 $components = []; // array of [raw_id, raw_name, qty]
                 if ($prod['item_type']==='finished') {
@@ -430,14 +422,14 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                         // BOM LOGIC FOR COMPLETION:
                         // - finished_unit_qty = weight per piece (e.g., 20 kg for 1 pc Papadam)
                         // - per_unit_qty = raw material needed for 1 piece
-                        // - actual_qty = NUMBER OF PIECES from planned_qty
+                        // - planned_qty = NUMBER OF PIECES to produce
                         // Example: 1 pc × 2 kg Salt/pc = 2 kg Salt to deduct
                         foreach ($direct_raws as $rw) {
                             $per_unit_qty = (float)$rw['per_unit_qty'];
                             
-                            // Calculate raw consumption based on number of pieces
-                            // actual_qty is number of pieces from planned_qty
-                            $raw_consumed = $actual_qty * $per_unit_qty;
+                            // Calculate raw consumption based on number of pieces (use planned_qty)
+                            // Actual quantity comes later from trolley verification
+                            $raw_consumed = $planned_qty * $per_unit_qty;
                             
                             $components[] = [
                                 'raw_id'   => (int)($rw['raw_material_id'] ?: 0),
@@ -465,7 +457,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                         $units_per_peetu = (float)$stmt->fetchColumn();
                         if ($units_per_peetu<=0) throw new Exception("Invalid yield for finished → peetu.");
 
-                        $actual_peetu_qty = $actual_qty / $units_per_peetu;
+                        $actual_peetu_qty = $planned_qty / $units_per_peetu;
 
                         // RAW per peetu
                         $stmt = $db->prepare("
@@ -490,7 +482,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                         }
                     }
                 } else {
-                    // semi_finished: RAW = per_peetu_raw * actual_qty
+                    // semi_finished: RAW = per_peetu_raw * planned_qty
                     $stmt = $db->prepare("
                         SELECT bp.raw_material_id, bp.category_id, bp.quantity AS per_peetu_qty, 
                                COALESCE(i.name, c.name) AS raw_name
@@ -508,7 +500,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                             'raw_id'   => (int)($rw['raw_material_id'] ?: 0),
                             'category_id' => (int)($rw['category_id'] ?: 0),
                             'raw_name' => $rw['raw_name'],
-                            'qty'      => (float)$rw['per_peetu_qty'] * $actual_qty
+                            'qty'      => (float)$rw['per_peetu_qty'] * $planned_qty
                         ];
                     }
                 }
@@ -624,33 +616,37 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                     }
                 }
 
-                // Receive finished / semi-finished
-                // Use finished_weight_kg for stock_ledger (total weight in kg)
-                $s = $db->prepare("
-                    SELECT COALESCE(SUM(quantity_in - quantity_out),0)
-                    FROM stock_ledger
-                    WHERE item_id=? AND location_id=?
+                // ========================================================================
+                // Mark production as completed and initialize remaining quantities
+                // DO NOT add production_in to stock_ledger here!
+                // Stock will be added ONLY when trolley weights are verified.
+                // ========================================================================
+                
+                // Calculate theoretical total weight
+                $theoretical_weight_kg = $planned_qty * $unit_weight;
+                
+                // Update production record
+                $u = $db->prepare("
+                    UPDATE production 
+                    SET actual_qty = ?,
+                        status = 'completed',
+                        remaining_qty = ?,
+                        remaining_weight_kg = ?
+                    WHERE id = ?
                 ");
-                $s->execute([(int)$prod['item_id'], (int)$prod['location_id']]);
-                $bal = (float)$s->fetchColumn();
-                $new_bal = $bal + $finished_weight_kg;
-
-                $ins = $db->prepare("
-                    INSERT INTO stock_ledger
-                      (item_id, location_id, transaction_type, reference_id, reference_no, transaction_date, quantity_in, balance, created_at)
-                    VALUES (?, ?, 'production_in', ?, ?, ?, ?, ?, NOW())
+                $u->execute([$planned_qty, $planned_qty, $theoretical_weight_kg, $pid]);
+                
+                // Initialize wastage tracking record
+                $stmt = $db->prepare("
+                    INSERT INTO production_wastage (production_id, theoretical_units, total_actual_raw_units, total_actual_rounded_units, total_wastage_units, wastage_percentage)
+                    VALUES (?, ?, 0, 0, 0, 0)
+                    ON DUPLICATE KEY UPDATE theoretical_units = ?
                 ");
-                $ins->execute([(int)$prod['item_id'], (int)$prod['location_id'], (int)$prod['id'], $prod['batch_no'], $prod['production_date'], $finished_weight_kg, $new_bal]);
-
-                // Update item current_stock (GLOBAL - all locations)
-                updateItemCurrentStock($db, (int)$prod['item_id']);
-
-                $u = $db->prepare("UPDATE production SET actual_qty=?, status='completed' WHERE id=?");
-                $u->execute([$actual_qty, $pid]);
+                $stmt->execute([$pid, $planned_qty, $planned_qty]);
 
                 $db->commit();
                 $transaction_started = false;
-                $success = "Production completed successfully!";
+                $success = "✅ Production completed! Raw materials consumed. Batch is ready for trolley transfer.";
                 break;
             }
 
@@ -675,6 +671,111 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                 break;
             }
 
+            case 'complete_remaining': {
+                // Record actual measured remaining weight and update remaining quantities
+                // This does NOT finalize the batch - remaining can still be assigned to trolleys
+                $pid = as_int($_POST['id'] ?? 0);
+                if ($pid <= 0) throw new Exception("Production ID is required");
+                
+                $actual_weight = floatval($_POST['actual_remaining_weight'] ?? 0);
+                if ($actual_weight <= 0) throw new Exception("Actual remaining weight must be greater than 0");
+                
+                $completion_reason = trim($_POST['completion_reason'] ?? 'Remaining weight verified');
+                
+                $db->beginTransaction();
+                $transaction_started = true;
+                
+                // Get production details
+                $stmt = $db->prepare("
+                    SELECT p.*, i.name AS item_name,
+                           COALESCE(bp.product_unit_qty, bd.finished_unit_qty, i.unit_weight_kg) as unit_weight_kg
+                    FROM production p
+                    JOIN items i ON i.id = p.item_id
+                    LEFT JOIN bom_product bp ON bp.finished_item_id = i.id
+                    LEFT JOIN bom_direct bd ON bd.finished_item_id = i.id
+                    WHERE p.id = ? AND p.status IN ('completed', 'partially_transferred')
+                    GROUP BY p.id
+                ");
+                $stmt->execute([$pid]);
+                $prod = $stmt->fetch(PDO::FETCH_ASSOC);
+                
+                if (!$prod) {
+                    throw new Exception("Production not found or not in correct status (must be completed or partially_transferred)");
+                }
+                
+                $remaining_qty_old = (float)$prod['remaining_qty'];
+                $remaining_weight_theoretical = (float)$prod['remaining_weight_kg'];
+                $unit_weight_kg = (float)$prod['unit_weight_kg'];
+                
+                if ($remaining_qty_old <= 0) {
+                    throw new Exception("No remaining quantity to update");
+                }
+                
+                if ($unit_weight_kg <= 0) {
+                    throw new Exception("Unit weight not configured for this item");
+                }
+                
+                // Calculate NEW remaining units from actual measured weight
+                $actual_units_raw = $actual_weight / $unit_weight_kg;
+                $actual_units_rounded = floor($actual_units_raw);
+                $wastage_units = $actual_units_raw - $actual_units_rounded;
+                $weight_variance = $actual_weight - $remaining_weight_theoretical;
+                
+                // The actual_units_rounded becomes the NEW remaining_qty
+                $new_remaining_qty = $actual_units_rounded;
+                $new_remaining_weight = $actual_weight;
+                
+                // Record the remaining weight measurement
+                $stmt = $db->prepare("
+                    INSERT INTO production_remaining_completion (
+                        production_id, remaining_qty_before, remaining_weight_before,
+                        actual_weight_measured, actual_units_raw, actual_units_rounded,
+                        wastage_units, weight_variance, completion_reason, completed_by
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ");
+                $stmt->execute([
+                    $pid,
+                    $remaining_qty_old,
+                    $remaining_weight_theoretical,
+                    $actual_weight,
+                    $actual_units_raw,
+                    $actual_units_rounded,
+                    $wastage_units,
+                    $weight_variance,
+                    $completion_reason,
+                    6 // Current user ID
+                ]);
+                
+                // Update production record with NEW actual remaining quantities
+                // Set status to 'completed' after verification
+                // This remaining can now be assigned to trolleys
+                $stmt = $db->prepare("
+                    UPDATE production 
+                    SET remaining_qty = ?,
+                        remaining_weight_kg = ?,
+                        status = 'completed'
+                    WHERE id = ?
+                ");
+                $stmt->execute([
+                    $new_remaining_qty,
+                    $new_remaining_weight,
+                    $pid
+                ]);
+                
+                $db->commit();
+                $transaction_started = false;
+                
+                $qty_diff = $remaining_qty_old - $new_remaining_qty;
+                $diff_text = $qty_diff > 0 ? 
+                    "reduced by " . number_format($qty_diff, 3) . " pcs" : 
+                    "increased by " . number_format(abs($qty_diff), 3) . " pcs";
+                
+                $success = "✅ Remaining weight verified! New remaining: " . number_format($new_remaining_qty, 0) . 
+                           " pcs (" . number_format($new_remaining_weight, 3) . " kg). " .
+                           "Remaining " . $diff_text . ". Can now assign to trolleys.";
+                break;
+            }
+
             default:
                 throw new Exception("Invalid action");
         }
@@ -691,10 +792,17 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
 /* ---------- Load table for page ---------- */
 try {
     $stmt = $db->query("
-        SELECT p.*, i.name AS item_name, i.code AS item_code, u.symbol AS unit_symbol,
+        SELECT p.*, i.name AS item_name, i.code AS item_code, 
+               CASE 
+                   WHEN bd.id IS NOT NULL THEN 'pcs'
+                   ELSE u.symbol 
+               END AS unit_symbol,
+               CASE WHEN bd.id IS NOT NULL THEN 1 ELSE 0 END AS is_bom_direct,
                COALESCE(bp.product_unit_qty, bd.finished_unit_qty, i.unit_weight_kg) as unit_weight_kg,
                l.name AS location_name,
-               pi.name AS peetu_name
+               pi.name AS peetu_name,
+               pw.total_actual_rounded_units, pw.total_wastage_units,
+               prc.id IS NOT NULL AS verified
         FROM production p
         JOIN items i  ON i.id = p.item_id
         JOIN units u  ON u.id = i.unit_id
@@ -702,6 +810,8 @@ try {
         LEFT JOIN items pi ON pi.id = p.peetu_item_id
         LEFT JOIN bom_product bp ON bp.finished_item_id = i.id
         LEFT JOIN bom_direct bd ON bd.finished_item_id = i.id
+        LEFT JOIN production_wastage pw ON pw.production_id = p.id
+        LEFT JOIN production_remaining_completion prc ON prc.production_id = p.id
         GROUP BY p.id
         ORDER BY p.production_date DESC, p.id DESC
     ");
@@ -755,12 +865,23 @@ try {
         </div>
         <div class="bg-white p-6 rounded-lg shadow">
             <div class="flex items-center">
+                <div class="p-3 rounded-full bg-teal-100">
+                    <svg class="w-6 h-6 text-teal-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>
+                </div>
+                <div class="ml-4">
+                    <p class="text-sm font-medium text-gray-600">Ready for Trolley</p>
+                    <p class="text-2xl font-bold text-gray-900"><?php echo count(array_filter($productions, fn($p)=>in_array($p['status'], ['completed', 'partially_transferred']))); ?></p>
+                </div>
+            </div>
+        </div>
+        <div class="bg-white p-6 rounded-lg shadow">
+            <div class="flex items-center">
                 <div class="p-3 rounded-full bg-green-100">
                     <svg class="w-6 h-6 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
                 </div>
                 <div class="ml-4">
-                    <p class="text-sm font-medium text-gray-600">Completed</p>
-                    <p class="text-2xl font-bold text-gray-900"><?php echo count(array_filter($productions, fn($p)=>$p['status']==='completed')); ?></p>
+                    <p class="text-sm font-medium text-gray-600">Fully Transferred</p>
+                    <p class="text-2xl font-bold text-gray-900"><?php echo count(array_filter($productions, fn($p)=>$p['status']==='fully_transferred')); ?></p>
                 </div>
             </div>
         </div>
@@ -812,19 +933,44 @@ try {
                     </td>
                     <td class="px-6 py-4 text-sm text-gray-900 font-medium">
                         <?php 
-                        if ($p['actual_qty']) {
-                            $actual_qty = (float)$p['actual_qty'];
-                            $unit_weight = (float)$p['unit_weight_kg'];
+                        if ($p['status'] === 'completed' || $p['status'] === 'partially_transferred' || $p['status'] === 'fully_transferred') {
+                            $planned_qty = (float)$p['planned_qty'];
+                            $remaining_qty = isset($p['remaining_qty']) ? (float)$p['remaining_qty'] : $planned_qty;
+                            $remaining_weight_kg = isset($p['remaining_weight_kg']) ? (float)$p['remaining_weight_kg'] : 0;
+                            $transferred_qty = isset($p['total_transferred_qty']) ? (float)$p['total_transferred_qty'] : 0;
+                            $wastage = isset($p['total_wastage_units']) ? (float)$p['total_wastage_units'] : 0;
+                            $is_bom_direct = !empty($p['is_bom_direct']);
                             
-                            if ($unit_weight > 0) {
-                                // Show pieces and total weight
-                                $total_weight = $actual_qty * $unit_weight;
-                                echo number_format($actual_qty, 0) . ' ' . htmlspecialchars($p['unit_symbol']) . '<br>';
-                                echo '<span class="text-xs text-gray-600">(' . number_format($total_weight, 3) . ' kg total)</span>';
-                            } else {
-                                // No weight info, show quantity only
-                                echo number_format($actual_qty, 3) . ' ' . htmlspecialchars($p['unit_symbol']);
+                            echo '<div class="space-y-1">';
+                            echo '<div>' . number_format($planned_qty, 0) . ' ' . htmlspecialchars($p['unit_symbol']) . ' <span class="text-xs text-gray-500">(planned)</span></div>';
+                            
+                            if ($transferred_qty > 0) {
+                                // For bom_direct, show transferred in kg; for others, show in pcs
+                                if ($is_bom_direct) {
+                                    echo '<div class="text-green-600">' . number_format($transferred_qty, 2) . ' kg <span class="text-xs">(transferred)</span></div>';
+                                } else {
+                                    echo '<div class="text-green-600">' . number_format($transferred_qty, 0) . ' ' . htmlspecialchars($p['unit_symbol']) . ' <span class="text-xs">(transferred)</span></div>';
+                                }
                             }
+                            
+                            // For bom_direct, check remaining_weight_kg; for others, check remaining_qty
+                            $has_remaining = $is_bom_direct ? ($remaining_weight_kg > 0) : ($remaining_qty > 0);
+                            if ($has_remaining && $p['status'] !== 'completed') {
+                                $color = $p['status'] === 'partially_transferred' ? 'text-orange-600' : 'text-gray-600';
+                                // For bom_direct, show remaining_weight_kg in kg; for others, show remaining_qty in pcs
+                                if ($is_bom_direct) {
+                                    echo '<div class="' . $color . '">' . number_format($remaining_weight_kg, 2) . ' kg <span class="text-xs">(remaining)</span></div>';
+                                } else {
+                                    echo '<div class="' . $color . '">' . number_format($remaining_qty, 0) . ' ' . htmlspecialchars($p['unit_symbol']) . ' <span class="text-xs">(remaining)</span></div>';
+                                }
+                            }
+                            
+                            if ($wastage > 0) {
+                                // Wastage always in same unit as transferred
+                                $wastage_unit = $is_bom_direct ? 'kg' : htmlspecialchars($p['unit_symbol']);
+                                echo '<div class="text-red-500 text-xs">Wastage: ' . number_format($wastage, 3) . ' ' . $wastage_unit . '</div>';
+                            }
+                            echo '</div>';
                         } else {
                             echo '-';
                         }
@@ -832,8 +978,10 @@ try {
                     </td>
                     <td class="px-6 py-4 text-sm">
                         <span class="<?php
-                            echo $p['status']==='completed' ? 'bg-green-100 text-green-800' :
-                                 ($p['status']==='in_progress' ? 'bg-blue-100 text-blue-800' : 'bg-yellow-100 text-yellow-800');
+                            echo $p['status']==='fully_transferred' ? 'bg-green-100 text-green-800' :
+                                 ($p['status']==='partially_transferred' ? 'bg-orange-100 text-orange-800' :
+                                  ($p['status']==='completed' ? 'bg-teal-100 text-teal-800' :
+                                   ($p['status']==='in_progress' ? 'bg-blue-100 text-blue-800' : 'bg-yellow-100 text-yellow-800')));
                         ?> text-xs font-medium px-2.5 py-0.5 rounded capitalize"><?php echo str_replace('_',' ',$p['status']); ?></span>
                     </td>
                     <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium space-x-2">
@@ -843,11 +991,13 @@ try {
                             <input type="hidden" name="id" value="<?php echo (int)$p['id']; ?>">
                             <button type="submit" class="text-blue-600 hover:text-blue-900">Start</button>
                           </form>
+                          <form method="POST" class="inline" onsubmit="return confirm('Delete this batch?')">
+                            <input type="hidden" name="action" value="delete">
+                            <input type="hidden" name="id" value="<?php echo (int)$p['id']; ?>">
+                            <button type="submit" class="text-red-600 hover:text-red-900">Delete</button>
+                          </form>
                         <?php endif; ?>
-                        <?php if ($p['status']==='completed'): ?>
-                          <button class="text-blue-600 hover:text-blue-900"
-                                  onclick='viewProductionDetails(<?php echo (int)$p['id']; ?>)'>View Details</button>
-                        <?php endif; ?>
+                        
                         <?php if ($p['status']==='in_progress'): ?>
                           <button class="text-green-600 hover:text-green-900"
                                   onclick='completeProduction(<?php echo json_encode([
@@ -859,12 +1009,24 @@ try {
                                       'unit_symbol'=>$p['unit_symbol']
                                   ], JSON_HEX_TAG|JSON_HEX_APOS|JSON_HEX_QUOT|JSON_HEX_AMP); ?>)'>Complete</button>
                         <?php endif; ?>
-                        <?php if ($p['status']==='planned'): ?>
-                          <form method="POST" class="inline" onsubmit="return confirm('Delete this batch?')">
-                            <input type="hidden" name="action" value="delete">
-                            <input type="hidden" name="id" value="<?php echo (int)$p['id']; ?>">
-                            <button type="submit" class="text-red-600 hover:text-red-900">Delete</button>
-                          </form>
+                        
+                        <?php if (in_array($p['status'], ['completed', 'partially_transferred', 'fully_transferred'])): ?>
+                          <button class="text-blue-600 hover:text-blue-900"
+                                  onclick='viewProductionDetails(<?php echo (int)$p['id']; ?>)'>View Details</button>
+                        <?php endif; ?>
+                        
+                        <?php if (($p['status']==='completed' || $p['status']==='partially_transferred') && 
+                                  ((float)$p['remaining_qty'] > 0 || (float)$p['remaining_weight_kg'] > 0) && 
+                                  !$p['verified']): ?>
+                          <button class="text-purple-600 hover:text-purple-900"
+                                  onclick='completeRemaining(<?php echo json_encode([
+                                      'id'=>$p['id'],
+                                      'batch_no'=>$p['batch_no'],
+                                      'item_name'=>$p['item_name'],
+                                      'remaining_qty'=>$p['remaining_qty'],
+                                      'remaining_weight_kg'=>$p['remaining_weight_kg'],
+                                      'unit_weight_kg'=>$p['unit_weight_kg']
+                                  ], JSON_HEX_TAG|JSON_HEX_APOS|JSON_HEX_QUOT|JSON_HEX_AMP); ?>)'>Verify Remaining</button>
                         <?php endif; ?>
                     </td>
                 </tr>
@@ -994,21 +1156,46 @@ try {
           <p class="text-sm text-gray-600">Actual Quantity</p>
           <p class="text-lg font-semibold" id="pd_actual"></p>
         </div>
-      </div>
-
-      <!-- Repacking Tab -->
-      <div class="border-t pt-4">
-        <h4 class="text-lg font-bold text-gray-900 mb-3">Repacking</h4>
-        <div id="pd_repacking" class="bg-gray-50 p-4 rounded-lg">
-          <p class="text-sm text-gray-500">Loading repacking data...</p>
+        <div>
+          <p class="text-sm text-gray-600">Status</p>
+          <p class="text-lg font-semibold" id="pd_status"></p>
+        </div>
+        <div>
+          <p class="text-sm text-gray-600">Location</p>
+          <p class="text-lg font-semibold" id="pd_location"></p>
+        </div>
+        <div class="col-span-2">
+          <p class="text-sm text-gray-600">Production Date</p>
+          <p class="text-lg font-semibold" id="pd_date"></p>
         </div>
       </div>
 
-      <!-- Rolls Tab -->
-      <div class="border-t pt-4">
-        <h4 class="text-lg font-bold text-gray-900 mb-3">Rolls Production</h4>
-        <div id="pd_rolls" class="bg-gray-50 p-4 rounded-lg">
-          <p class="text-sm text-gray-500">Loading rolls data...</p>
+      <!-- Transfers to Store -->
+      <div>
+        <h4 class="text-lg font-semibold mb-2">Transfers to Store</h4>
+        <div class="overflow-x-auto">
+          <table class="min-w-full border-collapse border border-gray-300">
+            <thead>
+              <tr class="bg-gray-50">
+                <th class="px-4 py-2 border border-gray-300 text-left">Trolley Batch</th>
+                <th class="px-4 py-2 border border-gray-300 text-left">Expected Weight</th>
+                <th class="px-4 py-2 border border-gray-300 text-left">Actual Weight</th>
+                <th class="px-4 py-2 border border-gray-300 text-left">Status</th>
+                <th class="px-4 py-2 border border-gray-300 text-left">Date</th>
+              </tr>
+            </thead>
+            <tbody id="pd_transfers">
+              <!-- Transfers will be populated here -->
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Remaining Completion -->
+      <div>
+        <h4 class="text-lg font-semibold mb-2">Remaining Verification</h4>
+        <div id="pd_remaining" class="bg-gray-50 p-4 rounded">
+          <!-- Remaining completion will be populated here -->
         </div>
       </div>
 
@@ -1163,46 +1350,177 @@ function completeProduction(p){
 function viewProductionDetails(productionId) {
   openModal('productionDetailsModal');
   
-  // Fetch production details and related repacking/rolls data
+  // Fetch production details
   fetch(`/Jann%20Network/lakgovi-erp/api/production_details.php?id=${productionId}`)
     .then(response => response.json())
     .then(data => {
+      if (data.error) {
+        alert('Error: ' + data.error);
+        return;
+      }
       // Populate production info
       document.getElementById('pd_batch').textContent = data.production.batch_no;
       document.getElementById('pd_item').textContent = `${data.production.item_name} (${data.production.item_code})`;
       document.getElementById('pd_planned').textContent = `${Number(data.production.planned_qty).toFixed(3)} ${data.production.unit_symbol}`;
       document.getElementById('pd_actual').textContent = `${Number(data.production.actual_qty).toFixed(3)} ${data.production.unit_symbol}`;
+      document.getElementById('pd_status').textContent = data.production.status;
+      document.getElementById('pd_location').textContent = data.production.location_name;
+      document.getElementById('pd_date').textContent = new Date(data.production.production_date).toLocaleDateString();
       
-      // Populate repacking data
-      if (data.repacking && data.repacking.length > 0) {
-        let repackHTML = '<div class="overflow-x-auto"><table class="min-w-full text-sm"><thead class="bg-gray-200"><tr><th class="px-3 py-2 text-left">Code</th><th class="px-3 py-2 text-left">Date</th><th class="px-3 py-2 text-left">Status</th><th class="px-3 py-2 text-right">Source Qty</th><th class="px-3 py-2 text-right">Packs Created</th></tr></thead><tbody>';
-        data.repacking.forEach(r => {
-          repackHTML += `<tr class="border-b"><td class="px-3 py-2">${r.batch_code}</td><td class="px-3 py-2">${new Date(r.batch_date).toLocaleDateString()}</td><td class="px-3 py-2"><span class="px-2 py-1 rounded text-xs font-semibold ${r.status === 'completed' ? 'bg-green-100 text-green-800' : 'bg-blue-100 text-blue-800'}">${r.status}</span></td><td class="px-3 py-2 text-right">${Number(r.source_quantity).toFixed(3)}</td><td class="px-3 py-2 text-right font-bold">${r.bundle_quantity}</td></tr>`;
-        });
-        repackHTML += '</tbody></table></div>';
-        document.getElementById('pd_repacking').innerHTML = repackHTML;
+      // Populate transfers
+      const transfersContainer = document.getElementById('pd_transfers');
+      if (data.transfers.length > 0) {
+        transfersContainer.innerHTML = data.transfers.map(transfer => `
+          <tr>
+            <td class="px-4 py-2 border">${transfer.trolley_batch}</td>
+            <td class="px-4 py-2 border">${Number(transfer.expected_weight_kg).toFixed(3)} kg</td>
+            <td class="px-4 py-2 border">${Number(transfer.actual_weight_kg).toFixed(3)} kg</td>
+            <td class="px-4 py-2 border">${transfer.status_text}</td>
+            <td class="px-4 py-2 border">${new Date(transfer.movement_date).toLocaleString()}</td>
+          </tr>
+        `).join('');
       } else {
-        document.getElementById('pd_repacking').innerHTML = '<p class="text-sm text-gray-500">No repacking records found</p>';
+        transfersContainer.innerHTML = '<tr><td colspan="5" class="px-4 py-2 border text-center text-gray-500">No transfers found</td></tr>';
       }
       
-      // Populate rolls data
-      if (data.rolls && data.rolls.length > 0) {
-        let rollsHTML = '<div class="overflow-x-auto"><table class="min-w-full text-sm"><thead class="bg-gray-200"><tr><th class="px-3 py-2 text-left">Code</th><th class="px-3 py-2 text-left">Date</th><th class="px-3 py-2 text-left">Status</th><th class="px-3 py-2 text-left">Materials Used</th><th class="px-3 py-2 text-right">Rolls Created</th></tr></thead><tbody>';
-        data.rolls.forEach(r => {
-          rollsHTML += `<tr class="border-b"><td class="px-3 py-2">${r.batch_code}</td><td class="px-3 py-2">${new Date(r.batch_date).toLocaleDateString()}</td><td class="px-3 py-2"><span class="px-2 py-1 rounded text-xs font-semibold ${r.status === 'completed' ? 'bg-green-100 text-green-800' : 'bg-blue-100 text-blue-800'}">${r.status}</span></td><td class="px-3 py-2">${r.total_materials_used} items</td><td class="px-3 py-2 text-right font-bold">${r.rolls_quantity}</td></tr>`;
-        });
-        rollsHTML += '</tbody></table></div>';
-        document.getElementById('pd_rolls').innerHTML = rollsHTML;
+      // Populate remaining completion
+      const remainingContainer = document.getElementById('pd_remaining');
+      if (data.remaining_completion) {
+        remainingContainer.innerHTML = `
+          <div class="grid grid-cols-2 gap-4">
+            <div>
+              <p class="text-sm text-gray-600">Remaining Before</p>
+              <p class="font-semibold">${Number(data.remaining_completion.remaining_qty_before).toFixed(3)} pcs / ${Number(data.remaining_completion.remaining_weight_before).toFixed(3)} kg</p>
+            </div>
+            <div>
+              <p class="text-sm text-gray-600">Actual Measured</p>
+              <p class="font-semibold">${Number(data.remaining_completion.actual_weight_measured).toFixed(3)} kg</p>
+            </div>
+            <div>
+              <p class="text-sm text-gray-600">New Remaining</p>
+              <p class="font-semibold">${Number(data.remaining_completion.actual_units_rounded).toFixed(3)} pcs</p>
+            </div>
+            <div>
+              <p class="text-sm text-gray-600">Completed At</p>
+              <p class="font-semibold">${new Date(data.remaining_completion.completed_at).toLocaleString()}</p>
+            </div>
+          </div>
+        `;
       } else {
-        document.getElementById('pd_rolls').innerHTML = '<p class="text-sm text-gray-500">No rolls records found</p>';
+        remainingContainer.innerHTML = '<p class="text-gray-500">No remaining verification completed</p>';
       }
     })
     .catch(error => {
       console.error('Error loading details:', error);
-      document.getElementById('pd_repacking').innerHTML = '<p class="text-red-500">Error loading repacking data</p>';
-      document.getElementById('pd_rolls').innerHTML = '<p class="text-red-500">Error loading rolls data</p>';
+      alert('Error loading production details');
     });
+}
+
+function completeRemaining(p) {
+  document.getElementById('cr_id').value = p.id;
+  document.getElementById('cr_batch').textContent = p.batch_no;
+  document.getElementById('cr_item').textContent = p.item_name;
+  document.getElementById('cr_remaining_qty').textContent = Number(p.remaining_qty).toFixed(3);
+  document.getElementById('cr_theoretical_weight').textContent = Number(p.remaining_weight_kg).toFixed(3);
+  document.getElementById('cr_unit_weight').value = p.unit_weight_kg;
+  document.getElementById('cr_actual_weight').value = Number(p.remaining_weight_kg).toFixed(3);
+  updateRemainingCalculation();
+  openModal('completeRemainingModal');
+}
+
+function updateRemainingCalculation() {
+  const actualWeight = parseFloat(document.getElementById('cr_actual_weight').value) || 0;
+  const unitWeight = parseFloat(document.getElementById('cr_unit_weight').value) || 1;
+  
+  if (unitWeight > 0) {
+    const rawUnits = actualWeight / unitWeight;
+    const roundedUnits = Math.floor(rawUnits);
+    const wastage = rawUnits - roundedUnits;
+    
+    document.getElementById('cr_calculated_units').textContent = roundedUnits.toFixed(0);
+    document.getElementById('cr_wastage').textContent = wastage.toFixed(3);
+  }
 }
 </script>
 
+<!-- Complete Remaining Batch Modal -->
+<div id="completeRemainingModal" class="fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full modal-backdrop hidden z-50">
+  <div class="relative top-20 mx-auto p-5 border w-[32rem] max-w-[95vw] shadow-lg rounded-md bg-white">
+    <div class="flex justify-between items-center mb-4">
+      <h3 class="text-lg font-bold text-gray-900">📏 Verify Remaining Weight</h3>
+      <button onclick="closeModal('completeRemainingModal')" class="text-gray-400 hover:text-gray-600">
+        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+      </button>
+    </div>
+
+    <form method="POST" class="space-y-4" onsubmit="return confirm('Update remaining quantity based on actual measured weight?')">
+      <input type="hidden" name="action" value="complete_remaining">
+      <input type="hidden" name="id" id="cr_id">
+      <input type="hidden" id="cr_unit_weight">
+
+      <div class="bg-blue-50 border border-blue-200 rounded-md p-4 space-y-2">
+        <div class="flex justify-between">
+          <span class="text-sm font-medium text-gray-700">Batch:</span>
+          <span class="text-sm font-bold text-gray-900" id="cr_batch"></span>
+        </div>
+        <div class="flex justify-between">
+          <span class="text-sm font-medium text-gray-700">Item:</span>
+          <span class="text-sm font-bold text-gray-900" id="cr_item"></span>
+        </div>
+        <div class="flex justify-between">
+          <span class="text-sm font-medium text-gray-700">Current Remaining:</span>
+          <span class="text-sm font-bold text-purple-600" id="cr_remaining_qty"></span>
+        </div>
+        <div class="flex justify-between">
+          <span class="text-sm font-medium text-gray-700">Theoretical Weight:</span>
+          <span class="text-sm text-gray-600"><span id="cr_theoretical_weight"></span> kg</span>
+        </div>
+      </div>
+
+      <div>
+        <label class="block text-sm font-medium text-gray-700 mb-1">Actual Measured Weight (kg) <span class="text-red-500">*</span></label>
+        <input type="number" step="0.001" name="actual_remaining_weight" id="cr_actual_weight" required
+               oninput="updateRemainingCalculation()"
+               class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-purple-500">
+        <p class="text-xs text-gray-500 mt-1">Weigh the actual remaining batch and enter the measured weight</p>
+      </div>
+
+      <div class="bg-gray-50 border border-gray-200 rounded-md p-4 space-y-2">
+        <div class="flex justify-between">
+          <span class="text-sm font-medium text-gray-700">New Remaining Units (floor):</span>
+          <span class="text-sm font-bold text-green-600" id="cr_calculated_units">0</span>
+        </div>
+        <div class="flex justify-between">
+          <span class="text-sm font-medium text-gray-700">Rounding Difference:</span>
+          <span class="text-sm font-bold text-orange-600" id="cr_wastage">0.000</span>
+        </div>
+      </div>
+
+      <div class="bg-yellow-50 border border-yellow-200 rounded-md p-3">
+        <p class="text-sm text-yellow-800">
+          <strong>Note:</strong> This updates the remaining quantity based on actual weight. 
+          The remaining can still be assigned to trolleys and moved to store.
+        </p>
+      </div>
+
+      <div>
+        <label class="block text-sm font-medium text-gray-700 mb-1">Verification Reason (Optional)</label>
+        <input type="text" name="completion_reason" 
+               placeholder="e.g., Weight verification, Inventory audit, etc."
+               class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-purple-500">
+      </div>
+
+      <div class="flex justify-end space-x-3 pt-4">
+        <button type="button" onclick="closeModal('completeRemainingModal')" 
+                class="px-4 py-2 border border-gray-300 rounded-md text-gray-700 hover:bg-gray-50">Cancel</button>
+        <button type="submit" 
+                class="px-4 py-2 bg-purple-600 text-white rounded-md hover:bg-purple-700">Update Remaining Quantity</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+</script>
+
 <?php include 'footer.php'; ?>
+

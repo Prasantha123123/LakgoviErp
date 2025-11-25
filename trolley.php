@@ -37,25 +37,158 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                     $db->beginTransaction();
                     $transaction_started = true;
                     
-                    // Validate production exists and is completed
+                    // Check if this is for all verified remaining batches (COMBINED)
+                    if (isset($_POST['production_id']) && $_POST['production_id'] === 'VERIFIED_ALL') {
+                        // Get all verified remaining batches that still have remaining weight
+                        $stmt = $db->query("
+                            SELECT DISTINCT p.id, p.batch_no, p.item_id, i.name as item_name, 
+                                   p.remaining_qty,
+                                   p.remaining_weight_kg,
+                                   COALESCE(bp.product_unit_qty, bd.finished_unit_qty, i.unit_weight_kg) as unit_weight_kg,
+                                   p.location_id, prc.actual_weight_measured
+                            FROM production p
+                            JOIN production_remaining_completion prc ON prc.production_id = p.id
+                            JOIN items i ON p.item_id = i.id
+                            LEFT JOIN bom_product bp ON bp.finished_item_id = i.id
+                            LEFT JOIN bom_direct bd ON bd.finished_item_id = i.id
+                            WHERE p.status IN ('completed', 'partially_transferred')
+                            AND p.remaining_weight_kg > 0
+                        ");
+                        $verified_batches = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                        
+                        if (empty($verified_batches)) {
+                            throw new Exception("No verified remaining batches found");
+                        }
+                        
+                        // Get trolley IDs - use only the first trolley for combined movement
+                        $trolley_ids = isset($_POST['trolley_ids']) ? $_POST['trolley_ids'] : [];
+                        if (!is_array($trolley_ids)) {
+                            $trolley_ids = [$trolley_ids];
+                        }
+                        $trolley_ids = array_filter($trolley_ids);
+                        
+                        if (empty($trolley_ids)) {
+                            throw new Exception("Please select at least one trolley");
+                        }
+                        
+                        // Use first selected trolley
+                        $trolley_id = $trolley_ids[0];
+                        $movement_date = $_POST['movement_date'];
+                        
+                        // Calculate combined totals
+                        $total_qty = 0;
+                        $total_weight = 0;
+                        $batch_nos = [];
+                        $first_item_id = null;
+                        $first_location_id = null;
+                        $first_unit_weight = null;
+                        
+                        foreach ($verified_batches as $batch) {
+                            $total_weight += (float)$batch['actual_weight_measured'];
+                            $batch_nos[] = $batch['batch_no'];
+                            if (!$first_item_id) {
+                                $first_item_id = $batch['item_id'];
+                                $first_location_id = $batch['location_id'];
+                                $first_unit_weight = $batch['unit_weight_kg'];
+                            }
+                        }
+                        
+                        // Calculate combined quantity from combined weight
+                        $total_qty = floor($total_weight / $first_unit_weight);
+                        
+                        // Generate unique movement number
+                        $count_stmt = $db->query("SELECT COUNT(*) as count FROM trolley_movements");
+                        $count = $count_stmt->fetch()['count'] + 1;
+                        $movement_no = 'TM' . str_pad($count, 4, '0', STR_PAD_LEFT);
+                        
+                        // Create ONE combined trolley movement (use first batch ID as reference)
+                        $stmt = $db->prepare("
+                            INSERT INTO trolley_movements (
+                                movement_no, trolley_id, production_id, from_location_id, to_location_id,
+                                movement_date, expected_weight_kg, expected_units, status, notes
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                        ");
+                        $stmt->execute([
+                            $movement_no,
+                            $trolley_id,
+                            $verified_batches[0]['id'], // Use first batch as primary reference
+                            $first_location_id,
+                            1, // To store
+                            $movement_date,
+                            $total_weight,
+                            $total_qty,
+                            'Combined verified remaining from: ' . implode(', ', $batch_nos)
+                        ]);
+                        $movement_id = $db->lastInsertId();
+                        
+                        // Create ONE combined trolley item
+                        $stmt = $db->prepare("
+                            INSERT INTO trolley_items (
+                                movement_id, item_id, expected_quantity, expected_weight_kg, unit_weight_kg
+                            ) VALUES (?, ?, ?, ?, ?)
+                        ");
+                        $stmt->execute([
+                            $movement_id,
+                            $first_item_id,
+                            $total_qty,
+                            $total_weight,
+                            $first_unit_weight
+                        ]);
+                        
+                        // Update trolley status
+                        $stmt = $db->prepare("UPDATE trolleys SET status = 'in_use' WHERE id = ?");
+                        $stmt->execute([$trolley_id]);
+                        
+                        $db->commit();
+                        $transaction_started = false;
+                        $success = "✅ Created combined trolley movement for " . count($verified_batches) . " verified remaining batches (" . implode(', ', $batch_nos) . ")!";
+                        break;
+                    }
+                    
+                    // Regular single production movement
+                    // Validate production exists and is completed or partially transferred
                     // Get weight from BOM tables if available, fallback to unit_weight_kg
                     $stmt = $db->prepare("
                         SELECT p.*, i.name as item_name,
                                COALESCE(bp.product_unit_qty, bd.finished_unit_qty, i.unit_weight_kg) as unit_weight_kg,
-                               l.name as location_name
+                               l.name as location_name,
+                               CASE WHEN bd.id IS NOT NULL THEN 1 ELSE 0 END as is_bom_direct
                         FROM production p
                         JOIN items i ON p.item_id = i.id
                         JOIN locations l ON p.location_id = l.id
                         LEFT JOIN bom_product bp ON bp.finished_item_id = i.id
                         LEFT JOIN bom_direct bd ON bd.finished_item_id = i.id
-                        WHERE p.id = ? AND p.status = 'completed'
+                        WHERE p.id = ? AND p.status IN ('completed', 'partially_transferred')
                         GROUP BY p.id
                     ");
                     $stmt->execute([$_POST['production_id']]);
                     $production = $stmt->fetch();
                     
                     if (!$production) {
-                        throw new Exception("Production batch not found or not completed");
+                        throw new Exception("Production batch not found or not ready for trolley transfer");
+                    }
+                    
+                    $is_bom_direct = (bool)$production['is_bom_direct'];
+                    
+                    // Initialize remaining qty if not set
+                    if ($production['remaining_qty'] === null) {
+                        $stmt = $db->prepare("UPDATE production SET remaining_qty = planned_qty, remaining_weight_kg = (planned_qty * ?) WHERE id = ?");
+                        $stmt->execute([(float)$production['unit_weight_kg'], $_POST['production_id']]);
+                        $production['remaining_qty'] = $production['planned_qty'];
+                        $production['remaining_weight_kg'] = (float)$production['planned_qty'] * (float)$production['unit_weight_kg'];
+                    }
+                    
+                    // Check if there's remaining quantity available
+                    // For bom_direct items, remaining_qty represents weight in kg
+                    // For bom_product items, remaining_qty represents pieces
+                    if ($is_bom_direct) {
+                        $remaining_display = (float)$production['remaining_weight_kg'];
+                    } else {
+                        $remaining_display = (float)$production['remaining_qty'];
+                    }
+                    
+                    if ($remaining_display <= 0) {
+                        throw new Exception("This production batch has been fully transferred. No remaining quantity available.");
                     }
                     
                     // Get trolley IDs (can be single or multiple)
@@ -69,15 +202,27 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         throw new Exception("At least one trolley must be selected");
                     }
                     
-                    // Calculate total expected weight and units
-                    $expected_units = floatval($production['actual_qty']);
+                    // Calculate total expected weight and units from REMAINING quantity
+                    $remaining_qty = (float)$production['remaining_qty'];
                     $unit_weight = floatval($production['unit_weight_kg']);
-                    $expected_weight = $expected_units * $unit_weight;
+                    $remaining_weight = (float)$production['remaining_weight_kg'];
+                    
+                    // For bom_direct, expected_units = weight; for others, expected_units = pieces
+                    if ($is_bom_direct) {
+                        $expected_units = $remaining_weight; // Weight-based
+                        $expected_weight = $remaining_weight;
+                    } else {
+                        $expected_units = $remaining_qty; // Piece-based
+                        $expected_weight = $expected_units * $unit_weight;
+                    }
                     
                     // Distribute units equally among trolleys (default if not specified)
                     $trolley_count = count($trolley_ids);
                     $units_per_trolley = $expected_units / $trolley_count;
                     $weight_per_trolley = $expected_weight / $trolley_count;
+                    
+                    // Validate: Total weight for this movement cannot exceed remaining weight
+                    $total_movement_weight = 0;
                     
                     // Create movements for each trolley
                     $created_movements = [];
@@ -99,15 +244,29 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         
                         // Check if individual weight was specified for this trolley
                         $trolley_weight_key = 'trolley_weight_' . $trolley_id;
+                        $current_units = $units_per_trolley;
+                        $current_weight = $weight_per_trolley;
                         
                         if (isset($_POST[$trolley_weight_key]) && $_POST[$trolley_weight_key] != '') {
-                            $weight_per_trolley = floatval($_POST[$trolley_weight_key]);
-                            // Calculate units from weight if weight is provided
-                            $units_per_trolley = $unit_weight > 0 ? $weight_per_trolley / $unit_weight : 0;
-                        } else {
-                            // Default distribution
-                            $units_per_trolley = $expected_units / $trolley_count;
-                            $weight_per_trolley = $expected_weight / $trolley_count;
+                            $current_weight = floatval($_POST[$trolley_weight_key]);
+                            // For bom_direct, units = weight; for others, calculate from weight
+                            if ($is_bom_direct) {
+                                $current_units = $current_weight; // Weight-based: units = weight
+                            } else {
+                                $current_units = $unit_weight > 0 ? $current_weight / $unit_weight : 0;
+                            }
+                        }
+                        
+                        // Accumulate total weight
+                        $total_movement_weight += $current_weight;
+                        
+                        // Validate: Cannot exceed remaining weight
+                        if ($total_movement_weight > $remaining_weight + 0.001) { // Small epsilon for float comparison
+                            throw new Exception(
+                                "Total weight for this movement (" . number_format($total_movement_weight, 3) . " kg) "
+                                . "exceeds remaining batch weight (" . number_format($remaining_weight, 3) . " kg). "
+                                . "Please reduce the weight allocation."
+                            );
                         }
                         
                         // Generate unique movement number for each trolley
@@ -129,8 +288,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                             $production['location_id'], // From production location
                             1, // To store (location_id = 1)
                             $_POST['movement_date'],
-                            $weight_per_trolley,
-                            $units_per_trolley
+                            $current_weight,
+                            $current_units
                         ]);
                         $movement_id = $db->lastInsertId();
                         $created_movements[] = $movement_id;
@@ -144,8 +303,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         $stmt->execute([
                             $movement_id,
                             $production['item_id'],
-                            $units_per_trolley,
-                            $weight_per_trolley,
+                            $current_units,
+                            $current_weight,
                             $unit_weight
                         ]);
                         
@@ -153,10 +312,6 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         $stmt = $db->prepare("UPDATE trolleys SET status = 'in_use' WHERE id = ?");
                         $stmt->execute([$trolley_id]);
                     }
-                    
-                    // Mark production batch as moved to trolley (update status)
-                    $stmt = $db->prepare("UPDATE production SET status = 'moved_to_trolley' WHERE id = ?");
-                    $stmt->execute([$_POST['production_id']]);
                     
                     $db->commit();
                     $transaction_started = false;
@@ -167,20 +322,41 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                     exit;
                     
                 case 'verify_weight':
-                    // Verify trolley weight - calculates actual units from weight
+                    // ========================================================================
+                    // TROLLEY WEIGHT VERIFICATION - THE ONLY PLACE WHERE PRODUCTION STOCK IS ADDED
+                    // ========================================================================
+                    // This action:
+                    // 1. Calculates actual_units_raw = actual_weight_kg / unit_weight_kg
+                    // 2. Calculates actual_units_rounded = FLOOR(actual_units_raw) for stock transfer
+                    // 3. Calculates wastage_units = actual_units_raw - actual_units_rounded
+                    // 4. Inserts stock_ledger entries with ROUNDED units (production_in to store)
+                    // 5. Updates production.remaining_qty and tracking fields
+                    // 6. Sets status to partially_transferred or fully_transferred
+                    // ========================================================================
+                    
                     $db->beginTransaction();
                     $transaction_started = true;
                     
                     $movement_id = $_POST['movement_id'];
                     $actual_weight = floatval($_POST['actual_weight_kg']);
                     
-                    // Get movement details
+                    if ($actual_weight <= 0) {
+                        throw new Exception("Actual weight must be greater than 0");
+                    }
+                    
+                    // Get movement details including production info and BOM type
                     $stmt = $db->prepare("
-                        SELECT tm.*, ti.expected_quantity, ti.expected_weight_kg, ti.unit_weight_kg, ti.item_id,
-                               i.weight_tolerance_percent, i.name as item_name
+                        SELECT tm.*, 
+                               ti.expected_quantity, ti.expected_weight_kg, ti.unit_weight_kg, ti.item_id,
+                               i.weight_tolerance_percent, i.name as item_name,
+                               p.id as production_id, p.remaining_qty, p.remaining_weight_kg, p.planned_qty,
+                               p.total_transferred_qty, p.total_wastage_units,
+                               CASE WHEN bd.id IS NOT NULL THEN 1 ELSE 0 END as is_bom_direct
                         FROM trolley_movements tm
                         JOIN trolley_items ti ON tm.id = ti.movement_id
                         JOIN items i ON ti.item_id = i.id
+                        LEFT JOIN production p ON p.id = tm.production_id
+                        LEFT JOIN bom_direct bd ON bd.finished_item_id = i.id
                         WHERE tm.id = ?
                     ");
                     $stmt->execute([$movement_id]);
@@ -190,26 +366,97 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         throw new Exception("Trolley movement not found");
                     }
                     
-                    // Calculate actual units from the entered weight
-                    // For items measured in kg, the weight value IS the quantity
-                    $actual_units = $actual_weight;
+                    // Check if this is a bom_direct item (should use weight, not pieces)
+                    $is_bom_direct = (bool)$movement['is_bom_direct'];
                     
-                    // Calculate variances
+                    // ========================================================================
+                    // STEP 1: Calculate units from weight with rounding
+                    // ========================================================================
+                    $unit_weight_kg = (float)$movement['unit_weight_kg'];
+                    
+                    if ($unit_weight_kg <= 0) {
+                        throw new Exception("Unit weight not configured for this item. Cannot calculate units from weight.");
+                    }
+                    
+                    // Calculate raw units (before rounding)
+                    $actual_units_raw = $actual_weight / $unit_weight_kg;
+                    
+                    // For bom_direct items, units = weight (kg), no need to divide by unit_weight
+                    // For bom_product items, units = pieces (divide weight by unit_weight and floor)
+                    if ($is_bom_direct) {
+                        // Weight-based: store actual weight, calculate wastage from expected vs actual
+                        $actual_units_rounded = floor($actual_weight * 1000) / 1000; // Round to 3 decimals
+                        $expected_weight = (float)$movement['expected_weight_kg'];
+                        $wastage_units = max(0, $expected_weight - $actual_units_rounded); // Weight difference as wastage
+                    } else {
+                        // Piece-based: floor rounding for whole pieces
+                        $actual_units_rounded = floor($actual_units_raw);
+                        $wastage_units = $actual_units_raw - $actual_units_rounded;
+                    }
+                    
+                    // ========================================================================
+                    // VALIDATION: Cannot exceed remaining quantity from production batch
+                    // ========================================================================
+                    if ($movement['production_id']) {
+                        // Check if this is a combined movement (has notes about multiple batches)
+                        $is_combined = strpos($movement['notes'], 'Combined verified remaining from:') !== false;
+                        
+                        if ($is_combined) {
+                            // For combined movements, validate against expected_weight_kg instead of batch remaining
+                            $expected_weight = (float)$movement['expected_weight_kg'];
+                            
+                            if ($actual_weight > $expected_weight + ($expected_weight * 0.05)) { // 5% tolerance
+                                throw new Exception(
+                                    "Actual weight (" . number_format($actual_weight, 3) . " kg) "
+                                    . "exceeds expected combined weight (" . number_format($expected_weight, 3) . " kg) by more than 5%. "
+                                    . "This is a combined movement. Please verify the weight."
+                                );
+                            }
+                        } else {
+                            // For single batch movements, validate against remaining_qty and remaining_weight_kg
+                            $current_remaining = (float)$movement['remaining_qty'];
+                            $current_remaining_weight = (float)$movement['remaining_weight_kg'];
+                            
+                            // Check if actual weight would exceed remaining weight
+                            if ($actual_weight > $current_remaining_weight + 0.001) {
+                                throw new Exception(
+                                    "Actual weight (" . number_format($actual_weight, 3) . " kg) "
+                                    . "exceeds remaining batch weight (" . number_format($current_remaining_weight, 3) . " kg). "
+                                    . ($is_bom_direct ? "This batch has " . number_format($current_remaining_weight, 3) . " kg remaining. " : "This batch only has " . number_format($current_remaining, 0) . " pcs remaining. ")
+                                    . "Please verify the weight or check if you selected the correct batch."
+                                );
+                            }
+                            
+                            // For piece-based items (not bom_direct), check if rounded units exceed remaining quantity
+                            if (!$is_bom_direct && $actual_units_rounded > $current_remaining + 0.001) {
+                                throw new Exception(
+                                    "Calculated units (" . number_format($actual_units_rounded, 0) . " pcs) "
+                                    . "exceeds remaining batch quantity (" . number_format($current_remaining, 0) . " pcs). "
+                                    . "Weight entered: " . number_format($actual_weight, 3) . " kg. "
+                                    . "Please verify the weight is correct."
+                                );
+                            }
+                        }
+                    }
+                    
+                    // ========================================================================
+                    // STEP 2: Calculate variances and check tolerances
+                    // ========================================================================
                     $weight_variance = $actual_weight - $movement['expected_weight_kg'];
-                    $unit_variance = $actual_units - $movement['expected_quantity'];
+                    $unit_variance_raw = $actual_units_raw - $movement['expected_quantity'];
+                    $unit_variance_rounded = $actual_units_rounded - $movement['expected_quantity'];
                     
                     // Check tolerances - use 5% default if not set
                     $tolerance_percent = !empty($movement['weight_tolerance_percent']) ? floatval($movement['weight_tolerance_percent']) : 5.0;
                     $weight_tolerance = ($tolerance_percent / 100) * $movement['expected_weight_kg'];
                     $weight_within_tolerance = abs($weight_variance) <= $weight_tolerance;
-                    $units_match = $actual_units == $movement['expected_quantity'];
                     
-                    // Set status based on verification
-                    // IMPORTANT: Accept actual quantities even if they differ from expected
-                    // Only reject if weight is outside tolerance
-                    $verification_status = $weight_within_tolerance ? 'verified' : 'rejected';
+                    // Set status - accept even with variance, but flag if outside tolerance
+                    $verification_status = 'verified'; // We accept all actual weights and track variances
                     
-                    // Update movement
+                    // ========================================================================
+                    // STEP 3: Update movement and trolley_items records
+                    // ========================================================================
                     $stmt = $db->prepare("
                         UPDATE trolley_movements SET 
                             actual_weight_kg = ?, 
@@ -223,168 +470,284 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                     ");
                     $stmt->execute([
                         $actual_weight,
-                        $actual_units,
+                        $actual_units_rounded, // Store rounded units in main movement record
                         $weight_variance,
-                        $unit_variance,
+                        $unit_variance_rounded,
                         $verification_status,
-                        6, // Current user ID - replace with actual user session
+                        6, // Current user ID - replace with actual session
                         $movement_id
                     ]);
                     
-                    // Update trolley item with actual quantities
+                    // Update trolley_items with detailed breakdown
                     $stmt = $db->prepare("
                         UPDATE trolley_items SET 
                             actual_quantity = ?,
                             actual_weight_kg = ?,
+                            actual_units_raw = ?,
+                            actual_units_rounded = ?,
+                            wastage_units = ?,
                             variance_quantity = ?,
                             variance_weight_kg = ?,
                             status = ?
                         WHERE movement_id = ?
                     ");
                     $stmt->execute([
-                        $actual_units,
+                        $actual_units_rounded,  // Quantity field = rounded units
                         $actual_weight,
-                        $unit_variance,
+                        $actual_units_raw,      // Store raw calculation
+                        $actual_units_rounded,  // Store rounded result
+                        $wastage_units,         // Store wastage
+                        $unit_variance_rounded,
                         $weight_variance,
                         $verification_status,
                         $movement_id
                     ]);
                     
-                    if ($verification_status === 'verified') {
-                        // Transfer stock from production to store using ACTUAL quantities
-                        $production_location = $movement['from_location_id'];
-                        $store_location = $movement['to_location_id'];
+                    // ========================================================================
+                    // STEP 4: Transfer stock to store using ROUNDED units
+                    // THIS IS THE ONLY PLACE WHERE production_in IS CREATED FOR THIS BATCH
+                    // ========================================================================
+                    $production_location = $movement['from_location_id'];
+                    $store_location = $movement['to_location_id'];
+                    $item_id = $movement['item_id'];
+                    
+                    // Get current balance at store location
+                    $stmt = $db->prepare("
+                        SELECT COALESCE(SUM(quantity_in - quantity_out), 0) as current_balance 
+                        FROM stock_ledger 
+                        WHERE item_id = ? AND location_id = ?
+                    ");
+                    $stmt->execute([$item_id, $store_location]);
+                    $store_balance = $stmt->fetch()['current_balance'];
+                    $new_store_balance = $store_balance + $actual_units_rounded; // Add ROUNDED units
+                    
+                    // Insert production_in to store (using ROUNDED units)
+                    $stmt = $db->prepare("
+                        INSERT INTO stock_ledger (
+                            item_id, location_id, transaction_type, reference_id, reference_no,
+                            transaction_date, quantity_in, balance, created_at
+                        ) VALUES (?, ?, 'production_in', ?, ?, ?, ?, ?, NOW())
+                    ");
+                    $stmt->execute([
+                        $item_id,
+                        $store_location,
+                        $movement_id,
+                        $movement['movement_no'],
+                        $movement['movement_date'],
+                        $actual_units_rounded,  // Only rounded units go into stock
+                        $new_store_balance
+                    ]);
+                    
+                    // Update item's current_stock (global across all locations)
+                    updateItemCurrentStock($db, $item_id);
+                    
+                    // ========================================================================
+                    // STEP 5: Update production batch remaining quantities and wastage tracking
+                    // ========================================================================
+                    if ($movement['production_id']) {
+                        // Check if this is a combined movement
+                        $is_combined = strpos($movement['notes'], 'Combined verified remaining from:') !== false;
                         
-                        // Get current balances
-                        $stmt = $db->prepare("
-                            SELECT COALESCE(SUM(quantity_in - quantity_out), 0) as current_balance 
-                            FROM stock_ledger 
-                            WHERE item_id = ? AND location_id = ?
-                        ");
-                        
-                        // Production location balance
-                        $stmt->execute([$movement['item_id'], $production_location]);
-                        $prod_balance = $stmt->fetch()['current_balance'];
-                        
-                        // If no production ledger entry exists, create one from items.current_stock
-                        // This handles items that were manually added or from legacy data
-                        $check_ledger = $db->prepare("
-                            SELECT COUNT(*) as count FROM stock_ledger 
-                            WHERE item_id = ? AND location_id = ?
-                        ");
-                        $check_ledger->execute([$movement['item_id'], $production_location]);
-                        $has_ledger = $check_ledger->fetch()['count'] > 0;
-                        
-                        if (!$has_ledger) {
-                            // Get item's current_stock as initial balance
-                            $item_stmt = $db->prepare("SELECT current_stock FROM items WHERE id = ?");
-                            $item_stmt->execute([$movement['item_id']]);
-                            $current_stock = floatval($item_stmt->fetchColumn() ?? 0);
-                            
-                            if ($current_stock > 0) {
-                                // Create initial production_in entry
-                                $init_stmt = $db->prepare("
-                                    INSERT INTO stock_ledger (
-                                        item_id, location_id, transaction_type, reference_id, reference_no,
-                                        transaction_date, quantity_in, balance, created_at
-                                    ) VALUES (?, ?, 'initial_stock', 0, 'INITIAL', ?, ?, ?, NOW())
+                        if ($is_combined) {
+                            // Extract batch numbers from notes
+                            preg_match('/Combined verified remaining from: (.+)/', $movement['notes'], $matches);
+                            if (!empty($matches[1])) {
+                                $batch_nos = explode(', ', $matches[1]);
+                                
+                                // Get all production batches with their verified weights
+                                $batch_placeholders = str_repeat('?,', count($batch_nos) - 1) . '?';
+                                $stmt = $db->prepare("
+                                    SELECT p.id, p.batch_no, p.remaining_qty, p.remaining_weight_kg,
+                                           p.total_transferred_qty, p.total_wastage_units, p.planned_qty,
+                                           prc.actual_weight_measured as verified_weight
+                                    FROM production p
+                                    JOIN production_remaining_completion prc ON prc.production_id = p.id
+                                    WHERE p.batch_no IN ($batch_placeholders)
                                 ");
-                                $init_stmt->execute([
-                                    $movement['item_id'],
-                                    $production_location,
-                                    date('Y-m-d'),
-                                    $current_stock,
-                                    $current_stock
-                                ]);
-                                $prod_balance = $current_stock;
+                                $stmt->execute($batch_nos);
+                                $batches = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                                
+                                // Calculate total verified weight
+                                $total_verified_weight = 0;
+                                foreach ($batches as $batch) {
+                                    $total_verified_weight += (float)$batch['verified_weight'];
+                                }
+                                
+                                // Deduct proportionally from each batch based on verified weight
+                                foreach ($batches as $batch) {
+                                    $batch_verified_weight = (float)$batch['verified_weight'];
+                                    $proportion = $total_verified_weight > 0 ? ($batch_verified_weight / $total_verified_weight) : 0;
+                                    
+                                    // Calculate this batch's share of actual weight and units
+                                    $batch_actual_weight = $actual_weight * $proportion;
+                                    
+                                    // For bom_direct, use weight directly; for others, use floor() rounding
+                                    if ($is_bom_direct) {
+                                        $batch_actual_units_raw = $batch_actual_weight;
+                                        $batch_actual_units_rounded = $batch_actual_weight; // Weight = Quantity for transfer tracking
+                                        $batch_wastage = max(0, $batch_verified_weight - $batch_actual_weight); // Expected - actual weight
+                                    } else {
+                                        $batch_actual_units_raw = $batch_actual_weight / $unit_weight_kg;
+                                        $batch_actual_units_rounded = floor($batch_actual_units_raw);
+                                        $batch_wastage = $batch_actual_units_raw - $batch_actual_units_rounded;
+                                    }
+                                    
+                                    // Update production batch
+                                    $new_remaining_weight = max(0, (float)$batch['remaining_weight_kg'] - $batch_actual_weight);
+                                    // For bom_direct, calculate remaining_qty in pieces from remaining weight
+                                    if ($is_bom_direct) {
+                                        $new_remaining_qty = $unit_weight_kg > 0 ? $new_remaining_weight / $unit_weight_kg : 0;
+                                    } else {
+                                        $new_remaining_qty = max(0, (float)$batch['remaining_qty'] - $batch_actual_units_rounded);
+                                    }
+                                    $new_transferred = (float)$batch['total_transferred_qty'] + $batch_actual_units_rounded;
+                                    $new_wastage = (float)$batch['total_wastage_units'] + $batch_wastage;
+                                    
+                                    $new_status = $new_remaining_qty <= 0.001 ? 'fully_transferred' : 'partially_transferred';
+                                    
+                                    $stmt = $db->prepare("
+                                        UPDATE production 
+                                        SET remaining_qty = ?,
+                                            remaining_weight_kg = ?,
+                                            total_transferred_qty = ?,
+                                            total_wastage_units = ?,
+                                            actual_qty = ?,
+                                            status = ?
+                                        WHERE id = ?
+                                    ");
+                                    $stmt->execute([
+                                        $new_remaining_qty,
+                                        $new_remaining_weight,
+                                        $new_transferred,
+                                        $new_wastage,
+                                        $new_transferred,
+                                        $new_status,
+                                        $batch['id']
+                                    ]);
+                                }
                             }
-                        }
-                        
-                        $new_prod_balance = $prod_balance - $actual_units; // Use ACTUAL units
-                        
-                        // Store location balance  
-                        $stmt->execute([$movement['item_id'], $store_location]);
-                        $store_balance = $stmt->fetch()['current_balance'];
-                        $new_store_balance = $store_balance + $actual_units; // Use ACTUAL units
-                        
-                        // Record stock movements with ACTUAL quantities
-                        // OUT from production
-                        $stmt = $db->prepare("
-                            INSERT INTO stock_ledger (
-                                item_id, location_id, transaction_type, reference_id, reference_no,
-                                transaction_date, quantity_out, balance, created_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())
-                        ");
-                        $stmt->execute([
-                            $movement['item_id'],
-                            $production_location,
-                            'trolley_movement_out',
-                            $movement_id,
-                            $movement['movement_no'],
-                            $movement['movement_date'],
-                            $actual_units, // Real quantity out
-                            $new_prod_balance
-                        ]);
-                        
-                        // IN to store
-                        $stmt = $db->prepare("
-                            INSERT INTO stock_ledger (
-                                item_id, location_id, transaction_type, reference_id, reference_no,
-                                transaction_date, quantity_in, balance, created_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())
-                        ");
-                        $stmt->execute([
-                            $movement['item_id'],
-                            $store_location,
-                            'trolley_movement_in',
-                            $movement_id,
-                            $movement['movement_no'],
-                            $movement['movement_date'],
-                            $actual_units, // Real quantity in
-                            $new_store_balance
-                        ]);
-                        
-                        // Update item's current_stock from ALL locations (not just store)
-                        updateItemCurrentStock($db, $movement['item_id']);
-                        
-                        // Update movement status to completed
-                        $stmt = $db->prepare("UPDATE trolley_movements SET status = 'completed' WHERE id = ?");
-                        $stmt->execute([$movement_id]);
-                        
-                        // Free up trolley - move to store location
-                        $stmt = $db->prepare("UPDATE trolleys SET status = 'available', current_location_id = ? WHERE id = ?");
-                        $stmt->execute([$store_location, $movement['trolley_id']]);
-                        
-                        $variance_info = "";
-                        if ($unit_variance != 0) {
-                            $variance_info = " | Qty Variance: " . ($unit_variance >= 0 ? '+' : '') . number_format($unit_variance, 3) . " pcs";
-                        }
-                        
-                        $success = "✅ VERIFIED & RELEASED! {$actual_units} pcs transferred to store | Weight variance: " . 
-                                  ($weight_variance >= 0 ? '+' : '') . number_format($weight_variance, 3) . " kg" . $variance_info;
-                    } else {
-                        $rejection_reasons = [];
-                        if (!$weight_within_tolerance) {
-                            $rejection_reasons[] = "Weight variance " . number_format($weight_variance, 3) . 
-                                                 " kg exceeds tolerance ±" . number_format($weight_tolerance, 3) . " kg";
-                        }
-                        
-                        $stmt = $db->prepare("
-                            UPDATE trolley_items SET rejection_reason = ? WHERE movement_id = ?
-                        ");
-                        $stmt->execute([implode('; ', $rejection_reasons), $movement_id]);
-                        
-                        // Return trolley to available status
-                        $stmt = $db->prepare("UPDATE trolleys SET status = 'available' WHERE id = ?");
-                        $stmt->execute([$movement['trolley_id']]);
-                        
-                        $error = "❌ WEIGHT VERIFICATION FAILED: " . implode('. ', $rejection_reasons) . " | Trolley not released";
-                    }
+                        } else {
+                            // Single batch movement - normal logic
+                            $prod_id = $movement['production_id'];
+                            
+                            // Get current production values
+                            $current_remaining = (float)$movement['remaining_qty'];
+                            $current_remaining_weight = (float)$movement['remaining_weight_kg'];
+                            $current_transferred = (float)$movement['total_transferred_qty'];
+                            $current_wastage = (float)$movement['total_wastage_units'];
+                            
+                            // Calculate new values
+                            $new_remaining_weight = $current_remaining_weight - $actual_weight;
+                            // For bom_direct, calculate remaining_qty in pieces from remaining weight
+                            if ($is_bom_direct) {
+                                $new_remaining = $unit_weight_kg > 0 ? $new_remaining_weight / $unit_weight_kg : 0;
+                            } else {
+                                $new_remaining = $current_remaining - $actual_units_rounded;
+                            }
+                            $new_transferred = $current_transferred + $actual_units_rounded;
+                            $new_wastage = $current_wastage + $wastage_units;
+                            
+                            // Determine new status
+                            $new_status = 'partially_transferred';
+                            if ($new_remaining <= 0.001 || $new_remaining_weight <= 0.001) { // Small epsilon for float comparison
+                                $new_status = 'fully_transferred';
+                                $new_remaining = 0;
+                                $new_remaining_weight = 0;
+                            }
+                            
+                            // Update production record
+                            $stmt = $db->prepare("
+                                UPDATE production 
+                                SET actual_qty = ?,
+                                    remaining_qty = ?,
+                                    remaining_weight_kg = ?,
+                                    total_transferred_qty = ?,
+                                    total_wastage_units = ?,
+                                    status = ?
+                                WHERE id = ?
+                            ");
+                            $stmt->execute([
+                                $new_transferred,       // actual_qty = total verified units
+                                $new_remaining,
+                                $new_remaining_weight,
+                                $new_transferred,
+                                $new_wastage,
+                                $new_status,
+                                $prod_id
+                            ]);
+                            
+                            // Update production_wastage summary
+                            $stmt = $db->prepare("
+                                SELECT COUNT(*) as movement_count,
+                                       SUM(ti.actual_units_raw) as total_raw,
+                                       SUM(ti.actual_units_rounded) as total_rounded,
+                                       SUM(ti.wastage_units) as total_wastage
+                                FROM trolley_movements tm
+                                JOIN trolley_items ti ON ti.movement_id = tm.id
+                                WHERE tm.production_id = ? AND tm.status = 'verified'
+                            ");
+                            $stmt->execute([$prod_id]);
+                            $summary = $stmt->fetch();
+                            
+                            $theoretical = (float)$movement['planned_qty'];
+                            $total_raw = (float)($summary['total_raw'] ?: 0);
+                            $total_rounded = (float)($summary['total_rounded'] ?: 0);
+                            $total_wastage = (float)($summary['total_wastage'] ?: 0);
+                            $wastage_pct = $theoretical > 0 ? ($total_wastage / $theoretical) * 100 : 0;
+                            
+                            $stmt = $db->prepare("
+                                INSERT INTO production_wastage (
+                                    production_id, theoretical_units, total_actual_raw_units, 
+                                    total_actual_rounded_units, total_wastage_units, wastage_percentage,
+                                    total_movements
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                                ON DUPLICATE KEY UPDATE
+                                    total_actual_raw_units = ?,
+                                    total_actual_rounded_units = ?,
+                                    total_wastage_units = ?,
+                                    wastage_percentage = ?,
+                                    total_movements = ?
+                            ");
+                            $stmt->execute([
+                                $prod_id, $theoretical, $total_raw, $total_rounded, $total_wastage, $wastage_pct, $summary['movement_count'],
+                                $total_raw, $total_rounded, $total_wastage, $wastage_pct, $summary['movement_count']
+                            ]);
+                        } // End of else (single batch)
+                    } // End of if ($movement['production_id'])
+                    
+                    // ========================================================================
+                    // STEP 6: Update movement status and free trolley
+                    // ========================================================================
+                    $stmt = $db->prepare("UPDATE trolley_movements SET status = 'completed' WHERE id = ?");
+                    $stmt->execute([$movement_id]);
+                    
+                    // Free up trolley - move to store location
+                    $stmt = $db->prepare("UPDATE trolleys SET status = 'available', current_location_id = ? WHERE id = ?");
+                    $stmt->execute([$store_location, $movement['trolley_id']]);
                     
                     $db->commit();
                     $transaction_started = false;
                     
-                    // Redirect to prevent duplicate submission on page reload
+                    // Build success message with details
+                    if ($is_bom_direct) {
+                        $success = "✅ VERIFIED & TRANSFERRED (Weight-Based)!\n";
+                        $success .= "• Expected weight: " . number_format($movement['expected_weight_kg'], 3) . " kg\n";
+                        $success .= "• Actual weight: " . number_format($actual_weight, 3) . " kg\n";
+                        $success .= "• Transferred to stock: " . number_format($actual_units_rounded, 3) . " kg\n";
+                        $success .= "• Wastage: " . number_format($wastage_units, 3) . " kg";
+                    } else {
+                        $success = "✅ VERIFIED & TRANSFERRED (Piece-Based)!\n";
+                        $success .= "• Raw calculation: " . number_format($actual_units_raw, 3) . " units\n";
+                        $success .= "• Transferred to stock: " . number_format($actual_units_rounded, 0) . " pcs\n";
+                        $success .= "• Wastage (rounding): " . number_format($wastage_units, 3) . " units\n";
+                        $success .= "• Weight: " . number_format($actual_weight, 3) . " kg";
+                    }
+                    
+                    if ($movement['production_id']) {
+                        $success .= "\n• Batch remaining: " . number_format($new_remaining, 0) . " units";
+                    }
+                    
+                    // Redirect to prevent duplicate submission
                     header('Location: ' . $_SERVER['REQUEST_URI']);
                     exit;
                     
@@ -396,13 +759,15 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                     $movement_id = $_POST['movement_id'];
                     $new_actual_weight = floatval($_POST['actual_weight_kg']);
                     
-                    // Get movement details
+                    // Get movement details including production info for validation
                     $stmt = $db->prepare("
                         SELECT tm.*, ti.unit_weight_kg, ti.item_id,
-                               i.weight_tolerance_percent, i.name as item_name
+                               i.weight_tolerance_percent, i.name as item_name,
+                               p.id as production_id, p.remaining_qty, p.remaining_weight_kg
                         FROM trolley_movements tm
                         JOIN trolley_items ti ON tm.id = ti.movement_id
                         JOIN items i ON ti.item_id = i.id
+                        LEFT JOIN production p ON p.id = tm.production_id
                         WHERE tm.id = ?
                     ");
                     $stmt->execute([$movement_id]);
@@ -412,20 +777,55 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         throw new Exception("Trolley movement not found");
                     }
                     
-                    $new_actual_units = $new_actual_weight; // Weight = Quantity
+                    $unit_weight_kg = (float)$movement['unit_weight_kg'];
+                    if ($unit_weight_kg <= 0) {
+                        throw new Exception("Unit weight not configured. Cannot calculate units.");
+                    }
+                    
+                    // Calculate new rounded units
+                    $new_actual_units_raw = $new_actual_weight / $unit_weight_kg;
+                    $new_actual_units_rounded = floor($new_actual_units_raw);
+                    $new_wastage_units = $new_actual_units_raw - $new_actual_units_rounded;
+                    
                     $old_actual_weight = floatval($movement['actual_weight_kg']);
                     $old_actual_units = floatval($movement['actual_units']);
+                    
+                    // Validate: New weight cannot exceed batch limits
+                    if ($movement['production_id']) {
+                        $current_remaining = (float)$movement['remaining_qty'];
+                        $current_remaining_weight = (float)$movement['remaining_weight_kg'];
+                        
+                        // Add back the old units to get original remaining
+                        $original_remaining = $current_remaining + $old_actual_units;
+                        $original_remaining_weight = $current_remaining_weight + $old_actual_weight;
+                        
+                        // Check new weight against original remaining
+                        if ($new_actual_weight > $original_remaining_weight + 0.001) {
+                            throw new Exception(
+                                "New weight (" . number_format($new_actual_weight, 3) . " kg) "
+                                . "exceeds available batch weight (" . number_format($original_remaining_weight, 3) . " kg). "
+                                . "Maximum allowed: " . number_format($original_remaining_weight, 3) . " kg"
+                            );
+                        }
+                        
+                        if ($new_actual_units_rounded > $original_remaining + 0.001) {
+                            throw new Exception(
+                                "New calculated units (" . number_format($new_actual_units_rounded, 0) . " pcs) "
+                                . "exceeds available batch quantity (" . number_format($original_remaining, 0) . " pcs)."
+                            );
+                        }
+                    }
                     
                     // Only update if weight/units changed
                     if ($new_actual_weight != $old_actual_weight) {
                         $unit_weight = floatval($movement['unit_weight_kg']);
                         $weight_tolerance = floatval($movement['weight_tolerance_percent']);
                         $weight_variance = $new_actual_weight - floatval($movement['expected_weight_kg']);
-                        $unit_variance = $new_actual_units - floatval($movement['expected_units']);
+                        $unit_variance_rounded = $new_actual_units_rounded - floatval($movement['expected_units']);
                         $weight_tolerance_kg = floatval($movement['expected_weight_kg']) * ($weight_tolerance / 100);
                         $weight_within_tolerance = abs($weight_variance) <= $weight_tolerance_kg;
                         
-                        $new_status = $weight_within_tolerance ? 'verified' : 'rejected';
+                        $new_status = 'verified'; // Always verified, track variances
                         
                         // Update movement record
                         $stmt = $db->prepare("
@@ -441,9 +841,9 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         ");
                         $stmt->execute([
                             $new_actual_weight,
-                            $new_actual_units,
+                            $new_actual_units_rounded,
                             $weight_variance,
-                            $unit_variance,
+                            $unit_variance_rounded,
                             $new_status,
                             6, // Current user ID
                             $movement_id
@@ -454,15 +854,21 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                             UPDATE trolley_items SET 
                                 actual_quantity = ?,
                                 actual_weight_kg = ?,
+                                actual_units_raw = ?,
+                                actual_units_rounded = ?,
+                                wastage_units = ?,
                                 variance_quantity = ?,
                                 variance_weight_kg = ?,
                                 status = ?
                             WHERE movement_id = ?
                         ");
                         $stmt->execute([
-                            $new_actual_units,
+                            $new_actual_units_rounded,
                             $new_actual_weight,
-                            $unit_variance,
+                            $new_actual_units_raw,
+                            $new_actual_units_rounded,
+                            $new_wastage_units,
+                            $unit_variance_rounded,
                             $weight_variance,
                             $new_status,
                             $movement_id
@@ -472,12 +878,11 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                             // Delete old ledger entries for this movement
                             $stmt = $db->prepare("
                                 DELETE FROM stock_ledger 
-                                WHERE reference_id = ? AND reference_no LIKE 'TM%' 
+                                WHERE reference_id = ? AND transaction_type = 'production_in' AND reference_no LIKE 'TM%' 
                             ");
                             $stmt->execute([$movement_id]);
                             
                             // Recalculate balances
-                            $production_location = $movement['from_location_id'];
                             $store_location = $movement['to_location_id'];
                             
                             $stmt = $db->prepare("
@@ -486,62 +891,33 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                                 WHERE item_id = ? AND location_id = ?
                             ");
                             
-                            // Production location balance
-                            $stmt->execute([$movement['item_id'], $production_location]);
-                            $prod_balance = $stmt->fetch()['current_balance'];
-                            $new_prod_balance = $prod_balance - $new_actual_units;
-                            
                             // Store location balance  
                             $stmt->execute([$movement['item_id'], $store_location]);
                             $store_balance = $stmt->fetch()['current_balance'];
-                            $new_store_balance = $store_balance + $new_actual_units;
+                            $new_store_balance = $store_balance + $new_actual_units_rounded;
                             
-                            // Insert new ledger entries with updated quantities
-                            // OUT from production
-                            $stmt = $db->prepare("
-                                INSERT INTO stock_ledger (
-                                    item_id, location_id, transaction_type, reference_id, reference_no,
-                                    transaction_date, quantity_out, balance, created_at
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())
-                            ");
-                            $stmt->execute([
-                                $movement['item_id'],
-                                $production_location,
-                                'trolley_movement_out',
-                                $movement_id,
-                                $movement['movement_no'],
-                                $movement['movement_date'],
-                                $new_actual_units,
-                                $new_prod_balance
-                            ]);
-                            
+                            // Insert new ledger entry with updated rounded quantity
                             // IN to store
                             $stmt = $db->prepare("
                                 INSERT INTO stock_ledger (
                                     item_id, location_id, transaction_type, reference_id, reference_no,
                                     transaction_date, quantity_in, balance, created_at
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())
+                                ) VALUES (?, ?, 'production_in', ?, ?, ?, ?, ?, NOW())
                             ");
                             $stmt->execute([
                                 $movement['item_id'],
                                 $store_location,
-                                'trolley_movement_in',
                                 $movement_id,
                                 $movement['movement_no'],
                                 $movement['movement_date'],
-                                $new_actual_units,
+                                $new_actual_units_rounded,
                                 $new_store_balance
                             ]);
                             
-                            // Update item's current_stock from ALL locations (not just store)
+                            // Update item's current_stock from ALL locations
                             updateItemCurrentStock($db, $movement['item_id']);
                             
-                            $variance_info = "";
-                            if ($unit_variance != 0) {
-                                $variance_info = " | Qty Variance: " . ($unit_variance >= 0 ? '+' : '') . number_format($unit_variance, 3) . " pcs";
-                            }
-                            
-                            $success = "✅ MOVEMENT UPDATED & VERIFIED! {$new_actual_units} pcs transferred (was {$old_actual_units} pcs) | Ledger updated";
+                            $success = "✅ MOVEMENT UPDATED & VERIFIED! {$new_actual_units_rounded} pcs transferred (was {$old_actual_units} pcs) | Ledger updated";
                         } else {
                             $success = "⚠️ MOVEMENT UPDATED - Weight variance exceeds tolerance, needs re-verification";
                         }
@@ -677,21 +1053,79 @@ try {
     
     // Get completed productions ready for trolley
     // Calculate weight from BOM tables (bom_product.product_unit_qty, bom_direct.finished_unit_qty, or items.unit_weight_kg)
+    // Exclude batches that have verified remaining (they should only appear in VERIFIED_ALL option)
     $stmt = $db->query("
         SELECT p.*, i.name as item_name, i.code as item_code,
                COALESCE(bp.product_unit_qty, bd.finished_unit_qty, i.unit_weight_kg) as unit_weight_kg,
-               l.name as location_name
+               l.name as location_name,
+               CASE WHEN bd.id IS NOT NULL THEN 1 ELSE 0 END as is_bom_direct
         FROM production p
         JOIN items i ON p.item_id = i.id  
         JOIN locations l ON p.location_id = l.id
         LEFT JOIN bom_product bp ON bp.finished_item_id = i.id
         LEFT JOIN bom_direct bd ON bd.finished_item_id = i.id
-        WHERE p.status = 'completed' 
-        AND p.id NOT IN (SELECT production_id FROM trolley_movements WHERE production_id IS NOT NULL AND status IN ('pending', 'in_transit', 'verified'))
+        WHERE p.status IN ('completed', 'partially_transferred')
+        AND (p.remaining_qty IS NULL OR p.remaining_qty > 0)
+        AND NOT EXISTS (
+            SELECT 1 FROM production_remaining_completion prc 
+            WHERE prc.production_id = p.id
+        )
         GROUP BY p.id
         ORDER BY p.created_at DESC
     ");
     $ready_productions = $stmt->fetchAll();
+    
+    // Get verified remaining batches separately (for alert box and VERIFIED_ALL option)
+    // These batches can be moved multiple times until fully transferred
+    $stmt = $db->query("
+        SELECT p.*, i.name as item_name, i.code as item_code,
+               COALESCE(bp.product_unit_qty, bd.finished_unit_qty, i.unit_weight_kg) as unit_weight_kg,
+               l.name as location_name,
+               prc.id as remaining_completion_id,
+               prc.actual_units_rounded as verified_remaining_qty,
+               prc.actual_weight_measured as verified_remaining_weight,
+               prc.completed_at as remaining_verified_at
+        FROM production p
+        JOIN items i ON p.item_id = i.id  
+        JOIN locations l ON p.location_id = l.id
+        LEFT JOIN bom_product bp ON bp.finished_item_id = i.id
+        LEFT JOIN bom_direct bd ON bd.finished_item_id = i.id
+        JOIN production_remaining_completion prc ON prc.production_id = p.id
+        WHERE p.status IN ('completed', 'partially_transferred')
+        AND prc.actual_weight_measured > 0
+        AND p.remaining_weight_kg > 0
+        GROUP BY p.id
+        ORDER BY prc.completed_at DESC
+    ");
+    $verified_remaining_batches = $stmt->fetchAll();
+    
+    // Get total verified remaining quantity and weight from production_remaining_completion
+    $stmt = $db->query("
+        SELECT 
+            COUNT(DISTINCT prc.production_id) as verified_batches,
+            SUM(prc.actual_units_rounded) as total_verified_qty,
+            SUM(prc.actual_weight_measured) as total_verified_weight
+        FROM production_remaining_completion prc
+        JOIN production p ON p.id = prc.production_id
+        WHERE p.status IN ('completed', 'partially_transferred')
+        AND prc.actual_weight_measured > 0
+        AND NOT EXISTS (
+            SELECT 1 FROM trolley_movements tm
+            WHERE tm.production_id = p.id
+            AND tm.expected_weight_kg = prc.actual_weight_measured
+            AND tm.status IN ('pending', 'in_transit', 'verified')
+        )
+    ");
+    $verified_totals = $stmt->fetch();
+    
+    // Set defaults if no data
+    if (!$verified_totals || $verified_totals['verified_batches'] == 0) {
+        $verified_totals = [
+            'verified_batches' => 0,
+            'total_verified_qty' => 0,
+            'total_verified_weight' => 0
+        ];
+    }
     
     // Get active trolley movements
     $stmt = $db->query("
@@ -729,6 +1163,14 @@ ORDER BY tm.verified_at DESC, tm.created_at DESC
     
 } catch(PDOException $e) {
     $error = "Error fetching data: " . $e->getMessage();
+    // Set default values to prevent undefined variable errors
+    $locations = [];
+    $trolleys = [];
+    $available_trolleys = [];
+    $ready_productions = [];
+    $verified_totals = ['verified_batches' => 0, 'total_verified_qty' => 0, 'total_verified_weight' => 0];
+    $active_movements = [];
+    $completed_movements = [];
 }
 ?>
 
@@ -809,6 +1251,27 @@ ORDER BY tm.verified_at DESC, tm.created_at DESC
             <div class="flex items-center">
                 <div class="p-3 rounded-full bg-purple-100">
                     <svg class="w-6 h-6 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                    </svg>
+                </div>
+                <div class="ml-4">
+                    <p class="text-sm font-medium text-gray-600">Total Verified Remaining</p>
+                    <p class="text-2xl font-bold text-gray-900">
+                        <?php 
+                        $total_qty = $verified_totals && $verified_totals['total_verified_qty'] ? number_format($verified_totals['total_verified_qty'], 0) : '0';
+                        $total_weight = $verified_totals && $verified_totals['total_verified_weight'] ? number_format($verified_totals['total_verified_weight'], 2) : '0.00';
+                        echo $total_qty . ' pcs';
+                        ?>
+                    </p>
+                    <p class="text-xs text-purple-600 mt-1"><?php echo $total_weight; ?> kg verified</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="bg-white p-6 rounded-lg shadow">
+            <div class="flex items-center">
+                <div class="p-3 rounded-full bg-indigo-100">
+                    <svg class="w-6 h-6 text-indigo-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/>
                     </svg>
                 </div>
@@ -819,6 +1282,45 @@ ORDER BY tm.verified_at DESC, tm.created_at DESC
             </div>
         </div>
     </div>
+
+    <!-- Verified Remaining Productions Alert -->
+    <?php if (!empty($verified_remaining_batches)): ?>
+    <div class="bg-purple-50 border-l-4 border-purple-500 p-4 rounded-lg shadow">
+        <div class="flex">
+            <div class="flex-shrink-0">
+                <svg class="h-6 w-6 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                </svg>
+            </div>
+            <div class="ml-3 flex-1">
+                <h3 class="text-sm font-medium text-purple-800">Verified Remaining Batches Ready for Trolley</h3>
+                <div class="mt-2 text-sm text-purple-700">
+                    <p>The following batches have verified remaining weight and are ready to assign to trolleys:</p>
+                    <ul class="list-disc list-inside mt-2 space-y-1">
+                        <?php foreach ($verified_remaining_batches as $prod): ?>
+                            <li>
+                                <strong><?php echo htmlspecialchars($prod['batch_no']); ?></strong> - 
+                                <?php echo htmlspecialchars($prod['item_name']); ?>: 
+                                <span class="font-semibold"><?php echo number_format($prod['verified_remaining_qty'], 0); ?> pcs</span>
+                                (<span class="font-semibold"><?php echo number_format($prod['verified_remaining_weight'], 3); ?> kg</span> verified)
+                                <span class="text-xs text-purple-600">✓ <?php echo date('M d, H:i', strtotime($prod['remaining_verified_at'])); ?></span>
+                            </li>
+                        <?php endforeach; ?>
+                    </ul>
+                </div>
+                <div class="mt-3">
+                    <button onclick="openModal('createMovementModal')" 
+                            class="inline-flex items-center px-3 py-2 border border-transparent text-sm leading-4 font-medium rounded-md text-white bg-purple-600 hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-purple-500">
+                        <svg class="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
+                        </svg>
+                        Create Trolley Movement
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <?php endif; ?>
 
     <!-- Trolley Management Section -->
     <div class="bg-white rounded-lg shadow overflow-hidden">
@@ -1099,14 +1601,52 @@ ORDER BY tm.verified_at DESC, tm.created_at DESC
                 <label class="block text-sm font-medium text-gray-700 mb-1">Production Batch</label>
                 <select name="production_id" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary" onchange="updateExpectedWeight(this)">
                     <option value="">Select Production Batch</option>
-                    <?php foreach ($ready_productions as $prod): ?>
+                    <?php if (empty($ready_productions)): ?>
+                        <option value="" disabled>No productions ready for trolley transfer</option>
+                    <?php endif; ?>
+                    
+                    <?php 
+                    // Separate verified and non-verified batches
+                    $verified_batches = array_filter($ready_productions, function($p) { 
+                        return !empty($p['remaining_completion_id']); 
+                    });
+                    $non_verified_batches = array_filter($ready_productions, function($p) { 
+                        return empty($p['remaining_completion_id']); 
+                    });
+                    
+                    // Show combined verified remaining option
+                    if (!empty($verified_batches)):
+                        $total_verified_qty = array_sum(array_map(function($p) { return (float)$p['remaining_qty']; }, $verified_batches));
+                        $total_verified_weight = array_sum(array_map(function($p) { return (float)$p['verified_remaining_weight']; }, $verified_batches));
+                        $verified_ids = array_map(function($p) { return $p['id']; }, $verified_batches);
+                    ?>
+                        <option value="VERIFIED_ALL" 
+                                data-quantity="<?php echo $total_verified_qty; ?>"
+                                data-weight="4.0"
+                                data-verified="1"
+                                data-verified-weight="<?php echo $total_verified_weight; ?>"
+                                data-batch-ids="<?php echo implode(',', $verified_ids); ?>"
+                                style="background-color: #f3e8ff; font-weight: bold;">
+                            ✓ ALL VERIFIED REMAINING (<?php echo number_format($total_verified_qty, 0); ?> pcs, <?php echo number_format($total_verified_weight, 2); ?> kg verified)
+                        </option>
+                    <?php endif; ?>
+                    
+                    <?php 
+                    // Show individual non-verified batches
+                    foreach ($non_verified_batches as $prod): 
+                        $remaining = isset($prod['remaining_qty']) && $prod['remaining_qty'] !== null ? (float)$prod['remaining_qty'] : (float)$prod['planned_qty'];
+                        $unit_weight = (float)$prod['unit_weight_kg'];
+                    ?>
                         <option value="<?php echo $prod['id']; ?>" 
-                                data-quantity="<?php echo $prod['actual_qty']; ?>"
+                                data-quantity="<?php echo $remaining; ?>"
                                 data-planned-qty="<?php echo $prod['planned_qty']; ?>"
-                                data-weight="<?php echo $prod['unit_weight_kg']; ?>"
+                                data-weight="<?php echo $unit_weight; ?>"
                                 data-item="<?php echo htmlspecialchars($prod['item_name']); ?>"
                                 data-batch="<?php echo htmlspecialchars($prod['batch_no']); ?>">
-                            <?php echo $prod['batch_no']; ?> - <?php echo $prod['item_name']; ?> (<?php echo number_format($prod['actual_qty'], 3); ?> units)
+                            <?php 
+                            echo htmlspecialchars($prod['batch_no'] . ' - ' . $prod['item_name']); 
+                            echo ' (' . number_format($remaining, 0) . ' pcs remaining)';
+                            ?>
                         </option>
                     <?php endforeach; ?>
                 </select>

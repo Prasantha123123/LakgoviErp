@@ -275,7 +275,37 @@ if (isset($_SESSION['error_message'])) {
 
 // Fetch all bundle records
 try {
-    $stmt = $db->query("SELECT * FROM v_bundle_details ORDER BY bundle_date DESC, created_at DESC");
+    $stmt = $db->query("
+        SELECT 
+            b.id,
+            b.bundle_code,
+            b.bundle_date,
+            b.source_item_id,
+            si.code AS source_item_code,
+            si.name AS source_item_name,
+            b.source_quantity,
+            su.symbol AS source_unit_symbol,
+            b.bundle_item_id,
+            bi.code AS bundle_item_code,
+            bi.name AS bundle_item_name,
+            b.bundle_quantity,
+            b.packs_per_bundle,
+            bu.symbol AS bundle_unit_symbol,
+            CONCAT(b.packs_per_bundle, ' packs per bundle') AS bundle_config,
+            l.name AS location_name,
+            b.notes,
+            u.username AS created_by_name,
+            b.created_at,
+            b.updated_at
+        FROM bundles b
+        LEFT JOIN items si ON si.id = b.source_item_id
+        LEFT JOIN items bi ON bi.id = b.bundle_item_id
+        LEFT JOIN units su ON su.id = b.source_unit_id
+        LEFT JOIN units bu ON bu.id = b.bundle_unit_id
+        LEFT JOIN locations l ON l.id = b.location_id
+        LEFT JOIN admin_users u ON u.id = b.created_by
+        ORDER BY b.bundle_date DESC, b.created_at DESC
+    ");
     $bundle_records = $stmt->fetchAll();
 } catch(PDOException $e) {
     $error = "Error fetching bundle records: " . $e->getMessage();
