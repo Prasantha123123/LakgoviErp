@@ -132,6 +132,15 @@ try {
     ");
     $items = $stmt->fetchAll(PDO::FETCH_ASSOC);
     
+    // Update current_stock to match ledger stock
+    foreach ($items as $item) {
+        $ledger_stock = (float)($item['total_stock'] ?? 0);
+        if ((float)$item['current_stock'] != $ledger_stock) {
+            $upd = $db->prepare("UPDATE items SET current_stock = ? WHERE id = ?");
+            $upd->execute([$ledger_stock, $item['id']]);
+        }
+    }
+    
     // Fetch all category IDs for each item (for edit modal)
     foreach ($items as &$item) {
         $stmt_cats = $db->prepare("SELECT category_id FROM item_categories WHERE item_id = ?");
