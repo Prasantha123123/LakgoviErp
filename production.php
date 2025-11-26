@@ -384,14 +384,13 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                 $stmt = $db->prepare("
                     SELECT p.*, i.name AS item_name, i.code AS item_code, i.type AS item_type,
                            l.name AS location_name,
-                           COALESCE(bp.product_unit_qty, bd.finished_unit_qty, i.unit_weight_kg) as unit_weight_kg
+                           COALESCE((SELECT product_unit_qty FROM bom_product WHERE finished_item_id = i.id LIMIT 1), 
+                                    (SELECT finished_unit_qty FROM bom_direct WHERE finished_item_id = i.id LIMIT 1), 
+                                    i.unit_weight_kg) as unit_weight_kg
                     FROM production p
                     JOIN items i ON i.id = p.item_id
                     JOIN locations l ON l.id = p.location_id
-                    LEFT JOIN bom_product bp ON bp.finished_item_id = i.id
-                    LEFT JOIN bom_direct bd ON bd.finished_item_id = i.id
                     WHERE p.id=? AND p.status='in_progress'
-                    GROUP BY p.id
                 ");
 
               
@@ -690,13 +689,12 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                 // Get production details
                 $stmt = $db->prepare("
                     SELECT p.*, i.name AS item_name,
-                           COALESCE(bp.product_unit_qty, bd.finished_unit_qty, i.unit_weight_kg) as unit_weight_kg
+                           COALESCE((SELECT product_unit_qty FROM bom_product WHERE finished_item_id = i.id LIMIT 1), 
+                                    (SELECT finished_unit_qty FROM bom_direct WHERE finished_item_id = i.id LIMIT 1), 
+                                    i.unit_weight_kg) as unit_weight_kg
                     FROM production p
                     JOIN items i ON i.id = p.item_id
-                    LEFT JOIN bom_product bp ON bp.finished_item_id = i.id
-                    LEFT JOIN bom_direct bd ON bd.finished_item_id = i.id
                     WHERE p.id = ? AND p.status IN ('completed', 'partially_transferred')
-                    GROUP BY p.id
                 ");
                 $stmt->execute([$pid]);
                 $prod = $stmt->fetch(PDO::FETCH_ASSOC);
