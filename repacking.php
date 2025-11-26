@@ -379,14 +379,12 @@ try {
 try {
     $stmt = $db->query("
         SELECT i.id, i.code, i.name, u.symbol AS unit_symbol,
-               bp.product_unit_qty, bp.total_quantity,
-               bd.finished_unit_qty
+               (SELECT product_unit_qty FROM bom_product WHERE finished_item_id = i.id LIMIT 1) as product_unit_qty,
+               (SELECT total_quantity FROM bom_product WHERE finished_item_id = i.id LIMIT 1) as total_quantity,
+               (SELECT finished_unit_qty FROM bom_direct WHERE finished_item_id = i.id LIMIT 1) as finished_unit_qty
         FROM items i
         JOIN units u ON u.id = i.unit_id
-        LEFT JOIN bom_product bp ON bp.finished_item_id = i.id
-        LEFT JOIN bom_direct bd ON bd.finished_item_id = i.id
         WHERE i.type = 'finished'
-        GROUP BY i.id
         ORDER BY i.name
     ");
     $finished_items = $stmt->fetchAll();
