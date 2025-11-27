@@ -326,6 +326,144 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                     // Redirect to prevent duplicate submission on page reload
                     header('Location: ' . $_SERVER['REQUEST_URI']);
                     exit;
+                    
+                case 'transfer':
+                    $db->beginTransaction();
+                    
+                    $transfer_date = $_POST['transfer_date'];
+                    $from_location_id = intval($_POST['from_location_id']);
+                    $to_location_id = intval($_POST['to_location_id']);
+                    $transfer_items = $_POST['transfer_items'] ?? [];
+                    $transfer_quantities = $_POST['transfer_quantities'] ?? [];
+                    
+                    if (empty($transfer_items) || empty($transfer_quantities)) {
+                        throw new Exception("No items selected for transfer");
+                    }
+                    
+                    if ($from_location_id == $to_location_id) {
+                        throw new Exception("From and To locations cannot be the same");
+                    }
+                    
+                    // Generate transfer reference number
+                    $stmt = $db->query("SELECT transfer_no FROM repacking_transfers ORDER BY id DESC LIMIT 1");
+                    $last_transfer = $stmt->fetch();
+                    if ($last_transfer) {
+                        $last_number = intval(substr($last_transfer['transfer_no'], 3));
+                        $transfer_no = 'TRF' . str_pad($last_number + 1, 6, '0', STR_PAD_LEFT);
+                    } else {
+                        $transfer_no = 'TRF000001';
+                    }
+                    
+                    $total_items = 0;
+                    
+                    // Process each transfer item
+                    foreach ($transfer_items as $index => $item_id) {
+                        if (empty($item_id) || empty($transfer_quantities[$index])) {
+                            continue;
+                        }
+                        
+                        $item_id = intval($item_id);
+                        $quantity = floatval($transfer_quantities[$index]);
+                        
+                        if ($quantity <= 0) {
+                            continue;
+                        }
+                        
+                        // Check available stock in from location
+                        $stock_stmt = $db->prepare("
+                            SELECT COALESCE(SUM(quantity_in - quantity_out), 0) as available_stock 
+                            FROM stock_ledger 
+                            WHERE item_id = ? AND location_id = ?
+                        ");
+                        $stock_stmt->execute([$item_id, $from_location_id]);
+                        $available_stock = floatval($stock_stmt->fetchColumn());
+                        
+                        if ($quantity > $available_stock) {
+                            // Get item name for error message
+                            $item_stmt = $db->prepare("SELECT name FROM items WHERE id = ?");
+                            $item_stmt->execute([$item_id]);
+                            $item_name = $item_stmt->fetchColumn();
+                            
+                            throw new Exception("Insufficient stock for {$item_name}! Available: " . number_format($available_stock, 3) . " kg, Requested: " . number_format($quantity, 3) . " kg");
+                        }
+                        
+                        // Insert transfer record
+                        $stmt = $db->prepare("
+                            INSERT INTO repacking_transfers (
+                                transfer_no, transfer_date, item_id, quantity, 
+                                from_location_id, to_location_id, created_by
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ");
+                        $stmt->execute([
+                            $transfer_no,
+                            $transfer_date,
+                            $item_id,
+                            $quantity,
+                            $from_location_id,
+                            $to_location_id,
+                            $_SESSION['user_id']
+                        ]);
+                        
+                        // Update stock ledger - Reduce from source location
+                        $stmt = $db->prepare("
+                            INSERT INTO stock_ledger 
+                            (item_id, location_id, transaction_type, reference_id, reference_no, 
+                             transaction_date, quantity_in, quantity_out, balance)
+                            SELECT ?, ?, 'transfer_out', ?, ?, ?, 0, ?, 
+                                   COALESCE((SELECT balance FROM stock_ledger 
+                                            WHERE item_id = ? AND location_id = ? 
+                                            ORDER BY id DESC LIMIT 1), 0) - ?
+                        ");
+                        $stmt->execute([
+                            $item_id,
+                            $from_location_id,
+                            $db->lastInsertId(),
+                            $transfer_no,
+                            $transfer_date,
+                            $quantity,
+                            $item_id,
+                            $from_location_id,
+                            $quantity
+                        ]);
+                        
+                        // Update stock ledger - Increase in destination location
+                        $stmt = $db->prepare("
+                            INSERT INTO stock_ledger 
+                            (item_id, location_id, transaction_type, reference_id, reference_no, 
+                             transaction_date, quantity_in, quantity_out, balance)
+                            SELECT ?, ?, 'transfer_in', ?, ?, ?, ?, 0, 
+                                   COALESCE((SELECT balance FROM stock_ledger 
+                                            WHERE item_id = ? AND location_id = ? 
+                                            ORDER BY id DESC LIMIT 1), 0) + ?
+                        ");
+                        $stmt->execute([
+                            $item_id,
+                            $to_location_id,
+                            $db->lastInsertId(),
+                            $transfer_no,
+                            $transfer_date,
+                            $quantity,
+                            $item_id,
+                            $to_location_id,
+                            $quantity
+                        ]);
+                        
+                        // Update current_stock for the item (GLOBAL - all locations)
+                        updateItemCurrentStock($db, $item_id);
+                        
+                        $total_items++;
+                    }
+                    
+                    if ($total_items == 0) {
+                        throw new Exception("No valid items to transfer");
+                    }
+                    
+                    $db->commit();
+                    $success = "Transfer completed successfully! Reference: {$transfer_no}, Items transferred: {$total_items}";
+                    
+                    // Redirect to prevent duplicate submission on page reload
+                    header('Location: ' . $_SERVER['REQUEST_URI']);
+                    exit;
             }
         }
     } catch(Exception $e) {

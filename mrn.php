@@ -177,6 +177,13 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         }
                         
                         $db->commit();
+                        
+                        // If a production batch was selected, mark it as materials issued
+                        if (!empty($_POST['production_batch'])) {
+                            $stmt = $db->prepare("UPDATE production SET status = 'materials_issued' WHERE id = ?");
+                            $stmt->execute([$_POST['production_batch']]);
+                        }
+                        
                         $success = "MRN created successfully! {$items_inserted} items transferred from Store to Production Floor.";
                     } catch(Exception $e) {
                         $db->rollback();
@@ -635,6 +642,29 @@ try {
                 </div>
             </div>
 
+            <!-- Production Batch Selection -->
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Production Batch (Optional)</label>
+                    <select name="production_batch" id="production_batch" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent">
+                        <option value="">Select Production Batch</option>
+                        <?php
+                        $stmt = $db->query("SELECT id, batch_no, status FROM production WHERE status IN ('planned', 'pending_material', '') OR status IS NULL ORDER BY batch_no");
+                        while ($row = $stmt->fetch()) {
+                            $effective_status = empty($row['status']) ? 'planned' : $row['status'];
+                            $status_label = $effective_status === 'pending_material' ? ' (Pending Materials)' : '';
+                            echo "<option value='{$row['id']}'>{$row['batch_no']}{$status_label}</option>";
+                        }
+                        ?>
+                    </select>
+                </div>
+                <div class="flex items-end">
+                    <button type="button" id="load_materials_btn" class="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:bg-gray-400" disabled>
+                        Load from Production Batch
+                    </button>
+                </div>
+            </div>
+
             <!-- Items Section -->
             <div>
                 <div class="flex justify-between items-center mb-4">
@@ -897,14 +927,22 @@ function fetchLocationSpecificStock(itemId, locationId, row) {
                 const requestedQty = parseFloat(quantityInput.value || 0);
                 if (requestedQty > currentStock) {
                     quantityInput.style.borderColor = '#ef4444';
-                    quantityInput.title = `Insufficient stock! Available: ${currentStock.toFixed(3)}`;
-                    if (quantityInput.value) {
-                        alert(`Insufficient stock! Available: ${currentStock.toFixed(3)}, Requested: ${requestedQty.toFixed(3)}`);
-                        quantityInput.focus();
+                    quantityInput.title = `Insufficient stock! Available: ${currentStock.toFixed(3)}, Requested: ${requestedQty.toFixed(3)}`;
+                    // Add warning class and message
+                    row.classList.add('insufficient-stock');
+                    let warningDiv = row.querySelector('.stock-warning');
+                    if (!warningDiv) {
+                        warningDiv = document.createElement('div');
+                        warningDiv.className = 'stock-warning text-xs text-red-600 mt-1';
+                        row.cells[1].appendChild(warningDiv);
                     }
+                    warningDiv.textContent = `Insufficient: Avail ${currentStock.toFixed(3)}, Req ${requestedQty.toFixed(3)}`;
                 } else {
                     quantityInput.style.borderColor = '#d1d5db';
                     quantityInput.title = '';
+                    row.classList.remove('insufficient-stock');
+                    const warningDiv = row.querySelector('.stock-warning');
+                    if (warningDiv) warningDiv.remove();
                 }
             } else {
                 stockDisplay.textContent = 'Error';
@@ -948,16 +986,110 @@ function validateQuantity(input) {
     const requestedQty = parseFloat(input.value || 0);
     if (requestedQty > maxStock) {
         input.style.borderColor = '#ef4444';
-        input.title = `Insufficient stock! Available: ${maxStock.toFixed(3)}`;
-        alert(`Insufficient stock! Available: ${maxStock.toFixed(3)}, Requested: ${requestedQty.toFixed(3)}`);
-        input.focus();
+        input.title = `Insufficient stock! Available: ${maxStock.toFixed(3)}, Requested: ${requestedQty.toFixed(3)}`;
+        // Add warning class and message
+        row.classList.add('insufficient-stock');
+        let warningDiv = row.querySelector('.stock-warning');
+        if (!warningDiv) {
+            warningDiv = document.createElement('div');
+            warningDiv.className = 'stock-warning text-xs text-red-600 mt-1';
+            row.cells[1].appendChild(warningDiv);
+        }
+        warningDiv.textContent = `Insufficient: Avail ${maxStock.toFixed(3)}, Req ${requestedQty.toFixed(3)}`;
         return false;
     } else {
         input.style.borderColor = '#d1d5db';
         input.title = '';
+        row.classList.remove('insufficient-stock');
+        const warningDiv = row.querySelector('.stock-warning');
+        if (warningDiv) warningDiv.remove();
         return true;
     }
 }
+
+// Production Batch Raw Materials Loading
+document.getElementById('production_batch').addEventListener('change', function() {
+    const btn = document.getElementById('load_materials_btn');
+    btn.disabled = !this.value;
+});
+
+document.getElementById('load_materials_btn').addEventListener('click', function() {
+    const productionId = document.getElementById('production_batch').value;
+    if (!productionId) {
+        alert('Please select a Production Batch first.');
+        return;
+    }
+
+    fetch(`api/get_production_materials.php?production_id=${productionId}`)
+        .then(response => response.json())
+        .then(data => {
+            if (data.error) {
+                alert(data.error);
+                return;
+            }
+
+            const table = document.getElementById('mrnItemsTable');
+            const existingItems = new Map(); // item_id to row index
+
+            // Build map of existing items
+            Array.from(table.rows).forEach((row, index) => {
+                const select = row.querySelector('.item-select-mrn');
+                if (select) {
+                    const itemId = select.value;
+                    if (itemId) {
+                        existingItems.set(itemId, index);
+                    }
+                }
+            });
+
+            data.materials.forEach(material => {
+                const itemId = material.item_id.toString();
+                if (existingItems.has(itemId)) {
+                    // Update existing row: add to quantity
+                    const rowIndex = existingItems.get(itemId);
+                    const row = table.rows[rowIndex];
+                    const quantityInput = row.querySelector('.quantity-input');
+                    const currentQty = parseFloat(quantityInput.value || 0);
+                    const newQty = currentQty + parseFloat(material.required_quantity);
+                    quantityInput.value = newQty.toFixed(3);
+                    // Re-validate stock for this row
+                    updateStockMrn(row.querySelector('.item-select-mrn'));
+                } else {
+                    // Add new row
+                    const row = table.insertRow();
+                    row.className = 'mrn-item-row';
+                    row.innerHTML = `
+                        <td class="px-4 py-2 border-r">
+                            <select name="items[${mrnItemCount}][item_id]" class="w-full px-2 py-1 border border-gray-300 rounded text-sm item-select-mrn" onchange="updateStockMrn(this)" required>
+                                <option value="${material.item_id}" selected>${material.item_name} (${material.item_code})</option>
+                            </select>
+                        </td>
+                        <td class="px-4 py-2 border-r">
+                            <div class="flex items-center">
+                                <span class="stock-display text-sm font-medium text-blue-600">Loading...</span>
+                                <span class="ml-1 text-xs text-gray-500 unit-display">${material.uom}</span>
+                            </div>
+                        </td>
+                        <td class="px-4 py-2 border-r">
+                            <input type="number" name="items[${mrnItemCount}][quantity]" step="0.001" min="0.001" value="${parseFloat(material.required_quantity).toFixed(3)}" class="w-full px-2 py-1 border border-gray-300 rounded text-sm quantity-input" placeholder="0.000" onchange="validateQuantity(this)" required>
+                        </td>
+                        <td class="px-4 py-2 text-center">
+                            <button type="button" onclick="removeMrnItem(this)" class="text-red-600 hover:text-red-900 text-sm">Remove</button>
+                        </td>
+                    `;
+                    // Trigger stock update for the new row
+                    updateStockMrn(row.querySelector('.item-select-mrn'));
+                    mrnItemCount++;
+                }
+            });
+
+            alert('Raw materials loaded successfully. You can edit quantities as needed.');
+        })
+        .catch(error => {
+            console.error('Error:', error);
+            alert('Failed to load raw materials. Please try again.');
+        });
+});
 
 // Basic validators (can be extended)
 function validateMrnForm(){ return true; }

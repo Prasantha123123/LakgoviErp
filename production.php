@@ -20,6 +20,155 @@ include 'header.php';
 function as_int($v){ return is_numeric($v)? (int)$v : 0; }
 function as_float($v){ return is_numeric($v)? (float)$v : 0.0; }
 
+function checkRawMaterialAvailability($db, $item_id, $item_type, $planned_qty, $peetu_item_id, $peetu_qty, $location_id) {
+    $available = true;
+    $errors = [];
+
+    if ($item_type === 'finished') {
+        // Check if this finished item has direct BOM first
+        $stmt = $db->prepare("SELECT COUNT(*) FROM bom_direct WHERE finished_item_id = ?");
+        $stmt->execute([$item_id]);
+        $has_direct_bom = (int)$stmt->fetchColumn() > 0;
+        
+        if ($has_direct_bom) {
+            // Direct BOM validation
+            $stmt = $db->prepare("
+                SELECT bd.raw_material_id, bd.category_id, bd.quantity AS per_unit_qty, bd.finished_unit_qty, 
+                       COALESCE(i.name, c.name) AS raw_name
+                FROM bom_direct bd
+                LEFT JOIN items i ON i.id = bd.raw_material_id
+                LEFT JOIN categories c ON c.id = bd.category_id
+                WHERE bd.finished_item_id = ?
+            ");
+            $stmt->execute([$item_id]);
+            $raws = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            foreach ($raws as $rw) {
+                $per_unit_qty = (float)$rw['per_unit_qty'];
+                $req = $planned_qty * $per_unit_qty;
+                
+                if ($rw['category_id']) {
+                    $s = $db->prepare("
+                        SELECT COALESCE(SUM(sl.quantity_in - sl.quantity_out),0)
+                        FROM stock_ledger sl
+                        WHERE sl.item_id IN (
+                            SELECT DISTINCT i.id 
+                            FROM items i
+                            LEFT JOIN item_categories ic ON ic.item_id = i.id
+                            WHERE (i.category_id = ? OR ic.category_id = ?)
+                        ) AND sl.location_id=?
+                    ");
+                    $s->execute([(int)$rw['category_id'], (int)$rw['category_id'], $location_id]);
+                } else {
+                    $s = $db->prepare("
+                        SELECT COALESCE(SUM(quantity_in - quantity_out),0)
+                        FROM stock_ledger
+                        WHERE item_id=? AND location_id=?
+                    ");
+                    $s->execute([(int)$rw['raw_material_id'], $location_id]);
+                }
+                $have = (float)$s->fetchColumn();
+                if ($have + 1e-9 < $req) {
+                    $available = false;
+                    $need = number_format($req, 3);
+                    $haveStr = number_format($have, 3);
+                    $errors[] = "Insufficient RAW: {$rw['raw_name']}. Need {$need}, have {$haveStr}";
+                }
+            }
+        } else {
+            // Peetu-based validation
+            $stmt = $db->prepare("
+                SELECT bp.raw_material_id, bp.category_id, bp.quantity AS per_peetu_qty, 
+                       COALESCE(i.name, c.name) AS raw_name
+                FROM bom_peetu bp
+                LEFT JOIN items i ON i.id = bp.raw_material_id
+                LEFT JOIN categories c ON c.id = bp.category_id
+                WHERE bp.peetu_item_id = ?
+            ");
+            $stmt->execute([$peetu_item_id]);
+            $raws = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            foreach ($raws as $rw) {
+                $req = (float)$rw['per_peetu_qty'] * $peetu_qty;
+
+                if ($rw['category_id']) {
+                    $s = $db->prepare("
+                        SELECT COALESCE(SUM(sl.quantity_in - sl.quantity_out),0)
+                        FROM stock_ledger sl
+                        WHERE sl.item_id IN (
+                            SELECT DISTINCT i.id 
+                            FROM items i
+                            LEFT JOIN item_categories ic ON ic.item_id = i.id
+                            WHERE (i.category_id = ? OR ic.category_id = ?)
+                        ) AND sl.location_id=?
+                    ");
+                    $s->execute([(int)$rw['category_id'], (int)$rw['category_id'], $location_id]);
+                } else {
+                    $s = $db->prepare("
+                        SELECT COALESCE(SUM(quantity_in - quantity_out),0)
+                        FROM stock_ledger
+                        WHERE item_id=? AND location_id=?
+                    ");
+                    $s->execute([(int)$rw['raw_material_id'], $location_id]);
+                }
+                $have = (float)$s->fetchColumn();
+                if ($have + 1e-9 < $req) {
+                    $available = false;
+                    $need = number_format($req, 3);
+                    $haveStr = number_format($have, 3);
+                    $errors[] = "Insufficient RAW: {$rw['raw_name']}. Need {$need}, have {$haveStr}";
+                }
+            }
+        }
+    } else {
+        // Semi-finished validation
+        $stmt = $db->prepare("
+            SELECT bp.raw_material_id, bp.category_id, bp.quantity AS per_peetu_qty, 
+                   COALESCE(i.name, c.name) AS raw_name
+            FROM bom_peetu bp
+            LEFT JOIN items i ON i.id = bp.raw_material_id
+            LEFT JOIN categories c ON c.id = bp.category_id
+            WHERE bp.peetu_item_id = ?
+        ");
+        $stmt->execute([$item_id]);
+        $raws = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        foreach ($raws as $rw) {
+            $req = (float)$rw['per_peetu_qty'] * $planned_qty;
+            
+            if ($rw['category_id']) {
+                $s = $db->prepare("
+                    SELECT COALESCE(SUM(sl.quantity_in - sl.quantity_out),0)
+                    FROM stock_ledger sl
+                    WHERE sl.item_id IN (
+                        SELECT DISTINCT i.id 
+                        FROM items i
+                        LEFT JOIN item_categories ic ON ic.item_id = i.id
+                        WHERE (i.category_id = ? OR ic.category_id = ?)
+                    ) AND sl.location_id=?
+                ");
+                $s->execute([(int)$rw['category_id'], (int)$rw['category_id'], $location_id]);
+            } else {
+                $s = $db->prepare("
+                    SELECT COALESCE(SUM(quantity_in - quantity_out),0)
+                    FROM stock_ledger
+                    WHERE item_id=? AND location_id=?
+                ");
+                $s->execute([(int)$rw['raw_material_id'], $location_id]);
+            }
+            $have = (float)$s->fetchColumn();
+            if ($have + 1e-9 < $req) {
+                $available = false;
+                $need = number_format($req, 3);
+                $haveStr = number_format($have, 3);
+                $errors[] = "Insufficient RAW: {$rw['raw_name']}. Need {$need}, have {$haveStr}";
+            }
+        }
+    }
+
+    return ['available' => $available, 'errors' => $errors];
+}
+
 /**
  * Update item current_stock from stock_ledger (ALL locations)
  * GLOBAL RULE: current_stock = total across all locations
@@ -149,65 +298,8 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                     $has_direct_bom = (int)$stmt->fetchColumn() > 0;
                     
                     if ($has_direct_bom) {
-                        // Direct BOM: finished product made directly from raw materials
-                        // BOM LOGIC:
-                        // - finished_unit_qty = weight per piece (e.g., 20 kg for 1 pc Papadam)
-                        // - quantity = raw material needed for 1 piece
-                        // - planned_qty entered by user = NUMBER OF PIECES (not weight)
-                        // Example: User enters 1 pc → needs 2 kg Salt (as per BOM)
                         $planned_qty = as_float($_POST['planned_qty'] ?? 0);
                         if ($planned_qty <= 0) throw new Exception("Planned quantity must be greater than 0");
-                        
-                        // Validate RAW availability for direct production
-                        $stmt = $db->prepare("
-                            SELECT bd.raw_material_id, bd.category_id, bd.quantity AS per_unit_qty, bd.finished_unit_qty, 
-                                   COALESCE(i.name, c.name) AS raw_name
-                            FROM bom_direct bd
-                            LEFT JOIN items i ON i.id = bd.raw_material_id
-                            LEFT JOIN categories c ON c.id = bd.category_id
-                            WHERE bd.finished_item_id = ?
-                        ");
-                        $stmt->execute([$item_id]);
-                        $raws = $stmt->fetchAll(PDO::FETCH_ASSOC);
-                        if (empty($raws)) throw new Exception("No direct BOM recipe found for this finished item.");
-
-                        foreach ($raws as $rw) {
-                            // Calculate required raw material
-                            // Formula: req = planned_qty (pieces) × per_unit_qty (raw per piece)
-                            // Example: 1 pc × 2 kg Salt/pc = 2 kg Salt needed
-                            $per_unit_qty = (float)$rw['per_unit_qty'];
-                            $req = $planned_qty * $per_unit_qty;
-                            
-                            if ($rw['category_id']) {
-                                // Category-based: sum stock across all items in category
-                                // Includes items from both items.category_id AND item_categories junction table
-                                $s = $db->prepare("
-                                    SELECT COALESCE(SUM(sl.quantity_in - sl.quantity_out),0)
-                                    FROM stock_ledger sl
-                                    WHERE sl.item_id IN (
-                                        SELECT DISTINCT i.id 
-                                        FROM items i
-                                        LEFT JOIN item_categories ic ON ic.item_id = i.id
-                                        WHERE (i.category_id = ? OR ic.category_id = ?)
-                                    ) AND sl.location_id=?
-                                ");
-                                $s->execute([(int)$rw['category_id'], (int)$rw['category_id'], $location_id]);
-                            } else {
-                                // Regular raw material
-                                $s = $db->prepare("
-                                    SELECT COALESCE(SUM(quantity_in - quantity_out),0)
-                                    FROM stock_ledger
-                                    WHERE item_id=? AND location_id=?
-                                ");
-                                $s->execute([(int)$rw['raw_material_id'], $location_id]);
-                            }
-                            $have = (float)$s->fetchColumn();
-                            if ($have + 1e-9 < $req) {
-                                $need = number_format($req, 3);
-                                $haveStr = number_format($have, 3);
-                                throw new Exception("Insufficient RAW: {$rw['raw_name']}. Need {$need}, have {$haveStr}");
-                            }
-                        }
                     } else {
                         // Traditional Peetu-based production
                         // From UI
@@ -228,122 +320,29 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                             throw new Exception("No BOM Product yield configured for this finished → peetu pair.");
                         }
                         $planned_qty = $peetu_qty * $units_per_peetu; // finished units
-
-                        // Validate RAW availability to make that many Peetu
-                        //   Need: sum(raw per 1 peetu) * peetu_qty  (from bom_peetu)
-                        $stmt = $db->prepare("
-                            SELECT bp.raw_material_id, bp.category_id, bp.quantity AS per_peetu_qty, 
-                                   COALESCE(i.name, c.name) AS raw_name
-                            FROM bom_peetu bp
-                            LEFT JOIN items i ON i.id = bp.raw_material_id
-                            LEFT JOIN categories c ON c.id = bp.category_id
-                            WHERE bp.peetu_item_id = ?
-                        ");
-                        $stmt->execute([$peetu_item_id]);
-                        $raws = $stmt->fetchAll(PDO::FETCH_ASSOC);
-                        if (empty($raws)) {
-                            throw new Exception("No Peetu recipe found (bom_peetu) for the selected Peetu.");
-                        }
-
-                        foreach ($raws as $rw) {
-                            $req = (float)$rw['per_peetu_qty'] * $peetu_qty;
-
-                            if ($rw['category_id']) {
-                                // Category-based: sum stock across all items in category
-                                // Includes items from both items.category_id AND item_categories junction table
-                                $s = $db->prepare("
-                                    SELECT COALESCE(SUM(sl.quantity_in - sl.quantity_out),0)
-                                    FROM stock_ledger sl
-                                    WHERE sl.item_id IN (
-                                        SELECT DISTINCT i.id 
-                                        FROM items i
-                                        LEFT JOIN item_categories ic ON ic.item_id = i.id
-                                        WHERE (i.category_id = ? OR ic.category_id = ?)
-                                    ) AND sl.location_id=?
-                                ");
-                                $s->execute([(int)$rw['category_id'], (int)$rw['category_id'], $location_id]);
-                            } else {
-                                // Regular raw material
-                                $s = $db->prepare("
-                                    SELECT COALESCE(SUM(quantity_in - quantity_out),0)
-                                    FROM stock_ledger
-                                    WHERE item_id=? AND location_id=?
-                                ");
-                                $s->execute([(int)$rw['raw_material_id'], $location_id]);
-                            }
-                            $have = (float)$s->fetchColumn();
-
-                            if ($have + 1e-9 < $req) {
-                                $need = number_format($req, 3);
-                                $haveStr = number_format($have, 3);
-                                throw new Exception("Insufficient RAW: {$rw['raw_name']}. Need {$need}, have {$haveStr}");
-                            }
-                        }
                     }
                 } else {
-                    // Semi-finished batch (straight from Peetu recipe)
+                    // Semi-finished batch
                     $planned_qty = as_float($_POST['planned_qty'] ?? 0);
                     if ($planned_qty<=0) throw new Exception("Planned quantity must be greater than 0");
-                    // Validate RAW availability for that many Peetu
-                    $stmt = $db->prepare("
-                        SELECT bp.raw_material_id, bp.category_id, bp.quantity AS per_peetu_qty, 
-                               COALESCE(i.name, c.name) AS raw_name
-                        FROM bom_peetu bp
-                        LEFT JOIN items i ON i.id = bp.raw_material_id
-                        LEFT JOIN categories c ON c.id = bp.category_id
-                        WHERE bp.peetu_item_id = ?
-                    ");
-                    $stmt->execute([$item_id]);
-                    $raws = $stmt->fetchAll(PDO::FETCH_ASSOC);
-                    if (empty($raws)) throw new Exception("No Peetu recipe found (bom_peetu) for this semi-finished item.");
-
-                    foreach ($raws as $rw) {
-                        $req = (float)$rw['per_peetu_qty'] * $planned_qty;
-                        
-                        if ($rw['category_id']) {
-                            // Category-based: sum stock across all items in category
-                            // Includes items from both items.category_id AND item_categories junction table
-                            $s = $db->prepare("
-                                SELECT COALESCE(SUM(sl.quantity_in - sl.quantity_out),0)
-                                FROM stock_ledger sl
-                                WHERE sl.item_id IN (
-                                    SELECT DISTINCT i.id 
-                                    FROM items i
-                                    LEFT JOIN item_categories ic ON ic.item_id = i.id
-                                    WHERE (i.category_id = ? OR ic.category_id = ?)
-                                ) AND sl.location_id=?
-                            ");
-                            $s->execute([(int)$rw['category_id'], (int)$rw['category_id'], $location_id]);
-                        } else {
-                            // Regular raw material
-                            $s = $db->prepare("
-                                SELECT COALESCE(SUM(quantity_in - quantity_out),0)
-                                FROM stock_ledger
-                                WHERE item_id=? AND location_id=?
-                            ");
-                            $s->execute([(int)$rw['raw_material_id'], $location_id]);
-                        }
-                        $have = (float)$s->fetchColumn();
-                        if ($have + 1e-9 < $req) {
-                            $need = number_format($req, 3);
-                            $haveStr = number_format($have, 3);
-                            throw new Exception("Insufficient RAW: {$rw['raw_name']}. Need {$need}, have {$haveStr}");
-                        }
-                    }
                 }
+
+                // Check raw material availability
+                $availability = checkRawMaterialAvailability($db, $item_id, $item_type, $planned_qty, $peetu_item_id, $peetu_qty, $location_id);
+                $status = $availability['available'] ? 'planned' : 'pending_material';
 
                 $db->beginTransaction();
                 $transaction_started = true;
 
                 $stmt = $db->prepare("
                     INSERT INTO production (batch_no, item_id, location_id, planned_qty, production_date, status, peetu_item_id, peetu_qty)
-                    VALUES (?, ?, ?, ?, ?, 'planned', ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ");
-                $stmt->execute([$batch_no, $item_id, $location_id, $planned_qty, $production_date, $peetu_item_id, $peetu_qty]);
+                $stmt->execute([$batch_no, $item_id, $location_id, $planned_qty, $production_date, $status, $peetu_item_id, $peetu_qty]);
 
                 $db->commit();
                 $transaction_started = false;
-                $success = "Production order created successfully!";
+                $success = "Production order created successfully! Status: " . ($status === 'planned' ? 'Ready to Start' : 'Pending Material');
                 break;
             }
 
@@ -354,11 +353,20 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                 $db->beginTransaction();
                 $transaction_started = true;
 
-                $stmt = $db->prepare("SELECT id, batch_no, status FROM production WHERE id=?");
+                $stmt = $db->prepare("SELECT id, batch_no, status, item_id, planned_qty, peetu_item_id, peetu_qty, location_id FROM production WHERE id=?");
                 $stmt->execute([$pid]);
                 $p = $stmt->fetch(PDO::FETCH_ASSOC);
                 if (!$p) throw new Exception("Production record not found");
-                if ($p['status']!=='planned') throw new Exception("Only planned batches can be started.");
+                if ($p['status'] !== 'planned' && $p['status'] !== 'pending_material' && $p['status'] !== 'materials_issued' && !empty($p['status'])) throw new Exception("Only planned, pending material, or materials issued batches can be started.");
+
+                // Check raw material availability at production location (skip if materials already issued)
+                if ($p['status'] !== 'materials_issued') {
+                    $availability = checkRawMaterialAvailability($db, $p['item_id'], 'finished', $p['planned_qty'], $p['peetu_item_id'], $p['peetu_qty'], $p['location_id']);
+                    if (!$availability['available']) {
+                        $errors = implode('; ', $availability['errors']);
+                        throw new Exception("Cannot start production: Raw materials not available. " . $errors);
+                    }
+                }
 
                 $stmt = $db->prepare("UPDATE production SET status='in_progress' WHERE id=?");
                 $stmt->execute([$pid]);
@@ -679,7 +687,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                 if ($pid <= 0) throw new Exception("Production ID is required");
                 
                 $actual_weight = floatval($_POST['actual_remaining_weight'] ?? 0);
-                if ($actual_weight <= 0) throw new Exception("Actual remaining weight must be greater than 0");
+                if ($actual_weight < 0) throw new Exception("Actual remaining weight cannot be negative");
                 
                 $completion_reason = trim($_POST['completion_reason'] ?? 'Remaining weight verified');
                 
@@ -715,11 +723,42 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                     throw new Exception("Unit weight not configured for this item");
                 }
                 
-                // Calculate NEW remaining units from actual measured weight
-                $actual_units_raw = $actual_weight / $unit_weight_kg;
-                $actual_units_rounded = floor($actual_units_raw);
-                $wastage_units = $actual_units_raw - $actual_units_rounded;
-                $weight_variance = $actual_weight - $remaining_weight_theoretical;
+                // Handle special case: when actual measured weight is 0, mark entire remaining as wastage
+                if ($actual_weight == 0) {
+                    // Mark entire remaining quantity as wastage
+                    $actual_units_raw = 0;
+                    $actual_units_rounded = 0;
+                    $wastage_units = $remaining_qty_old; // All remaining becomes wastage
+                    $weight_variance = 0 - $remaining_weight_theoretical;
+                    
+                    // Update completion reason to indicate wastage
+                    if (empty($completion_reason) || $completion_reason == 'Remaining weight verified') {
+                        $completion_reason = 'Complete wastage - no remaining weight found';
+                    }
+                    
+                    $success_message = "✅ Batch completed with complete wastage. All remaining quantity (" . 
+                                     number_format($remaining_qty_old, 3) . " pcs, " . 
+                                     number_format($remaining_weight_theoretical, 3) . " kg) marked as wastage.";
+                } else {
+                    // Normal calculation for actual_weight > 0
+                    // Calculate NEW remaining units from actual measured weight
+                    $actual_units_raw = $actual_weight / $unit_weight_kg;
+                    $actual_units_rounded = floor($actual_units_raw);
+                    $wastage_units = $actual_units_raw - $actual_units_rounded;
+                    $weight_variance = $actual_weight - $remaining_weight_theoretical;
+                    
+                    $qty_diff = $remaining_qty_old - $actual_units_rounded;
+                    $diff_text = $qty_diff > 0 ? 
+                        "reduced by " . number_format($qty_diff, 3) . " pcs" : 
+                        "increased by " . number_format(abs($qty_diff), 3) . " pcs";
+                    
+                    $success_message = "✅ Remaining quantity updated. Theoretical: " . 
+                                     number_format($remaining_qty_old, 3) . " pcs (" . 
+                                     number_format($remaining_weight_theoretical, 3) . " kg). " . 
+                                     "Actual measured: " . number_format($actual_weight, 3) . " kg (" . 
+                                     number_format($actual_units_rounded, 3) . " pcs). " . 
+                                     "Remaining quantity " . $diff_text . ".";
+                }
                 
                 // The actual_units_rounded becomes the NEW remaining_qty
                 $new_remaining_qty = $actual_units_rounded;
@@ -765,14 +804,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                 $db->commit();
                 $transaction_started = false;
                 
-                $qty_diff = $remaining_qty_old - $new_remaining_qty;
-                $diff_text = $qty_diff > 0 ? 
-                    "reduced by " . number_format($qty_diff, 3) . " pcs" : 
-                    "increased by " . number_format(abs($qty_diff), 3) . " pcs";
-                
-                $success = "✅ Remaining weight verified! New remaining: " . number_format($new_remaining_qty, 0) . 
-                           " pcs (" . number_format($new_remaining_weight, 3) . " kg). " .
-                           "Remaining " . $diff_text . ". Can now assign to trolleys.";
+                $success = $success_message;
                 break;
             }
 
@@ -839,15 +871,37 @@ try {
     <?php endif; ?>
 
     <!-- Status tiles -->
-    <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+    <div class="grid grid-cols-1 md:grid-cols-4 gap-6">
+        <div class="bg-white p-6 rounded-lg shadow">
+            <div class="flex items-center">
+                <div class="p-3 rounded-full bg-orange-100">
+                    <svg class="w-6 h-6 text-orange-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L3.732 16.5c-.77.833.192 2.5 1.732 2.5z"/></svg>
+                </div>
+                <div class="ml-4">
+                    <p class="text-sm font-medium text-gray-600">Pending Material</p>
+                    <p class="text-2xl font-bold text-gray-900"><?php echo count(array_filter($productions, fn($p)=>$p['status']==='pending_material')); ?></p>
+                </div>
+            </div>
+        </div>
         <div class="bg-white p-6 rounded-lg shadow">
             <div class="flex items-center">
                 <div class="p-3 rounded-full bg-yellow-100">
                     <svg class="w-6 h-6 text-yellow-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
                 </div>
                 <div class="ml-4">
-                    <p class="text-sm font-medium text-gray-600">Planned</p>
-                    <p class="text-2xl font-bold text-gray-900"><?php echo count(array_filter($productions, fn($p)=>$p['status']==='planned')); ?></p>
+                    <p class="text-sm font-medium text-gray-600">Ready to Start</p>
+                    <p class="text-2xl font-bold text-gray-900"><?php echo count(array_filter($productions, fn($p)=>$p['status']==='planned' || empty($p['status']))); ?></p>
+                </div>
+            </div>
+        </div>
+        <div class="bg-white p-6 rounded-lg shadow">
+            <div class="flex items-center">
+                <div class="p-3 rounded-full bg-purple-100">
+                    <svg class="w-6 h-6 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"/></svg>
+                </div>
+                <div class="ml-4">
+                    <p class="text-sm font-medium text-gray-600">Materials Issued</p>
+                    <p class="text-2xl font-bold text-gray-900"><?php echo count(array_filter($productions, fn($p)=>$p['status']==='materials_issued')); ?></p>
                 </div>
             </div>
         </div>
@@ -977,24 +1031,32 @@ try {
                     </td>
                     <td class="px-6 py-4 text-sm">
                         <span class="<?php
-                            echo $p['status']==='fully_transferred' ? 'bg-green-100 text-green-800' :
-                                 ($p['status']==='partially_transferred' ? 'bg-orange-100 text-orange-800' :
-                                  ($p['status']==='completed' ? 'bg-teal-100 text-teal-800' :
-                                   ($p['status']==='in_progress' ? 'bg-blue-100 text-blue-800' : 'bg-yellow-100 text-yellow-800')));
-                        ?> text-xs font-medium px-2.5 py-0.5 rounded capitalize"><?php echo str_replace('_',' ',$p['status']); ?></span>
+                            $display_status = empty($p['status']) ? 'planned' : $p['status'];
+                            echo $display_status==='fully_transferred' ? 'bg-green-100 text-green-800' :
+                                 ($display_status==='partially_transferred' ? 'bg-orange-100 text-orange-800' :
+                                  ($display_status==='completed' ? 'bg-teal-100 text-teal-800' :
+                                   ($display_status==='in_progress' ? 'bg-blue-100 text-blue-800' :
+                                    ($display_status==='pending_material' ? 'bg-orange-100 text-orange-800' :
+                                     ($display_status==='materials_issued' ? 'bg-purple-100 text-purple-800' : 'bg-yellow-100 text-yellow-800')))));
+                        ?> text-xs font-medium px-2.5 py-0.5 rounded capitalize"><?php echo str_replace('_',' ', empty($p['status']) ? 'planned' : $p['status']); ?></span>
                     </td>
                     <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium space-x-2">
-                        <?php if ($p['status']==='planned'): ?>
+                        <?php $effective_status = empty($p['status']) ? 'planned' : $p['status']; ?>
+                        <?php if ($effective_status==='planned' || $effective_status==='pending_material' || $effective_status==='materials_issued'): ?>
                           <form method="POST" class="inline">
                             <input type="hidden" name="action" value="start">
                             <input type="hidden" name="id" value="<?php echo (int)$p['id']; ?>">
                             <button type="submit" class="text-blue-600 hover:text-blue-900">Start</button>
                           </form>
+                          <?php if ($effective_status !== 'materials_issued'): ?>
                           <form method="POST" class="inline" onsubmit="return confirm('Delete this batch?')">
                             <input type="hidden" name="action" value="delete">
                             <input type="hidden" name="id" value="<?php echo (int)$p['id']; ?>">
                             <button type="submit" class="text-red-600 hover:text-red-900">Delete</button>
                           </form>
+                          <?php endif; ?>
+                        <?php elseif ($effective_status==='materials_issued'): ?>
+                          <span class="text-gray-500 text-xs">Materials Issued</span>
                         <?php endif; ?>
                         
                         <?php if ($p['status']==='in_progress'): ?>

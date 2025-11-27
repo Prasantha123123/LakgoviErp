@@ -60,6 +60,62 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                             throw new Exception("No verified remaining batches found");
                         }
                         
+                        // ========================================================================
+                        // MODIFIED LOGIC: Check existing movements for verified batches but allow concurrent movements
+                        // ========================================================================
+                        $batch_ids = array_column($verified_batches, 'id');
+                        $placeholders = str_repeat('?,', count($batch_ids) - 1) . '?';
+
+                        $stmt = $db->prepare("
+                            SELECT tm.production_id, tm.expected_weight_kg, tm.actual_weight_kg, tm.status,
+                                   p.batch_no, p.remaining_weight_kg
+                            FROM trolley_movements tm
+                            JOIN production p ON p.id = tm.production_id
+                            WHERE tm.production_id IN ($placeholders) AND tm.status IN ('pending', 'in_transit', 'verified', 'completed')
+                        ");
+                        $stmt->execute($batch_ids);
+                        $existing_movements = $stmt->fetchAll();
+
+                        // Check each verified batch to ensure new combined movement doesn't exceed remaining weight
+                        $batch_totals = [];
+                        foreach ($existing_movements as $movement) {
+                            $batch_id = $movement['production_id'];
+                            if (!isset($batch_totals[$batch_id])) {
+                                $batch_totals[$batch_id] = ['assigned' => 0, 'remaining' => 0, 'batch_no' => $movement['batch_no']];
+                            }
+
+                            // Only count pending/in_transit movements as assigned since completed movements
+                            // have already been deducted from remaining_weight_kg
+                            if ($movement['status'] === 'pending' || $movement['status'] === 'in_transit') {
+                                $batch_totals[$batch_id]['assigned'] += (float)$movement['expected_weight_kg'];
+                            }
+                            // Completed movements are already accounted for in remaining_weight_kg
+                        }
+
+                        // Set remaining weights for batches with movements
+                        foreach ($verified_batches as $batch) {
+                            if (isset($batch_totals[$batch['id']])) {
+                                $batch_totals[$batch['id']]['remaining'] = (float)$batch['remaining_weight_kg'];
+                            }
+                        }
+
+                        // Check if any batch would exceed its remaining weight
+                        $exceeded_batches = [];
+                        foreach ($batch_totals as $batch_id => $totals) {
+                            $new_weight_for_batch = $total_weight * ((float)$verified_batches[array_search($batch_id, array_column($verified_batches, 'id'))]['actual_weight_measured'] / $total_verified_weight);
+                            if ($totals['assigned'] + $new_weight_for_batch > $totals['remaining'] + 0.001) {
+                                $exceeded_batches[] = $totals['batch_no'];
+                            }
+                        }
+
+                        if (!empty($exceeded_batches)) {
+                            throw new Exception(
+                                "Cannot create combined movement. The following verified batches would exceed their remaining weight: " .
+                                implode(', ', $exceeded_batches) . ". " .
+                                "Please check existing trolley movements and available quantities."
+                            );
+                        }
+                        
                         // Get trolley IDs - use only the first trolley for combined movement
                         $trolley_ids = isset($_POST['trolley_ids']) ? $_POST['trolley_ids'] : [];
                         if (!is_array($trolley_ids)) {
@@ -190,8 +246,44 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         throw new Exception("This production batch has been fully transferred. No remaining quantity available.");
                     }
                     
+                    // ========================================================================
+                    // MODIFIED LOGIC: Allow multiple concurrent trolley movements for the same batch
+                    // Only restrict if total assigned weight would exceed remaining production quantity
+                    // ========================================================================
+                    $stmt = $db->prepare("
+                        SELECT tm.id, tm.expected_weight_kg, tm.actual_weight_kg, tm.status
+                        FROM trolley_movements tm
+                        WHERE tm.production_id = ? AND tm.status IN ('pending', 'in_transit', 'verified')
+                    ");
+                    $stmt->execute([$_POST['production_id']]);
+                    $all_movements = $stmt->fetchAll();
+
+                    // Calculate total weight already assigned to active/incomplete movements
+                    $total_assigned_weight = 0;
+                    foreach ($all_movements as $movement) {
+                        // Only count pending/in_transit movements as assigned since completed movements
+                        // have already been deducted from remaining_weight_kg
+                        if ($movement['status'] === 'pending' || $movement['status'] === 'in_transit') {
+                            $total_assigned_weight += (float)$movement['expected_weight_kg'];
+                        }
+                        // Completed movements are already accounted for in remaining_weight_kg
+                    }
+
+                    // Calculate the actual weight that will be assigned in this new movement
+                    // (distributed among selected trolleys)
+                    $trolley_count = count(array_filter(isset($_POST['trolley_ids']) ? $_POST['trolley_ids'] : []));
+                    if (!is_array($_POST['trolley_ids'] ?? [])) {
+                        $trolley_count = 1;
+                    } else {
+                        $trolley_count = count(array_filter($_POST['trolley_ids']));
+                    }
+                    
+                    if ($trolley_count == 0) {
+                        $trolley_count = 1; // fallback
+                    }
+                    
                     // Get trolley IDs (can be single or multiple)
-                    $trolley_ids = isset($_POST['trolley_ids']) ? $_POST['trolley_ids'] : [$_POST['trolley_id']];
+                    $trolley_ids = isset($_POST['trolley_ids']) ? $_POST['trolley_ids'] : [];
                     if (!is_array($trolley_ids)) {
                         $trolley_ids = [$trolley_ids];
                     }
@@ -201,17 +293,25 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         throw new Exception("At least one trolley must be selected");
                     }
                     
-                    // Calculate total expected weight and units from REMAINING quantity
+                    // Calculate available weight for new movement (remaining minus already assigned)
                     $remaining_qty = (float)$production['remaining_qty'];
                     $unit_weight = floatval($production['unit_weight_kg']);
-                    $remaining_weight = (float)$production['remaining_weight_kg'];
+                    $remaining_production_weight = (float)$production['remaining_weight_kg'];
+                    $planned_weight = $production['planned_qty'] * $production['unit_weight_kg'];
                     
-                    // For bom_direct, expected_units = weight; for others, expected_units = pieces
+                    if ($unit_weight <= 0) {
+                        throw new Exception("Unit weight not configured for this item. Cannot calculate quantities from weight.");
+                    }
+                    
+                    $available_weight = $planned_weight - $total_assigned_weight;
+                    $available_qty = $is_bom_direct ? $available_weight : ($available_weight / $unit_weight);
+                    
+                    // For bom_direct, expected_units = available weight; for others, expected_units = available pieces
                     if ($is_bom_direct) {
-                        $expected_units = $remaining_weight; // Weight-based
-                        $expected_weight = $remaining_weight;
+                        $expected_units = $available_weight; // Weight-based
+                        $expected_weight = $available_weight;
                     } else {
-                        $expected_units = $remaining_qty; // Piece-based
+                        $expected_units = $available_qty; // Piece-based
                         $expected_weight = $expected_units * $unit_weight;
                     }
                     
@@ -220,11 +320,49 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                     $units_per_trolley = $expected_units / $trolley_count;
                     $weight_per_trolley = $expected_weight / $trolley_count;
                     
-                    // Validate: Total weight for this movement cannot exceed remaining weight
-                    $total_movement_weight = 0;
+                    // Calculate actual total expected weight for this movement based on trolley inputs
+                    $actual_expected_weight = 0;
+                    $trolley_weights = [];
+                    
+                    foreach ($trolley_ids as $trolley_id) {
+                        // Check if individual weight was specified for this trolley
+                        $trolley_weight_key = 'trolley_weight_' . $trolley_id;
+                        $current_units = $units_per_trolley;
+                        $current_weight = $weight_per_trolley;
+                        
+                        if (isset($_POST[$trolley_weight_key]) && $_POST[$trolley_weight_key] != '') {
+                            $current_weight = floatval($_POST[$trolley_weight_key]);
+                            // For bom_direct, units = weight; for others, calculate from weight
+                            if ($is_bom_direct) {
+                                $current_units = $current_weight; // Weight-based: units = weight
+                            } else {
+                                $current_units = $unit_weight > 0 ? $current_weight / $unit_weight : 0;
+                            }
+                        }
+                        
+                        $trolley_weights[$trolley_id] = $current_weight;
+                        $actual_expected_weight += $current_weight;
+                    }
+                    
+                    // Now validate against the actual weight that will be assigned
+                    $total_assigned_rounded = round($total_assigned_weight, 3);
+                    $actual_expected_rounded = round($actual_expected_weight, 3);
+                    $planned_rounded = round($planned_weight, 3);
+                    
+                    if ($total_assigned_rounded + $actual_expected_rounded > $planned_rounded + 0.01) {
+                        throw new Exception(
+                            "Cannot assign this batch to a new trolley. Total weight already assigned to movements (" .
+                            number_format($total_assigned_weight, 3) . " kg) plus new movement weight (" .
+                            number_format($actual_expected_weight, 3) . " kg) would exceed planned batch weight (" .
+                            number_format($planned_weight, 3) . " kg)."
+                        );
+                    }
                     
                     // Create movements for each trolley
                     $created_movements = [];
+                    $total_movement_weight = 0;
+                    $remaining_weight = $remaining_production_weight;
+                    
                     foreach ($trolley_ids as $trolley_id) {
                         // Check if movement already exists for this production + trolley combination
                         $check_stmt = $db->prepare("
@@ -259,11 +397,11 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         // Accumulate total weight
                         $total_movement_weight += $current_weight;
                         
-                        // Validate: Cannot exceed remaining weight
-                        if ($total_movement_weight > $remaining_weight + 0.001) { // Small epsilon for float comparison
+                        // Validate: Cannot exceed available weight
+                        if ($total_movement_weight > $available_weight + 0.001) { // Small epsilon for float comparison
                             throw new Exception(
                                 "Total weight for this movement (" . number_format($total_movement_weight, 3) . " kg) "
-                                . "exceeds remaining batch weight (" . number_format($remaining_weight, 3) . " kg). "
+                                . "exceeds available batch weight (" . number_format($available_weight, 3) . " kg). "
                                 . "Please reduce the weight allocation."
                             );
                         }
@@ -1129,13 +1267,15 @@ try {
         SELECT tm.*, t.trolley_no, t.trolley_name,
                fl.name as from_location, tl.name as to_location,
                ti.item_id, i.name as item_name, i.code as item_code,
-               ti.expected_quantity, ti.expected_weight_kg, ti.rejection_reason
+               ti.expected_quantity, ti.expected_weight_kg, ti.rejection_reason,
+               p.batch_no, p.id as production_id
         FROM trolley_movements tm
         JOIN trolleys t ON tm.trolley_id = t.id
         JOIN locations fl ON tm.from_location_id = fl.id
         JOIN locations tl ON tm.to_location_id = tl.id
         JOIN trolley_items ti ON tm.id = ti.movement_id
         JOIN items i ON ti.item_id = i.id
+        LEFT JOIN production p ON p.id = tm.production_id
         WHERE tm.status IN ('pending', 'in_transit', 'verified', 'rejected')
         ORDER BY tm.created_at DESC
     ");
@@ -1280,7 +1420,8 @@ ORDER BY tm.verified_at DESC, tm.created_at DESC
         </div>
     </div>
 
-    <!-- Verified Remaining Productions Alert -->
+    <!-- Verified Remaining Productions Alert - COMMENTED OUT -->
+    <?php /*
     <?php if (!empty($verified_remaining_batches)): ?>
     <div class="bg-purple-50 border-l-4 border-purple-500 p-4 rounded-lg shadow">
         <div class="flex">
@@ -1318,6 +1459,7 @@ ORDER BY tm.verified_at DESC, tm.created_at DESC
         </div>
     </div>
     <?php endif; ?>
+    */ ?>
 
     <!-- Trolley Management Section -->
     <div class="bg-white rounded-lg shadow overflow-hidden">
@@ -1399,6 +1541,7 @@ ORDER BY tm.verified_at DESC, tm.created_at DESC
                     <tr>
                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Movement</th>
                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Trolley</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Batch</th>
                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Item</th>
                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Route</th>
                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Expected</th>
@@ -1416,6 +1559,9 @@ ORDER BY tm.verified_at DESC, tm.created_at DESC
                         <td class="px-6 py-4 whitespace-nowrap">
                             <div class="text-sm font-medium text-gray-900"><?php echo $movement['trolley_no']; ?></div>
                             <div class="text-sm text-gray-500"><?php echo $movement['trolley_name']; ?></div>
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap">
+                            <div class="text-sm font-medium text-gray-900"><?php echo $movement['batch_no'] ?: 'N/A'; ?></div>
                         </td>
                         <td class="px-6 py-4 whitespace-nowrap">
                             <div class="text-sm font-medium text-gray-900"><?php echo $movement['item_name']; ?></div>
@@ -1475,7 +1621,7 @@ ORDER BY tm.verified_at DESC, tm.created_at DESC
                     
                     <?php if (empty($active_movements)): ?>
                     <tr>
-                        <td colspan="7" class="px-6 py-4 text-center text-gray-500">No active trolley movements</td>
+                        <td colspan="8" class="px-6 py-4 text-center text-gray-500">No active trolley movements</td>
                     </tr>
                     <?php endif; ?>
                 </tbody>
@@ -1655,7 +1801,7 @@ ORDER BY tm.verified_at DESC, tm.created_at DESC
                     <?php foreach ($trolleys as $trolley): ?>
                         <?php if ($trolley['status'] === 'available'): ?>
                             <label class="flex items-center mb-2 cursor-pointer">
-                                <input type="checkbox" name="trolley_ids[]" value="<?php echo $trolley['id']; ?>" data-max-weight="<?php echo $trolley['max_weight_kg']; ?>" class="trolley-checkbox w-4 h-4 border-gray-300 rounded" onchange="updateTrolleyInputs()">
+                                <input type="checkbox" name="trolley_ids[]" value="<?php echo $trolley['id']; ?>" data-max-weight="<?php echo $trolley['max_weight_kg']; ?>" class="trolley-checkbox w-4 h-4 border-gray-300 rounded">
                                 <span class="ml-2 text-sm text-gray-700">
                                     <?php echo $trolley['trolley_no']; ?> - <?php echo $trolley['trolley_name']; ?> (Max: <?php echo number_format($trolley['max_weight_kg'], 1); ?> kg)
                                 </span>
@@ -1728,6 +1874,15 @@ ORDER BY tm.verified_at DESC, tm.created_at DESC
         <form method="POST" class="space-y-4" onsubmit="return confirmWeightVerification()">
             <input type="hidden" name="action" value="verify_weight">
             <input type="hidden" name="movement_id" id="verify_movement_id">
+            
+            <!-- Batch Information -->
+            <div class="bg-blue-50 border border-blue-200 rounded-md p-4">
+                <h4 class="text-sm font-medium text-blue-800 mb-2">📦 Production Batch:</h4>
+                <div class="text-sm text-blue-700">
+                    <div><strong>Batch Number:</strong> <span id="verify_batch_no">-</span></div>
+                    <div><strong>Item:</strong> <span id="verify_item_name">-</span> (<span id="verify_item_code">-</span>)</div>
+                </div>
+            </div>
             
             <!-- Expected vs Actual Display -->
             <div class="bg-gray-50 border border-gray-200 rounded-md p-4">
@@ -1953,39 +2108,46 @@ function updateTrolleyInputs() {
     const content = document.getElementById('trolleyInputsContent');
     const prodSelect = document.querySelector('select[name="production_id"]');
     
-    if (trolleyCheckboxes.length > 0 && prodSelect.value) {
-        let html = '';
-        trolleyCheckboxes.forEach((checkbox) => {
-            const trolleyId = checkbox.value;
-            const trolleyName = checkbox.closest('label').querySelector('span').textContent.trim();
-            html += `
-                <div class="flex items-end gap-3 pb-3 border-b border-blue-200 last:border-b-0">
-                    <div class="flex-1">
-                        <label class="text-xs font-medium text-blue-700">${trolleyName}</label>
+    if (trolleyCheckboxes.length > 0) {
+        if (prodSelect.value) {
+            // Show weight inputs when both production and trolleys are selected
+            let html = '';
+            trolleyCheckboxes.forEach((checkbox) => {
+                const trolleyId = checkbox.value;
+                const trolleyName = checkbox.closest('label').querySelector('span').textContent.trim();
+                html += `
+                    <div class="flex items-end gap-3 pb-3 border-b border-blue-200 last:border-b-0">
+                        <div class="flex-1">
+                            <label class="text-xs font-medium text-blue-700">${trolleyName}</label>
+                        </div>
+                        <div class="flex-1">
+                            <input type="number" step="0.001" name="trolley_weight_${trolleyId}" 
+                                   placeholder="Enter weight (kg)" 
+                                   class="w-full px-2 py-2 border border-blue-300 rounded text-sm focus:ring-2 focus:ring-blue-500"
+                                   required>
+                        </div>
                     </div>
-                    <div class="flex-1">
-                        <input type="number" step="0.001" name="trolley_weight_${trolleyId}" 
-                               placeholder="Enter weight (kg)" 
-                               class="w-full px-2 py-2 border border-blue-300 rounded text-sm focus:ring-2 focus:ring-blue-500"
-                               onchange="updateTrolleyDistribution()" 
-                               required>
-                    </div>
+                `;
+            });
+            
+            content.innerHTML = html;
+            container.classList.remove('hidden');
+        } else {
+            // Show message when trolleys are selected but no production chosen
+            content.innerHTML = `
+                <div class="text-center py-4">
+                    <div class="text-blue-600 font-medium">✅ ${trolleyCheckboxes.length} trolley(s) selected</div>
+                    <div class="text-sm text-gray-600 mt-1">Please select a production batch above to continue</div>
                 </div>
             `;
-        });
-        
-        content.innerHTML = html;
-        container.classList.remove('hidden');
-        updateExpectedWeight();
+            container.classList.remove('hidden');
+        }
     } else {
         container.classList.add('hidden');
     }
 }
 
-function updateTrolleyDistribution() {
-    updateExpectedWeight();
-}
-let currentMovement = null;
+
 let expectedWeight = 0;
 let expectedUnits = 0;
 let weightTolerance = 5; // Default 5%
@@ -2077,14 +2239,14 @@ function updateExpectedWeight() {
                     <div>Per Trolley: ${unitsPerTrolley} units × ${weightPerTrolley} kg</div>
                 </div>
             `;
-            submitBtn.disabled = true;
-            submitBtn.classList.add('opacity-50', 'cursor-not-allowed');
+            submitBtn.disabled = false;
+            submitBtn.classList.remove('opacity-50', 'cursor-not-allowed');
         }
         
         document.getElementById('expectedWeightDisplay').classList.remove('hidden');
         
         // Check trolley capacity
-        checkTrolleyCapacity(hasIndividualWeights ? totalEnteredWeight / trolleyCount : totalWeight / trolleyCount, trolleyCheckboxes);
+        checkTrolleyCapacity(hasIndividualWeights, hasIndividualWeights ? totalEnteredWeight : totalWeight, trolleyCount, trolleyCheckboxes);
     } else {
         document.getElementById('expectedWeightDisplay').classList.add('hidden');
         document.getElementById('weightWarning').classList.add('hidden');
@@ -2093,18 +2255,36 @@ function updateExpectedWeight() {
     }
 }
 
-function checkTrolleyCapacity(weightPerTrolley, trolleyCheckboxes) {
+function checkTrolleyCapacity(hasIndividualWeights, totalEnteredWeight, trolleyCount, trolleyCheckboxes) {
     const submitBtn = document.getElementById('createMovementBtn');
     const warningDiv = document.getElementById('weightWarning');
     
     let capacityIssue = false;
     
-    trolleyCheckboxes.forEach(checkbox => {
-        const maxWeight = parseFloat(checkbox.getAttribute('data-max-weight'));
-        if (weightPerTrolley > maxWeight) {
-            capacityIssue = true;
-        }
-    });
+    if (hasIndividualWeights) {
+        // Check each trolley's entered weight against its max capacity
+        trolleyCheckboxes.forEach(checkbox => {
+            const trolleyId = checkbox.value;
+            const weightInput = document.querySelector(`input[name="trolley_weight_${trolleyId}"]`);
+            const maxWeight = parseFloat(checkbox.getAttribute('data-max-weight'));
+            
+            if (weightInput && weightInput.value) {
+                const enteredWeight = parseFloat(weightInput.value) || 0;
+                if (enteredWeight > maxWeight) {
+                    capacityIssue = true;
+                }
+            }
+        });
+    } else {
+        // Check average weight against each trolley's max capacity
+        const weightPerTrolley = totalEnteredWeight / trolleyCount;
+        trolleyCheckboxes.forEach(checkbox => {
+            const maxWeight = parseFloat(checkbox.getAttribute('data-max-weight'));
+            if (weightPerTrolley > maxWeight) {
+                capacityIssue = true;
+            }
+        });
+    }
     
     if (capacityIssue) {
         warningDiv.innerHTML = `
@@ -2135,15 +2315,31 @@ function checkTrolleyCapacity(weightPerTrolley, trolleyCheckboxes) {
 document.addEventListener('DOMContentLoaded', function() {
     const prodSelect = document.querySelector('select[name="production_id"]');
     
-    // Use event delegation for checkboxes - detects changes on any .trolley-checkbox
+    // Use event delegation for checkboxes and weight inputs
     document.addEventListener('change', function(e) {
         if (e.target.classList.contains('trolley-checkbox')) {
+            // Trolley checkbox changed - update both trolley inputs and expected weight
+            updateTrolleyInputs();
+            updateExpectedWeight();
+        } else if (e.target.name && e.target.name.startsWith('trolley_weight_')) {
+            // Weight input changed - update expected weight
+            updateExpectedWeight();
+        }
+    });
+    
+    // Add input event listener for real-time capacity checking
+    document.addEventListener('input', function(e) {
+        if (e.target.name && e.target.name.startsWith('trolley_weight_')) {
+            // Weight input changed - update expected weight for real-time feedback
             updateExpectedWeight();
         }
     });
     
     if (prodSelect) {
-        prodSelect.addEventListener('change', updateExpectedWeight);
+        prodSelect.addEventListener('change', function() {
+            updateTrolleyInputs();
+            updateExpectedWeight();
+        });
     }
 });
 
@@ -2157,6 +2353,11 @@ function openVerificationModal(movement) {
     document.getElementById('verify_expected_units').textContent = expectedUnits.toFixed(3) + ' units';
     document.getElementById('verify_expected_weight').textContent = expectedWeight.toFixed(3) + ' kg';
     document.getElementById('verify_tolerance').textContent = '±' + weightTolerance + '%';
+    
+    // Populate batch information
+    document.getElementById('verify_batch_no').textContent = movement.batch_no || 'N/A';
+    document.getElementById('verify_item_name').textContent = movement.item_name || '';
+    document.getElementById('verify_item_code').textContent = movement.item_code || '';
     
     // Reset form - only weight field now
     const weightInput = document.querySelector('input[name="actual_weight_kg"]');
@@ -2296,21 +2497,14 @@ function validateWeightInputs() {
         return false;
     }
     
-    // Check if all weights are entered
-    let allWeightsEntered = true;
-    trolleyCheckboxes.forEach((checkbox) => {
-        const trolleyId = checkbox.value;
-        const weightInput = document.querySelector(`input[name="trolley_weight_${trolleyId}"]`);
-        if (!weightInput || !weightInput.value || parseFloat(weightInput.value) <= 0) {
-            allWeightsEntered = false;
-        }
-    });
-    
-    if (!allWeightsEntered) {
-        alert('Please enter actual weight for all selected trolleys');
+    // Check if production is selected
+    const prodSelect = document.querySelector('select[name="production_id"]');
+    if (!prodSelect || !prodSelect.value) {
+        alert('Please select a production batch');
         return false;
     }
     
+    // Individual weights are optional - if not entered, system will use default distribution
     return true;
 }
 // Auto-refresh page every 30 seconds to show updates
