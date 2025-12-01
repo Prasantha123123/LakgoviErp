@@ -173,16 +173,38 @@ try {
 // Filter by type
 
 $filter_type = $_GET['filter'] ?? 'all';
+$filter_category = $_GET['category'] ?? 'all';
 $search_query = trim($_GET['search'] ?? '');
 $filtered_items = $items;
+
+// Filter by type
 if ($filter_type !== 'all') {
     $filtered_items = array_filter($filtered_items, function($item) use ($filter_type) {
         return $item['type'] === $filter_type;
     });
 }
+
+// Filter by category
+if ($filter_category !== 'all' && $filter_category !== '') {
+    $filtered_items = array_filter($filtered_items, function($item) use ($filter_category) {
+        // Check primary category
+        if ($item['category_id'] == $filter_category) {
+            return true;
+        }
+        // Check if item has multiple categories
+        if (!empty($item['category_ids']) && in_array($filter_category, $item['category_ids'])) {
+            return true;
+        }
+        return false;
+    });
+}
+
+// Filter by search query
 if ($search_query !== '') {
     $filtered_items = array_filter($filtered_items, function($item) use ($search_query) {
-        return stripos($item['name'], $search_query) !== false || stripos($item['code'], $search_query) !== false;
+        return stripos($item['name'], $search_query) !== false || 
+               stripos($item['code'], $search_query) !== false ||
+               stripos($item['all_categories'] ?? '', $search_query) !== false;
     });
 }
 ?>
@@ -219,33 +241,81 @@ if ($search_query !== '') {
 
 
     <!-- Filter Tabs & Search -->
-    <div class="bg-white shadow rounded-lg p-4">
+    <div class="bg-white shadow rounded-lg p-4 space-y-4">
+        <!-- Type Filter Tabs -->
         <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
-            <div class="flex space-x-4">
-                <a href="?filter=all" class="<?php echo $filter_type === 'all' ? 'bg-primary text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'; ?> px-4 py-2 rounded-md transition-colors">
+            <div class="flex flex-wrap gap-2">
+                <a href="?filter=all&category=<?php echo htmlspecialchars($filter_category); ?>" class="<?php echo $filter_type === 'all' ? 'bg-primary text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'; ?> px-4 py-2 rounded-md transition-colors text-sm">
                     All Items (<?php echo count($items); ?>)
                 </a>
-                <a href="?filter=raw" class="<?php echo $filter_type === 'raw' ? 'bg-primary text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'; ?> px-4 py-2 rounded-md transition-colors">
+                <a href="?filter=raw&category=<?php echo htmlspecialchars($filter_category); ?>" class="<?php echo $filter_type === 'raw' ? 'bg-primary text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'; ?> px-4 py-2 rounded-md transition-colors text-sm">
                     Raw Materials (<?php echo count(array_filter($items, fn($i) => $i['type'] === 'raw')); ?>)
                 </a>
-                <a href="?filter=semi_finished" class="<?php echo $filter_type === 'semi_finished' ? 'bg-primary text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'; ?> px-4 py-2 rounded-md transition-colors">
+                <a href="?filter=semi_finished&category=<?php echo htmlspecialchars($filter_category); ?>" class="<?php echo $filter_type === 'semi_finished' ? 'bg-primary text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'; ?> px-4 py-2 rounded-md transition-colors text-sm">
                     Semi-Finished (Peettu) (<?php echo count(array_filter($items, fn($i) => $i['type'] === 'semi_finished')); ?>)
                 </a>
-                <a href="?filter=finished" class="<?php echo $filter_type === 'finished' ? 'bg-primary text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'; ?> px-4 py-2 rounded-md transition-colors">
+                <a href="?filter=finished&category=<?php echo htmlspecialchars($filter_category); ?>" class="<?php echo $filter_type === 'finished' ? 'bg-primary text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'; ?> px-4 py-2 rounded-md transition-colors text-sm">
                     Finished Goods (<?php echo count(array_filter($items, fn($i) => $i['type'] === 'finished')); ?>)
                 </a>
             </div>
-            <form method="GET" class="flex gap-2 items-center" id="itemSearchForm">
+        </div>
+
+        <!-- Category Filter Dropdown -->
+        <div class="flex flex-col md:flex-row gap-3 items-start md:items-center">
+            <label class="font-medium text-gray-700 flex items-center gap-2">
+                <svg class="w-5 h-5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A1.994 1.994 0 013 12V7a4 4 0 014-4z"/>
+                </svg>
+                Filter by Category:
+            </label>
+            <select id="categoryFilter" class="px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary" onchange="updateCategoryFilter()">
+                <option value="all">All Categories</option>
+                <?php foreach ($categories as $cat): ?>
+                    <option value="<?php echo htmlspecialchars($cat['id']); ?>" <?php echo $filter_category == $cat['id'] ? 'selected' : ''; ?>>
+                        <?php echo htmlspecialchars($cat['name']); ?>
+                    </option>
+                <?php endforeach; ?>
+            </select>
+            <script>
+            function updateCategoryFilter() {
+                const categoryFilter = document.getElementById('categoryFilter').value;
+                const filterType = '<?php echo htmlspecialchars($filter_type); ?>';
+                const searchQuery = '<?php echo htmlspecialchars($search_query); ?>';
+                let url = '?filter=' + filterType + '&category=' + encodeURIComponent(categoryFilter);
+                if (searchQuery) {
+                    url += '&search=' + encodeURIComponent(searchQuery);
+                }
+                window.location.href = url;
+            }
+            </script>
+        </div>
+
+        <!-- Search Bar -->
+        <div class="flex items-center">
+            <form method="GET" class="flex gap-2 items-center w-full" id="itemSearchForm">
                 <input type="hidden" name="filter" value="<?php echo htmlspecialchars($filter_type); ?>">
-                <input type="text" name="search" id="itemSearchInput" value="<?php echo htmlspecialchars($search_query); ?>" placeholder="Search by name or code..." class="px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent" autocomplete="off" />
+                <input type="hidden" name="category" value="<?php echo htmlspecialchars($filter_category); ?>">
+                <input type="text" name="search" id="itemSearchInput" value="<?php echo htmlspecialchars($search_query); ?>" placeholder="Search by name, code, or category..." class="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent" autocomplete="off" />
                 <button type="submit" class="bg-primary text-white px-4 py-2 rounded-md hover:bg-blue-600 transition-colors">Search</button>
+                <?php if ($search_query !== ''): ?>
+                    <a href="?filter=<?php echo htmlspecialchars($filter_type); ?>&category=<?php echo htmlspecialchars($filter_category); ?>" class="bg-gray-500 text-white px-4 py-2 rounded-md hover:bg-gray-600 transition-colors">Clear</a>
+                <?php endif; ?>
             </form>
+        </div>
             <script>
             // Auto-submit search form on input
             document.addEventListener('DOMContentLoaded', function() {
                 var searchInput = document.getElementById('itemSearchInput');
                 var searchForm = document.getElementById('itemSearchForm');
                 var timeout = null;
+                
+                // Refocus search input if there's an active search (after page reload)
+                if (searchInput && '<?php echo htmlspecialchars($search_query); ?>' !== '') {
+                    searchInput.focus();
+                    // Position cursor at the end of the text
+                    searchInput.setSelectionRange(searchInput.value.length, searchInput.value.length);
+                }
+                
                 if (searchInput && searchForm) {
                     searchInput.addEventListener('input', function() {
                         clearTimeout(timeout);

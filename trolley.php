@@ -1281,22 +1281,80 @@ try {
     ");
     $active_movements = $stmt->fetchAll();
     
-    // Get recent completed movements for history
-    $stmt = $db->query("
-        SELECT tm.*, t.trolley_no, i.name as item_name,
+    // ========================================================================
+    // ALL TROLLEY MOVEMENTS - WITH PAGINATION & FILTERING
+    // ========================================================================
+    $perPage = 20; // Page size configuration
+    $currentPage = max(1, intval($_GET['page'] ?? 1));
+    $offset = ($currentPage - 1) * $perPage;
+    
+    // Build filters from GET parameters
+    $filters = [];
+    $filterParams = [];
+    
+    if (!empty($_GET['from_date'])) {
+        $filters[] = "DATE(tm.movement_date) >= ?";
+        $filterParams[] = $_GET['from_date'];
+    }
+    if (!empty($_GET['to_date'])) {
+        $filters[] = "DATE(tm.movement_date) <= ?";
+        $filterParams[] = $_GET['to_date'];
+    }
+    if (!empty($_GET['status'])) {
+        $filters[] = "tm.status = ?";
+        $filterParams[] = $_GET['status'];
+    }
+    if (!empty($_GET['trolley_no'])) {
+        $filters[] = "t.trolley_no LIKE ?";
+        $filterParams[] = '%' . $_GET['trolley_no'] . '%';
+    }
+    
+    $whereClause = !empty($filters) ? "WHERE " . implode(" AND ", $filters) : "";
+    
+    // Get total count of movements matching filters
+    $countStmt = $db->prepare("
+        SELECT COUNT(DISTINCT tm.id) as total
+        FROM trolley_movements tm
+        JOIN trolleys t ON tm.trolley_id = t.id
+        $whereClause
+    ");
+    $countStmt->execute($filterParams);
+    $totalRows = intval($countStmt->fetch()['total']);
+    $totalPages = max(1, ceil($totalRows / $perPage));
+    $currentPage = min($currentPage, $totalPages); // Prevent page > total pages
+    $offset = ($currentPage - 1) * $perPage;
+    
+    // Get all movements with pagination
+    // Build query with WHERE clause (no placeholders for LIMIT/OFFSET - they're integers added directly)
+    $stmt = $db->prepare("
+        SELECT DISTINCT tm.id, tm.movement_no, tm.trolley_id, tm.production_id,
+               tm.from_location_id, tm.to_location_id, tm.movement_date,
+               tm.expected_weight_kg, tm.actual_weight_kg, 
+               tm.expected_units, tm.actual_units,
+               tm.status, tm.verified_at, tm.created_at,
+               t.trolley_no, t.trolley_name,
                fl.name as from_location, tl.name as to_location,
-               ti.actual_quantity, ti.actual_weight_kg, ti.variance_weight_kg
+               COALESCE(SUM(ti.expected_quantity), 0) as total_expected_qty,
+               COALESCE(SUM(ti.actual_quantity), 0) as total_actual_qty
         FROM trolley_movements tm
         JOIN trolleys t ON tm.trolley_id = t.id
         JOIN locations fl ON tm.from_location_id = fl.id
         JOIN locations tl ON tm.to_location_id = tl.id
-        JOIN trolley_items ti ON tm.id = ti.movement_id
-        JOIN items i ON ti.item_id = i.id
-        WHERE tm.status = 'completed'
-ORDER BY tm.verified_at DESC, tm.created_at DESC
-        LIMIT 20
+        LEFT JOIN trolley_items ti ON tm.id = ti.movement_id
+        $whereClause
+        GROUP BY tm.id, tm.movement_no, tm.trolley_id, tm.production_id,
+                 tm.from_location_id, tm.to_location_id, tm.movement_date,
+                 tm.expected_weight_kg, tm.actual_weight_kg, 
+                 tm.expected_units, tm.actual_units,
+                 tm.status, tm.verified_at, tm.created_at,
+                 t.trolley_no, t.trolley_name,
+                 fl.name, tl.name
+        ORDER BY tm.movement_date DESC, tm.created_at DESC
+        LIMIT " . intval($perPage) . " OFFSET " . intval($offset) . "
     ");
-    $completed_movements = $stmt->fetchAll();
+    // Execute with only filter parameters (LIMIT/OFFSET added as integers in SQL string)
+    $stmt->execute($filterParams);
+    $all_movements = $stmt->fetchAll();
     
 } catch(PDOException $e) {
     $error = "Error fetching data: " . $e->getMessage();
@@ -1307,7 +1365,11 @@ ORDER BY tm.verified_at DESC, tm.created_at DESC
     $ready_productions = [];
     $verified_totals = ['verified_batches' => 0, 'total_verified_qty' => 0, 'total_verified_weight' => 0];
     $active_movements = [];
-    $completed_movements = [];
+    $all_movements = [];
+    $totalRows = 0;
+    $totalPages = 1;
+    $currentPage = 1;
+    $perPage = 20;
 }
 ?>
 
@@ -1630,7 +1692,7 @@ ORDER BY tm.verified_at DESC, tm.created_at DESC
     </div>
 
     <!-- All Trolleys Status -->
-    <div class="bg-white rounded-lg shadow overflow-hidden">
+    <!-- <div class="bg-white rounded-lg shadow overflow-hidden">
         <div class="px-6 py-4 border-b border-gray-200">
             <h3 class="text-lg font-semibold text-gray-900">🛒 Trolley Fleet Status</h3>
         </div>
@@ -1670,60 +1732,375 @@ ORDER BY tm.verified_at DESC, tm.created_at DESC
                 </tbody>
             </table>
         </div>
-    </div>
+    </div> -->
 
-    <!-- Recent Completed Movements -->
-    <?php if (!empty($completed_movements)): ?>
+    <!-- All Trolley Movements - WITH PAGINATION & FILTERS -->
     <div class="bg-white rounded-lg shadow overflow-hidden">
-        <div class="px-6 py-4 border-b border-gray-200">
-            <h3 class="text-lg font-semibold text-gray-900">📋 Recent Completed Movements</h3>
+        <!-- Header with Export Button -->
+        <div class="px-6 py-4 border-b border-gray-200 flex justify-between items-center">
+            <div>
+                <h3 class="text-lg font-semibold text-gray-900">📋 All Trolley Movements</h3>
+                <p class="text-sm text-gray-600 mt-1">Total: <?php echo $totalRows; ?> movements</p>
+            </div>
+            <button onclick="document.getElementById('exportForm').submit()" 
+                    class="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-lg text-sm font-medium flex items-center">
+                <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+                </svg>
+                📄 Export to PDF
+            </button>
         </div>
+
+        <!-- Filter Form (hidden by default, expandable) -->
+        <div id="filterPanel" class="px-6 py-4 border-b border-gray-200 bg-gray-50 hidden">
+            <form method="GET" class="space-y-4">
+                <div class="grid grid-cols-1 md:grid-cols-5 gap-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">From Date</label>
+                        <input type="date" name="from_date" value="<?php echo htmlspecialchars($_GET['from_date'] ?? ''); ?>" 
+                               class="w-full px-3 py-2 border border-gray-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">To Date</label>
+                        <input type="date" name="to_date" value="<?php echo htmlspecialchars($_GET['to_date'] ?? ''); ?>" 
+                               class="w-full px-3 py-2 border border-gray-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Status</label>
+                        <select name="status" class="w-full px-3 py-2 border border-gray-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+                            <option value="">All</option>
+                            <option value="pending" <?php echo ($_GET['status'] ?? '') === 'pending' ? 'selected' : ''; ?>>Pending</option>
+                            <option value="in_transit" <?php echo ($_GET['status'] ?? '') === 'in_transit' ? 'selected' : ''; ?>>In Transit</option>
+                            <option value="verified" <?php echo ($_GET['status'] ?? '') === 'verified' ? 'selected' : ''; ?>>Verified</option>
+                            <option value="completed" <?php echo ($_GET['status'] ?? '') === 'completed' ? 'selected' : ''; ?>>Completed</option>
+                            <option value="rejected" <?php echo ($_GET['status'] ?? '') === 'rejected' ? 'selected' : ''; ?>>Rejected</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Trolley No</label>
+                        <input type="text" name="trolley_no" placeholder="Search..." value="<?php echo htmlspecialchars($_GET['trolley_no'] ?? ''); ?>" 
+                               class="w-full px-3 py-2 border border-gray-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+                    </div>
+                    <div class="flex items-end gap-2">
+                        <button type="submit" class="flex-1 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-md text-sm font-medium">
+                            🔍 Apply Filter
+                        </button>
+                        <a href="?page=1" class="flex-1 bg-gray-400 hover:bg-gray-500 text-white px-4 py-2 rounded-md text-sm font-medium text-center">
+                            Clear
+                        </a>
+                    </div>
+                </div>
+            </form>
+        </div>
+
+        <!-- Filter Toggle Button -->
+        <div class="px-6 py-2 border-b border-gray-200 bg-white">
+            <button onclick="document.getElementById('filterPanel').classList.toggle('hidden')" 
+                    class="text-blue-600 hover:text-blue-900 text-sm font-medium flex items-center">
+                <svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"/>
+                </svg>
+                🔽 Filters <?php echo (isset($_GET['from_date']) || isset($_GET['to_date']) || isset($_GET['status']) || isset($_GET['trolley_no'])) ? '(Active)' : ''; ?>
+            </button>
+        </div>
+
+        <!-- Movements Table -->
         <div class="overflow-x-auto">
             <table class="min-w-full divide-y divide-gray-200">
                 <thead class="bg-gray-50">
                     <tr>
-                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Movement</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Movement #</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Date & Time</th>
                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Trolley</th>
-                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Item</th>
-                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Actual Results</th>
-                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Weight Variance</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Route</th>
                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Qty</th>
+                        <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
                     </tr>
                 </thead>
                 <tbody class="bg-white divide-y divide-gray-200">
-                    <?php foreach ($completed_movements as $movement): ?>
-                    <tr>
+                    <?php foreach ($all_movements as $movement): ?>
+                    <tr class="hover:bg-gray-50 transition-colors">
                         <td class="px-6 py-4 whitespace-nowrap">
-                            <div class="text-sm font-medium text-gray-900"><?php echo $movement['movement_no']; ?></div>
-                            <div class="text-sm text-gray-500"><?php echo date('d M Y', strtotime($movement['movement_date'])); ?></div>
-                        </td>
-                        <td class="px-6 py-4 whitespace-nowrap">
-                            <div class="text-sm text-gray-900"><?php echo $movement['trolley_no']; ?></div>
-                        </td>
-                        <td class="px-6 py-4 whitespace-nowrap">
-                            <div class="text-sm font-medium text-gray-900"><?php echo $movement['item_name']; ?></div>
-                        </td>
-                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                            <div><?php echo number_format($movement['actual_quantity'], 3); ?> units</div>
-                            <div class="text-gray-500"><?php echo number_format($movement['actual_weight_kg'], 3); ?> kg</div>
+                            <div class="text-sm font-medium text-gray-900"><?php echo htmlspecialchars($movement['movement_no']); ?></div>
                         </td>
                         <td class="px-6 py-4 whitespace-nowrap text-sm">
-                            <span class="<?php echo $movement['variance_weight_kg'] >= 0 ? 'text-green-600' : 'text-red-600'; ?>">
-                                <?php echo ($movement['variance_weight_kg'] >= 0 ? '+' : '') . number_format($movement['variance_weight_kg'], 3); ?> kg
-                            </span>
+                            <div class="text-gray-900"><?php echo date('d M Y', strtotime($movement['movement_date'])); ?></div>
+                            <div class="text-xs text-gray-500"><?php echo date('H:i:s', strtotime($movement['movement_date'])); ?></div>
                         </td>
                         <td class="px-6 py-4 whitespace-nowrap">
-                            <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800">
-                                ✅ Completed
+                            <div class="text-sm font-medium text-gray-900"><?php echo htmlspecialchars($movement['trolley_no']); ?></div>
+                            <div class="text-xs text-gray-500"><?php echo htmlspecialchars($movement['trolley_name']); ?></div>
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm">
+                            <div class="flex items-center gap-2">
+                                <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800">
+                                    <?php echo htmlspecialchars($movement['from_location']); ?>
+                                </span>
+                                <svg class="w-3 h-3 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
+                                </svg>
+                                <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800">
+                                    <?php echo htmlspecialchars($movement['to_location']); ?>
+                                </span>
+                            </div>
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap">
+                            <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium <?php 
+                                echo $movement['status'] === 'completed' ? 'bg-green-100 text-green-800' : 
+                                    ($movement['status'] === 'verified' ? 'bg-blue-100 text-blue-800' : 
+                                    ($movement['status'] === 'rejected' ? 'bg-red-100 text-red-800' : 
+                                    ($movement['status'] === 'in_transit' ? 'bg-purple-100 text-purple-800' : 'bg-yellow-100 text-yellow-800'))); 
+                            ?>">
+                                <?php echo htmlspecialchars(ucfirst(str_replace('_', ' ', $movement['status']))); ?>
                             </span>
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm">
+                            <div class="text-gray-900"><?php echo htmlspecialchars($movement['total_actual_qty'] ?? $movement['total_expected_qty'] ?? '0'); ?> units</div>
+                            <div class="text-xs text-gray-500"><?php echo number_format($movement['actual_weight_kg'] ?? $movement['expected_weight_kg'] ?? 0, 2); ?> kg</div>
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                            <button onclick="viewMovementDetails(<?php echo htmlspecialchars($movement['id']); ?>)" 
+                                    class="text-blue-600 hover:text-blue-900 font-medium">
+                                👁️ View
+                            </button>
                         </td>
                     </tr>
                     <?php endforeach; ?>
+                    
+                    <?php if (empty($all_movements)): ?>
+                    <tr>
+                        <td colspan="7" class="px-6 py-8 text-center text-gray-500">
+                            <svg class="w-12 h-12 mx-auto mb-3 text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+                            </svg>
+                            <p class="text-lg font-medium">No movements found</p>
+                            <p class="text-sm">Try adjusting your filters or create a new movement</p>
+                        </td>
+                    </tr>
+                    <?php endif; ?>
                 </tbody>
             </table>
         </div>
+
+        <!-- Pagination Controls -->
+        <?php if ($totalPages > 1): ?>
+        <div class="px-6 py-4 border-t border-gray-200 bg-gray-50 flex justify-between items-center">
+            <div class="text-sm text-gray-600">
+                Page <span class="font-semibold"><?php echo $currentPage; ?></span> of <span class="font-semibold"><?php echo $totalPages; ?></span>
+                (<?php echo $totalRows; ?> total movements)
+            </div>
+            
+            <div class="flex gap-2">
+                <!-- Previous Button -->
+                <?php if ($currentPage > 1): ?>
+                    <a href="?page=<?php echo $currentPage - 1; ?><?php echo !empty($_GET) ? '&' . http_build_query(array_diff_key($_GET, ['page' => null])) : ''; ?>" 
+                       class="px-4 py-2 border border-gray-300 rounded-md text-sm font-medium text-gray-700 hover:bg-gray-100 transition-colors">
+                        ← Previous
+                    </a>
+                <?php else: ?>
+                    <button disabled class="px-4 py-2 border border-gray-300 rounded-md text-sm font-medium text-gray-400 bg-gray-100 cursor-not-allowed">
+                        ← Previous
+                    </button>
+                <?php endif; ?>
+
+                <!-- Page Numbers -->
+                <?php 
+                $startPage = max(1, $currentPage - 2);
+                $endPage = min($totalPages, $currentPage + 2);
+                if ($startPage > 1): ?>
+                    <a href="?page=1<?php echo !empty($_GET) ? '&' . http_build_query(array_diff_key($_GET, ['page' => null])) : ''; ?>" 
+                       class="px-3 py-2 border border-gray-300 rounded-md text-sm text-gray-700 hover:bg-gray-100">1</a>
+                    <?php if ($startPage > 2): ?>
+                        <span class="text-gray-400 px-2">...</span>
+                    <?php endif; ?>
+                <?php endif; ?>
+
+                <?php for ($i = $startPage; $i <= $endPage; $i++): ?>
+                    <?php if ($i === $currentPage): ?>
+                        <button class="px-3 py-2 bg-blue-600 text-white rounded-md text-sm font-medium">
+                            <?php echo $i; ?>
+                        </button>
+                    <?php else: ?>
+                        <a href="?page=<?php echo $i; ?><?php echo !empty($_GET) ? '&' . http_build_query(array_diff_key($_GET, ['page' => null])) : ''; ?>" 
+                           class="px-3 py-2 border border-gray-300 rounded-md text-sm text-gray-700 hover:bg-gray-100">
+                            <?php echo $i; ?>
+                        </a>
+                    <?php endif; ?>
+                <?php endfor; ?>
+
+                <?php if ($endPage < $totalPages): ?>
+                    <?php if ($endPage < $totalPages - 1): ?>
+                        <span class="text-gray-400 px-2">...</span>
+                    <?php endif; ?>
+                    <a href="?page=<?php echo $totalPages; ?><?php echo !empty($_GET) ? '&' . http_build_query(array_diff_key($_GET, ['page' => null])) : ''; ?>" 
+                       class="px-3 py-2 border border-gray-300 rounded-md text-sm text-gray-700 hover:bg-gray-100">
+                        <?php echo $totalPages; ?>
+                    </a>
+                <?php endif; ?>
+
+                <!-- Next Button -->
+                <?php if ($currentPage < $totalPages): ?>
+                    <a href="?page=<?php echo $currentPage + 1; ?><?php echo !empty($_GET) ? '&' . http_build_query(array_diff_key($_GET, ['page' => null])) : ''; ?>" 
+                       class="px-4 py-2 border border-gray-300 rounded-md text-sm font-medium text-gray-700 hover:bg-gray-100 transition-colors">
+                        Next →
+                    </a>
+                <?php else: ?>
+                    <button disabled class="px-4 py-2 border border-gray-300 rounded-md text-sm font-medium text-gray-400 bg-gray-100 cursor-not-allowed">
+                        Next →
+                    </button>
+                <?php endif; ?>
+            </div>
+        </div>
+        <?php endif; ?>
     </div>
-    <?php endif; ?>
+
+    <!-- Hidden Export Form -->
+    <form id="exportForm" method="GET" action="export_trolley_movements_pdf.php" target="_blank" style="display:none;">
+        <input type="hidden" name="from_date" value="<?php echo htmlspecialchars($_GET['from_date'] ?? ''); ?>">
+        <input type="hidden" name="to_date" value="<?php echo htmlspecialchars($_GET['to_date'] ?? ''); ?>">
+        <input type="hidden" name="status" value="<?php echo htmlspecialchars($_GET['status'] ?? ''); ?>">
+        <input type="hidden" name="trolley_no" value="<?php echo htmlspecialchars($_GET['trolley_no'] ?? ''); ?>">
+    </form>
+</div>
+
+<!-- Movement Details Modal -->
+<div id="movementDetailsModal" class="fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full modal-backdrop hidden z-50">
+    <div class="relative top-10 mx-auto p-5 border w-full max-w-2xl shadow-lg rounded-md bg-white max-h-[90vh] overflow-y-auto">
+        <div class="flex justify-between items-center mb-6">
+            <h3 class="text-xl font-bold text-gray-900">🛒 Trolley Movement Details</h3>
+            <button onclick="closeModal('movementDetailsModal')" class="text-gray-400 hover:text-gray-600">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                </svg>
+            </button>
+        </div>
+
+        <!-- Movement Header -->
+        <div class="bg-gradient-to-r from-blue-50 to-blue-100 p-4 rounded-lg mb-6 border border-blue-200">
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                <div>
+                    <p class="text-xs font-medium text-blue-600 uppercase">Movement #</p>
+                    <p class="text-sm font-semibold text-gray-900" id="detail_movement_no">—</p>
+                </div>
+                <div>
+                    <p class="text-xs font-medium text-blue-600 uppercase">Date & Time</p>
+                    <p class="text-sm font-semibold text-gray-900" id="detail_movement_date">—</p>
+                </div>
+                <div>
+                    <p class="text-xs font-medium text-blue-600 uppercase">Trolley</p>
+                    <p class="text-sm font-semibold text-gray-900" id="detail_trolley">—</p>
+                </div>
+                <div>
+                    <p class="text-xs font-medium text-blue-600 uppercase">Status</p>
+                    <div id="detail_status" class="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-gray-100 text-gray-800 mt-1">—</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Production Batch Info (if applicable) -->
+        <div id="detail_production_section" class="bg-indigo-50 p-4 rounded-lg mb-6 border border-indigo-200 hidden">
+            <p class="text-sm font-medium text-indigo-900 mb-3">📦 Production Batch</p>
+            <div class="grid grid-cols-2 md:grid-cols-3 gap-4">
+                <div>
+                    <p class="text-xs text-indigo-600 uppercase mb-1">Batch #</p>
+                    <p class="text-sm font-semibold text-indigo-900" id="detail_batch_no">—</p>
+                </div>
+                <div>
+                    <p class="text-xs text-indigo-600 uppercase mb-1">Item Code</p>
+                    <p class="text-sm font-semibold text-indigo-900" id="detail_batch_item_code">—</p>
+                </div>
+                <div>
+                    <p class="text-xs text-indigo-600 uppercase mb-1">Item Name</p>
+                    <p class="text-sm font-semibold text-indigo-900" id="detail_batch_item_name">—</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Location Route -->
+        <div class="bg-white p-4 rounded-lg mb-6 border border-gray-200">
+            <p class="text-sm font-medium text-gray-600 mb-3">Route</p>
+            <div class="flex items-center gap-4">
+                <div class="flex-1">
+                    <div class="text-xs text-gray-500 uppercase mb-1">From</div>
+                    <p class="text-sm font-semibold text-gray-900" id="detail_from_location">—</p>
+                </div>
+                <div class="text-2xl text-gray-400">→</div>
+                <div class="flex-1">
+                    <div class="text-xs text-gray-500 uppercase mb-1">To</div>
+                    <p class="text-sm font-semibold text-gray-900" id="detail_to_location">—</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Expected vs Actual Quantities -->
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+            <div class="bg-yellow-50 p-4 rounded-lg border border-yellow-200">
+                <p class="text-xs font-medium text-yellow-600 uppercase mb-1">Expected Units</p>
+                <p class="text-lg font-bold text-yellow-900" id="detail_expected_units">—</p>
+            </div>
+            <div class="bg-green-50 p-4 rounded-lg border border-green-200">
+                <p class="text-xs font-medium text-green-600 uppercase mb-1">Actual Units</p>
+                <p class="text-lg font-bold text-green-900" id="detail_actual_units">—</p>
+            </div>
+            <div class="bg-blue-50 p-4 rounded-lg border border-blue-200">
+                <p class="text-xs font-medium text-blue-600 uppercase mb-1">Expected Weight</p>
+                <p class="text-lg font-bold text-blue-900" id="detail_expected_weight">— kg</p>
+            </div>
+            <div class="bg-purple-50 p-4 rounded-lg border border-purple-200">
+                <p class="text-xs font-medium text-purple-600 uppercase mb-1">Actual Weight</p>
+                <p class="text-lg font-bold text-purple-900" id="detail_actual_weight">— kg</p>
+            </div>
+        </div>
+
+        <!-- Variance (if applicable) -->
+        <div id="detail_variance_section" class="bg-orange-50 p-4 rounded-lg border border-orange-200 mb-6 hidden">
+            <p class="text-sm font-medium text-orange-800 mb-3">Weight Variance Analysis</p>
+            <div class="grid grid-cols-2 gap-4">
+                <div>
+                    <p class="text-xs text-orange-600 uppercase mb-1">Unit Variance</p>
+                    <p class="text-lg font-semibold text-orange-900" id="detail_unit_variance">—</p>
+                </div>
+                <div>
+                    <p class="text-xs text-orange-600 uppercase mb-1">Weight Variance</p>
+                    <p class="text-lg font-semibold text-orange-900" id="detail_weight_variance">—</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Line Items Table -->
+        <div class="bg-white rounded-lg border border-gray-200 overflow-hidden">
+            <div class="bg-gray-50 px-6 py-3 border-b border-gray-200">
+                <h4 class="text-sm font-semibold text-gray-900">📦 Line Items</h4>
+            </div>
+            <div class="overflow-x-auto">
+                <table id="detail_items_table" class="min-w-full divide-y divide-gray-200">
+                    <thead class="bg-gray-50">
+                        <tr>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Item Code</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Item Name</th>
+                            <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase">Expected Qty</th>
+                            <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase">Actual Qty</th>
+                            <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase">Expected Wt</th>
+                            <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase">Actual Wt</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-gray-200">
+                        <tr>
+                            <td colspan="6" class="px-6 py-4 text-center text-gray-500">Loading...</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="flex justify-end gap-2 mt-6 pt-6 border-t border-gray-200">
+            <button onclick="closeModal('movementDetailsModal')" class="px-4 py-2 border border-gray-300 rounded-md text-gray-700 hover:bg-gray-50 font-medium">
+                Close
+            </button>
+        </div>
+    </div>
+</div>
 </div>
 
 <!-- Create Movement Modal -->
@@ -2507,6 +2884,108 @@ function validateWeightInputs() {
     // Individual weights are optional - if not entered, system will use default distribution
     return true;
 }
+
+// ========================================================================
+// VIEW TROLLEY MOVEMENT DETAILS
+// ========================================================================
+function viewMovementDetails(movementId) {
+    fetch('get_trolley_movement_details.php?id=' + movementId)
+        .then(response => {
+            if (!response.ok) {
+                throw new Error('Failed to fetch movement details');
+            }
+            return response.json();
+        })
+        .then(data => {
+            if (data.error) {
+                alert('Error: ' + data.error);
+                return;
+            }
+            
+            const movement = data.movement;
+            const items = data.items || [];
+            
+            // Populate modal with movement details
+            document.getElementById('detail_movement_no').textContent = movement.movement_no;
+            document.getElementById('detail_trolley').textContent = movement.trolley_no + ' (' + movement.trolley_name + ')';
+            document.getElementById('detail_movement_date').textContent = new Date(movement.movement_date).toLocaleString();
+            document.getElementById('detail_from_location').textContent = movement.from_location;
+            document.getElementById('detail_to_location').textContent = movement.to_location;
+            
+            // Status badge with color coding
+            const statusElement = document.getElementById('detail_status');
+            statusElement.textContent = movement.status.charAt(0).toUpperCase() + movement.status.slice(1).replace('_', ' ');
+            const statusBadgeClass = 
+                movement.status === 'completed' ? 'bg-green-100 text-green-800' :
+                movement.status === 'verified' ? 'bg-blue-100 text-blue-800' :
+                movement.status === 'rejected' ? 'bg-red-100 text-red-800' :
+                movement.status === 'in_transit' ? 'bg-purple-100 text-purple-800' :
+                'bg-yellow-100 text-yellow-800';
+            statusElement.className = 'inline-flex items-center px-3 py-1 rounded-full text-sm font-medium ' + statusBadgeClass;
+            
+            // Production Batch Info (if applicable)
+            if (movement.batch_no) {
+                document.getElementById('detail_batch_no').textContent = movement.batch_no;
+                document.getElementById('detail_batch_item_code').textContent = movement.prod_item_code || '—';
+                document.getElementById('detail_batch_item_name').textContent = movement.prod_item_name || '—';
+                document.getElementById('detail_production_section').classList.remove('hidden');
+            } else {
+                document.getElementById('detail_production_section').classList.add('hidden');
+            }
+            
+            // Expected vs Actual
+            document.getElementById('detail_expected_units').textContent = parseFloat(movement.expected_units || 0).toFixed(3);
+            document.getElementById('detail_actual_units').textContent = parseFloat(movement.actual_units || 0).toFixed(3) || '—';
+            document.getElementById('detail_expected_weight').textContent = parseFloat(movement.expected_weight_kg || 0).toFixed(3);
+            document.getElementById('detail_actual_weight').textContent = parseFloat(movement.actual_weight_kg || 0).toFixed(3) || '—';
+            
+            // Variance calculation if completed
+            if (movement.actual_units) {
+                const unitVariance = parseFloat(movement.actual_units) - parseFloat(movement.expected_units || 0);
+                const weightVariance = parseFloat(movement.actual_weight_kg || 0) - parseFloat(movement.expected_weight_kg || 0);
+                document.getElementById('detail_unit_variance').textContent = (unitVariance >= 0 ? '+' : '') + unitVariance.toFixed(3);
+                document.getElementById('detail_weight_variance').textContent = (weightVariance >= 0 ? '+' : '') + weightVariance.toFixed(3) + ' kg';
+                document.getElementById('detail_variance_section').classList.remove('hidden');
+            } else {
+                document.getElementById('detail_variance_section').classList.add('hidden');
+            }
+            
+            // Populate line items table
+            const itemsTableBody = document.querySelector('#detail_items_table tbody');
+            itemsTableBody.innerHTML = '';
+            
+            if (items.length > 0) {
+                items.forEach(item => {
+                    const row = document.createElement('tr');
+                    row.className = 'hover:bg-gray-50';
+                    row.innerHTML = `
+                        <td class="px-6 py-3 text-sm text-gray-900">${escapeHtml(item.item_code || '—')}</td>
+                        <td class="px-6 py-3 text-sm text-gray-900">${escapeHtml(item.item_name || '—')}</td>
+                        <td class="px-6 py-3 text-sm text-right">${parseFloat(item.expected_quantity || 0).toFixed(3)}</td>
+                        <td class="px-6 py-3 text-sm text-right">${item.actual_quantity ? parseFloat(item.actual_quantity).toFixed(3) : '—'}</td>
+                        <td class="px-6 py-3 text-sm text-right">${parseFloat(item.expected_weight_kg || 0).toFixed(3)}</td>
+                        <td class="px-6 py-3 text-sm text-right">${item.actual_weight_kg ? parseFloat(item.actual_weight_kg).toFixed(3) : '—'}</td>
+                    `;
+                    itemsTableBody.appendChild(row);
+                });
+            } else {
+                itemsTableBody.innerHTML = '<tr><td colspan="6" class="px-6 py-4 text-center text-gray-500">No line items</td></tr>';
+            }
+            
+            openModal('movementDetailsModal');
+        })
+        .catch(error => {
+            console.error('Error:', error);
+            alert('Failed to load movement details: ' + error.message);
+        });
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
 // Auto-refresh page every 30 seconds to show updates
 setInterval(function() {
     if (!document.querySelector('.modal-backdrop:not(.hidden)')) {

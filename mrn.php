@@ -33,7 +33,68 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         
                         // Process each MRN item (just create records, no stock movement yet)
                         foreach ($_POST['items'] as $item) {
-                            if (!empty($item['item_id']) && !empty($item['quantity'])) {
+                            if (!empty($item['is_category']) && !empty($item['category_id']) && !empty($item['quantity'])) {
+                                // Handle category-based material - distribute quantity across all items in category
+                                $category_id = intval($item['category_id']);
+                                $total_requested_qty = floatval($item['quantity']);
+                                
+                                // Get all items in this category with their current stock
+                                $stmt = $db->prepare("
+                                    SELECT i.id AS item_id, i.name, i.code, u.symbol as unit_symbol,
+                                           COALESCE(SUM(sl.quantity_in - sl.quantity_out), 0) as available_stock
+                                    FROM items i
+                                    JOIN units u ON u.id = i.unit_id
+                                    LEFT JOIN stock_ledger sl ON sl.item_id = i.id AND sl.location_id = ?
+                                    WHERE i.category_id = ? AND i.type = 'raw'
+                                    GROUP BY i.id, i.name, i.code, u.symbol
+                                    HAVING available_stock > 0
+                                    ORDER BY available_stock DESC
+                                ");
+                                $stmt->execute([$source_location_id, $category_id]);
+                                $category_items = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                                
+                                if (empty($category_items)) {
+                                    throw new Exception("No items with stock found in category ID: $category_id");
+                                }
+                                
+                                // Calculate total available stock in category
+                                $total_category_stock = 0;
+                                foreach ($category_items as $cat_item) {
+                                    $total_category_stock += floatval($cat_item['available_stock']);
+                                }
+                                
+                                if ($total_category_stock < $total_requested_qty) {
+                                    throw new Exception("Insufficient stock in category. Available: " . number_format($total_category_stock, 3) . " kg, Requested: " . number_format($total_requested_qty, 3) . " kg");
+                                }
+                                
+                                // Distribute quantity proportionally across items
+                                $remaining_qty = $total_requested_qty;
+                                $item_count = count($category_items);
+                                
+                                foreach ($category_items as $index => $cat_item) {
+                                    $item_stock = floatval($cat_item['available_stock']);
+                                    $allocated_qty = 0;
+                                    
+                                    if ($index == $item_count - 1) {
+                                        // Last item gets remaining quantity
+                                        $allocated_qty = $remaining_qty;
+                                    } else {
+                                        // Proportional allocation
+                                        $proportion = $item_stock / $total_category_stock;
+                                        $allocated_qty = round($total_requested_qty * $proportion, 3);
+                                        $allocated_qty = min($allocated_qty, $item_stock, $remaining_qty);
+                                    }
+                                    
+                                    if ($allocated_qty > 0) {
+                                        // Insert MRN item for this specific item
+                                        $stmt = $db->prepare("INSERT INTO mrn_items (mrn_id, item_id, location_id, quantity) VALUES (?, ?, ?, ?)");
+                                        $stmt->execute([$mrn_id, $cat_item['item_id'], $destination_location_id, $allocated_qty]);
+                                        $remaining_qty -= $allocated_qty;
+                                        $items_requested++;
+                                    }
+                                }
+                                
+                            } elseif (!empty($item['item_id']) && !empty($item['quantity'])) {
                                 $requested_qty = floatval($item['quantity']);
                                 
                                 // CONVERT PIECES TO KG if needed
@@ -418,6 +479,56 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                                 
                                 $stmt = $db->prepare("UPDATE items SET current_stock = ? WHERE id = ?");
                                 $stmt->execute([$total_stock, $item_id]);
+                            }
+                            
+                            // UPDATE LOCATION FOR RELATED RECORDS: Transfer rolls, bundles, and repacking items
+                            // These items are finished goods moved from Production Floor to Store
+                            foreach ($transfer_items as $item) {
+                                $item_id = $item['item_id'];
+                                
+                                // Update rolls_batches: Move completed rolls batches to Store
+                                // Match by rolls_item_id (the item being transferred)
+                                $stmt = $db->prepare("
+                                    UPDATE rolls_batches 
+                                    SET location_id = ?
+                                    WHERE rolls_item_id = ? AND location_id = ? AND status = 'completed'
+                                ");
+                                $stmt->execute([$store_id, $item_id, $production_floor_id]);
+                                
+                                // Update bundles: Move bundles to Store
+                                // Match by bundle_item_id (the item being transferred)
+                                $stmt = $db->prepare("
+                                    UPDATE bundles 
+                                    SET location_id = ?
+                                    WHERE bundle_item_id = ? AND location_id = ?
+                                ");
+                                $stmt->execute([$store_id, $item_id, $production_floor_id]);
+                                
+                                // When bundles are transferred, also move the repacking records that produced the source items
+                                // Get all source items from bundles that use this item
+                                $stmt = $db->prepare("
+                                    SELECT DISTINCT source_item_id FROM bundles WHERE bundle_item_id = ?
+                                ");
+                                $stmt->execute([$item_id]);
+                                $bundle_sources = $stmt->fetchAll(PDO::FETCH_COLUMN);
+                                
+                                // Update repacking for each source item used in transferred bundles
+                                foreach ($bundle_sources as $source_item_id) {
+                                    $stmt = $db->prepare("
+                                        UPDATE repacking 
+                                        SET location_id = ?
+                                        WHERE repack_item_id = ? AND location_id = ?
+                                    ");
+                                    $stmt->execute([$store_id, $source_item_id, $production_floor_id]);
+                                }
+                                
+                                // Also directly update repacking if the transferred item is a repacked item
+                                $stmt = $db->prepare("
+                                    UPDATE repacking 
+                                    SET location_id = ?
+                                    WHERE repack_item_id = ? AND location_id = ?
+                                ");
+                                $stmt->execute([$store_id, $item_id, $production_floor_id]);
                             }
                         } elseif ($is_return) {
                             // Execute return: get items and do stock movements (Production -> Store)
@@ -1052,7 +1163,7 @@ try {
                     <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Items</th>
                     <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Total Qty</th>
                     <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
-                    <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase">Actions</th>
+                    <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase w-48">Actions</th>
                 </tr>
             </thead>
             <tbody class="bg-white divide-y divide-gray-200">
@@ -1077,8 +1188,8 @@ try {
                     <td class="px-6 py-4 whitespace-nowrap">
                         <div class="text-sm font-medium text-gray-900 font-mono"><?php echo htmlspecialchars($mrn['mrn_no']); ?></div>
                     </td>
-                    <td class="px-6 py-4 whitespace-nowrap">
-                        <div class="text-sm text-gray-900"><?php echo htmlspecialchars($mrn['purpose']); ?></div>
+                    <td class="px-6 py-4">
+                        <div class="text-sm text-gray-900 break-words max-w-xs"><?php echo htmlspecialchars($mrn['purpose']); ?></div>
                     </td>
                     <td class="px-6 py-4 whitespace-nowrap">
                         <div class="text-sm text-gray-900"><?php echo $mrn['formatted_date']; ?></div>
@@ -1096,7 +1207,7 @@ try {
                             <?php echo ucfirst($mrn['status']); ?>
                         </span>
                     </td>
-                    <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium space-x-2">
+                    <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium space-x-2 w-48">
                         <button onclick="viewMrnDetails(<?php echo $mrn['id']; ?>)" class="text-blue-600 hover:text-blue-900">View</button>
                         <?php if ($mrn['status'] === 'pending'): ?>
                             <form method="POST" class="inline">
@@ -1183,18 +1294,18 @@ try {
                 </div>
                 
                 <div class="overflow-x-auto">
-                    <table class="min-w-full border border-gray-300">
+                    <table class="min-w-full border border-gray-300 table-fixed" style="min-width: 800px;">
                         <thead class="bg-gray-50">
                             <tr>
-                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase border-r">Item</th>
-                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase border-r">Available in Store</th>
-                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase border-r">Request Quantity</th>
-                                <th class="px-4 py-2 text-center text-xs font-medium text-gray-500 uppercase">Action</th>
+                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase border-r" style="width: calc(100% - 160px);">Item</th>
+                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase border-r" style="width: 80px;">Available</th>
+                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase border-r" style="width: 80px;">Quantity</th>
+                                <th class="px-4 py-2 text-center text-xs font-medium text-gray-500 uppercase" style="width: 80px;">Action</th>
                             </tr>
                         </thead>
                         <tbody id="mrnItemsTable">
                             <tr class="mrn-item-row">
-                                <td class="px-4 py-2 border-r">
+                                <td class="px-4 py-2 border-r" style="width: calc(100% - 160px);">
                                     <select name="items[0][item_id]" class="w-full px-2 py-1 border border-gray-300 rounded text-sm item-select-mrn" onchange="updateStockMrn(this)" required>
                                         <option value="">Select Item</option>
                                         <?php foreach ($items as $item): ?>
@@ -1202,16 +1313,16 @@ try {
                                         <?php endforeach; ?>
                                     </select>
                                 </td>
-                                <td class="px-4 py-2 border-r">
+                                <td class="px-4 py-2 border-r" style="width: 80px;">
                                     <div class="flex items-center">
                                         <span class="stock-display text-sm font-medium">-</span>
                                         <span class="ml-1 text-xs text-gray-500 unit-display"></span>
                                     </div>
                                 </td>
-                                <td class="px-4 py-2 border-r">
+                                <td class="px-4 py-2 border-r" style="width: 80px;">
                                     <input type="number" name="items[0][quantity]" step="0.001" min="0.001" class="w-full px-2 py-1 border border-gray-300 rounded text-sm quantity-input" placeholder="0.000" onchange="validateQuantity(this)" required>
                                 </td>
-                                <td class="px-4 py-2 text-center">
+                                <td class="px-4 py-2 text-center" style="width: 80px;">
                                     <button type="button" onclick="removeMrnItem(this)" class="text-red-600 hover:text-red-900 text-sm">Remove</button>
                                 </td>
                             </tr>
@@ -1264,18 +1375,18 @@ try {
                 </div>
                 
                 <div class="overflow-x-auto">
-                    <table class="min-w-full border border-gray-300">
+                    <table class="min-w-full border border-gray-300 table-fixed" style="min-width: 800px;">
                         <thead class="bg-gray-50">
                             <tr>
-                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase border-r">Item</th>
-                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase border-r">Available in Production</th>
-                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase border-r">Return Quantity</th>
-                                <th class="px-4 py-2 text-center text-xs font-medium text-gray-500 uppercase">Action</th>
+                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase border-r" style="width: calc(100% - 160px);">Item</th>
+                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase border-r" style="width: 80px;">Available</th>
+                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase border-r" style="width: 80px;">Quantity</th>
+                                <th class="px-4 py-2 text-center text-xs font-medium text-gray-500 uppercase" style="width: 80px;">Action</th>
                             </tr>
                         </thead>
                         <tbody id="returnItemsTable">
                             <tr class="return-item-row">
-                                <td class="px-4 py-2 border-r">
+                                <td class="px-4 py-2 border-r" style="width: calc(100% - 160px);">
                                     <select name="return_items[0][item_id]" class="w-full px-2 py-1 border border-gray-300 rounded text-sm item-select-return" onchange="updateStockReturn(this)" required>
                                         <option value="">Select Item</option>
                                         <?php foreach ($items as $item): ?>
@@ -1283,16 +1394,16 @@ try {
                                         <?php endforeach; ?>
                                     </select>
                                 </td>
-                                <td class="px-4 py-2 border-r">
+                                <td class="px-4 py-2 border-r" style="width: 80px;">
                                     <div class="flex items-center">
                                         <span class="stock-display text-sm font-medium">-</span>
                                         <span class="ml-1 text-xs text-gray-500 unit-display"></span>
                                     </div>
                                 </td>
-                                <td class="px-4 py-2 border-r">
+                                <td class="px-4 py-2 border-r" style="width: 80px;">
                                     <input type="number" name="return_items[0][quantity]" step="0.001" min="0.001" class="w-full px-2 py-1 border border-gray-300 rounded text-sm quantity-input" placeholder="0.000" onchange="validateQuantity(this)" required>
                                 </td>
-                                <td class="px-4 py-2 text-center">
+                                <td class="px-4 py-2 text-center" style="width: 80px;">
                                     <button type="button" onclick="removeReturnItem(this)" class="text-red-600 hover:text-red-900 text-sm">Remove</button>
                                 </td>
                             </tr>
@@ -1341,18 +1452,18 @@ try {
                 </div>
                 
                 <div class="overflow-x-auto">
-                    <table class="min-w-full border border-gray-300">
+                    <table class="min-w-full border border-gray-300 table-fixed" style="min-width: 800px;">
                         <thead class="bg-gray-50">
                             <tr>
-                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase border-r">Item</th>
-                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase border-r">Available in Production Floor</th>
-                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase border-r">Transfer Quantity</th>
-                                <th class="px-4 py-2 text-center text-xs font-medium text-gray-500 uppercase">Action</th>
+                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase border-r" style="width: calc(100% - 160px);">Item</th>
+                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase border-r" style="width: 80px;">Available</th>
+                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase border-r" style="width: 80px;">Quantity</th>
+                                <th class="px-4 py-2 text-center text-xs font-medium text-gray-500 uppercase" style="width: 80px;">Action</th>
                             </tr>
                         </thead>
                         <tbody id="transferItemsTable">
                             <tr class="transfer-item-row">
-                                <td class="px-4 py-2 border-r">
+                                <td class="px-4 py-2 border-r" style="width: calc(100% - 160px);">
                                     <select name="transfer_items[0][item_id]" class="w-full px-2 py-1 border border-gray-300 rounded text-sm item-select-transfer" onchange="updateTransferStock(this)" required>
                                         <option value="">Select Item</option>
                                         <?php foreach ($transfer_items as $item): ?>
@@ -1362,16 +1473,16 @@ try {
                                         <?php endforeach; ?>
                                     </select>
                                 </td>
-                                <td class="px-4 py-2 border-r">
+                                <td class="px-4 py-2 border-r" style="width: 80px;">
                                     <div class="flex items-center">
                                         <span class="stock-display text-sm font-medium">-</span>
                                         <span class="ml-1 text-xs text-gray-500 unit-display"></span>
                                     </div>
                                 </td>
-                                <td class="px-4 py-2 border-r">
+                                <td class="px-4 py-2 border-r" style="width: 80px;">
                                     <input type="number" name="transfer_items[0][quantity]" step="0.001" min="0.001" class="w-full px-2 py-1 border border-gray-300 rounded text-sm quantity-input" placeholder="0.000" onchange="validateTransferQuantity(this)" required>
                                 </td>
-                                <td class="px-4 py-2 text-center">
+                                <td class="px-4 py-2 text-center" style="width: 80px;">
                                     <button type="button" onclick="removeTransferItem(this)" class="text-red-600 hover:text-red-900 text-sm">Remove</button>
                                 </td>
                             </tr>
@@ -1388,27 +1499,44 @@ try {
     </div>
 </div>
 
-<!-- View MRN Details Modal (simple placeholder; hook up to your get_mrn_details.php) -->
-<div id="viewMrnModal" class="fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full modal-backdrop hidden">
-    <div class="relative top-4 mx-auto p-5 border w-11/12 max-w-7xl shadow-lg rounded-md bg-white">
-        <div class="flex justify-between items-center mb-6">
-            <h3 class="text-xl font-bold text-gray-900 flex items-center">
-                <svg class="w-6 h-6 mr-2 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg>
-                MRN Details
-            </h3>
-            <button onclick="closeModal('viewMrnModal')" class="text-gray-400 hover:text-gray-600 transition-colors">
-                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+<!-- MRN Details Modal - Shows full MRN information in readable format -->
+<div id="viewMrnModal" class="fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full modal-backdrop hidden z-50">
+    <div class="relative my-4 mx-auto p-6 w-11/12 max-w-4xl shadow-2xl rounded-lg bg-white">
+        <!-- Header -->
+        <div class="flex justify-between items-center mb-6 pb-4 border-b-2 border-gray-200">
+            <div class="flex items-center gap-3">
+                <svg class="w-8 h-8 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+                </svg>
+                <h2 class="text-2xl font-bold text-gray-900">MRN Details</h2>
+            </div>
+            <button onclick="closeModal('viewMrnModal')" class="text-gray-400 hover:text-gray-600 p-1 hover:bg-gray-100 rounded transition" title="Close (Esc)">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                </svg>
             </button>
         </div>
-        <div id="mrnDetailsContent" class="max-h-[calc(100vh-150px)] overflow-y-auto">
-            <div class="text-center py-8">
-                <svg class="w-12 h-12 text-gray-400 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg>
-                <h3 class="text-lg font-medium text-gray-900 mb-2">MRN Details</h3>
-                <p class="text-gray-600">Click "View" on any MRN/Return MRN to see detailed information.</p>
+        
+        <!-- Content Area -->
+        <div id="mrnDetailsContent" class="max-h-[calc(100vh-280px)] overflow-y-auto pr-3">
+            <!-- Placeholder content shown initially -->
+            <div class="text-center py-12">
+                <svg class="w-16 h-16 text-gray-300 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+                </svg>
+                <h3 class="text-lg font-medium text-gray-600 mt-2">MRN Details</h3>
+                <p class="text-gray-500 text-sm mt-1">Select a record to view details</p>
             </div>
         </div>
-        <div class="flex justify-end mt-6 pt-4 border-t border-gray-200">
-            <button onclick="closeModal('viewMrnModal')" class="px-6 py-2 bg-gray-500 text-white rounded-md hover:bg-gray-600 transition-colors">Close</button>
+        
+        <!-- Footer -->
+        <div class="flex justify-between items-center mt-6 pt-4 border-t border-gray-200">
+            <p class="text-sm text-gray-600">Last updated: <span id="lastUpdated">-</span></p>
+            <div class="flex gap-2">
+                <button onclick="closeModal('viewMrnModal')" class="px-6 py-2 bg-gray-600 text-white rounded-md hover:bg-gray-700 font-medium text-sm transition">
+                    Close
+                </button>
+            </div>
         </div>
     </div>
 </div>
@@ -1427,7 +1555,7 @@ function addMrnItem() {
     const row = document.createElement('tr');
     row.className = 'mrn-item-row';
     row.innerHTML = `
-        <td class="px-4 py-2 border-r">
+        <td class="px-4 py-2 border-r" style="width: calc(100% - 160px);">
             <select name="items[${mrnItemCount}][item_id]" class="w-full px-2 py-1 border border-gray-300 rounded text-sm item-select-mrn" onchange="updateStockMrn(this)" required>
                 <option value="">Select Item</option>
                 <?php foreach ($items as $item): ?>
@@ -1435,16 +1563,16 @@ function addMrnItem() {
                 <?php endforeach; ?>
             </select>
         </td>
-        <td class="px-4 py-2 border-r">
+        <td class="px-4 py-2 border-r" style="width: 80px;">
             <div class="flex items-center">
                 <span class="stock-display text-sm font-medium">-</span>
                 <span class="ml-1 text-xs text-gray-500 unit-display"></span>
             </div>
         </td>
-        <td class="px-4 py-2 border-r">
+        <td class="px-4 py-2 border-r" style="width: 80px;">
             <input type="number" name="items[${mrnItemCount}][quantity]" step="0.001" min="0.001" class="w-full px-2 py-1 border border-gray-300 rounded text-sm quantity-input" placeholder="0.000" onchange="validateQuantity(this)" required>
         </td>
-        <td class="px-4 py-2 text-center">
+        <td class="px-4 py-2 text-center" style="width: 80px;">
             <button type="button" onclick="removeMrnItem(this)" class="text-red-600 hover:text-red-900 text-sm">Remove</button>
         </td>
     `;
@@ -1462,7 +1590,7 @@ function addReturnItem() {
     const row = document.createElement('tr');
     row.className = 'return-item-row';
     row.innerHTML = `
-        <td class="px-4 py-2 border-r">
+        <td class="px-4 py-2 border-r" style="width: calc(100% - 160px);">
             <select name="return_items[${returnItemCount}][item_id]" class="w-full px-2 py-1 border border-gray-300 rounded text-sm item-select-return" onchange="updateStockReturn(this)" required>
                 <option value="">Select Item</option>
                 <?php foreach ($items as $item): ?>
@@ -1470,16 +1598,16 @@ function addReturnItem() {
                 <?php endforeach; ?>
             </select>
         </td>
-        <td class="px-4 py-2 border-r">
+        <td class="px-4 py-2 border-r" style="width: 80px;">
             <div class="flex items-center">
                 <span class="stock-display text-sm font-medium">-</span>
                 <span class="ml-1 text-xs text-gray-500 unit-display"></span>
             </div>
         </td>
-        <td class="px-4 py-2 border-r">
+        <td class="px-4 py-2 border-r" style="width: 80px;">
             <input type="number" name="return_items[${returnItemCount}][quantity]" step="0.001" min="0.001" class="w-full px-2 py-1 border border-gray-300 rounded text-sm quantity-input" placeholder="0.000" onchange="validateQuantity(this)" required>
         </td>
-        <td class="px-4 py-2 text-center">
+        <td class="px-4 py-2 text-center" style="width: 80px;">
             <button type="button" onclick="removeReturnItem(this)" class="text-red-600 hover:text-red-900 text-sm">Remove</button>
         </td>
     `;
@@ -1499,7 +1627,7 @@ function addTransferItem() {
     const row = document.createElement('tr');
     row.className = 'transfer-item-row';
     row.innerHTML = `
-        <td class="px-4 py-2 border-r">
+        <td class="px-4 py-2 border-r" style="width: 40%;">
             <select name="transfer_items[${transferItemCount}][item_id]" class="w-full px-2 py-1 border border-gray-300 rounded text-sm item-select-transfer" onchange="updateTransferStock(this)" required>
                 <option value="">Select Item</option>
                 <?php foreach ($transfer_items as $item): ?>
@@ -1509,16 +1637,16 @@ function addTransferItem() {
                 <?php endforeach; ?>
             </select>
         </td>
-        <td class="px-4 py-2 border-r">
+        <td class="px-4 py-2 border-r" style="width: 25%;">
             <div class="flex items-center">
                 <span class="stock-display text-sm font-medium">-</span>
                 <span class="ml-1 text-xs text-gray-500 unit-display"></span>
             </div>
         </td>
-        <td class="px-4 py-2 border-r">
+        <td class="px-4 py-2 border-r" style="width: 25%;">
             <input type="number" name="transfer_items[${transferItemCount}][quantity]" step="0.001" min="0.001" class="w-full px-2 py-1 border border-gray-300 rounded text-sm quantity-input" placeholder="0.000" onchange="validateTransferQuantity(this)" required>
         </td>
-        <td class="px-4 py-2 text-center">
+        <td class="px-4 py-2 text-center sticky right-0 bg-white border-l-2 border-gray-300" style="width: 80px;">
             <button type="button" onclick="removeTransferItem(this)" class="text-red-600 hover:text-red-900 text-sm">Remove</button>
         </td>
     `;
@@ -1596,8 +1724,16 @@ function validateTransferForm() {
 // ===== Stock helpers
 function fetchLocationSpecificStock(itemId, locationId, row) {
     const stockDisplay = row.querySelector('.stock-display');
+    const isCategoryRow = row.classList.contains('category-row');
+    
     stockDisplay.textContent = 'Loading...';
     stockDisplay.className = 'stock-display text-sm font-medium text-blue-600';
+    
+    // For category rows, hide the category total when loading
+    if (isCategoryRow) {
+        const categoryTotalSpan = row.querySelector('.category-total');
+        if (categoryTotalSpan) categoryTotalSpan.style.display = 'none';
+    }
     
     fetch(`get_current_stock.php?item_id=${itemId}&location_id=${locationId}`)
         .then(response => response.json())
@@ -1612,6 +1748,12 @@ function fetchLocationSpecificStock(itemId, locationId, row) {
                     (currentStock === 0 ? 'text-red-600' : currentStock < 50 ? 'text-yellow-600' : 'text-green-600');
                 
                 if (unitDisplay) unitDisplay.textContent = data.unit || '';
+                
+                // For category rows, keep the category total hidden when item is selected
+                if (isCategoryRow) {
+                    const categoryTotalSpan = row.querySelector('.category-total');
+                    if (categoryTotalSpan) categoryTotalSpan.style.display = 'none';
+                }
                 
                 quantityInput.setAttribute('max', currentStock);
                 
@@ -1638,11 +1780,21 @@ function fetchLocationSpecificStock(itemId, locationId, row) {
             } else {
                 stockDisplay.textContent = 'Error';
                 stockDisplay.className = 'stock-display text-sm font-medium text-red-600';
+                // For category rows, show category total again on error
+                if (isCategoryRow) {
+                    const categoryTotalSpan = row.querySelector('.category-total');
+                    if (categoryTotalSpan) categoryTotalSpan.style.display = 'inline';
+                }
             }
         })
         .catch(() => {
             stockDisplay.textContent = 'Error';
             stockDisplay.className = 'stock-display text-sm font-medium text-red-600';
+            // For category rows, show category total again on error
+            if (isCategoryRow) {
+                const categoryTotalSpan = row.querySelector('.category-total');
+                if (categoryTotalSpan) categoryTotalSpan.style.display = 'inline';
+            }
         });
 }
 
@@ -1663,7 +1815,17 @@ function resetStockDisplay(row) {
     const stockDisplay = row.querySelector('.stock-display');
     const unitDisplay = row.querySelector('.unit-display');
     const quantityInput = row.querySelector('.quantity-input');
-    stockDisplay.textContent = '-';
+    const isCategoryRow = row.classList.contains('category-row');
+    
+    if (isCategoryRow) {
+        stockDisplay.textContent = 'Select item first';
+        // Show category total for category rows
+        const categoryTotalSpan = row.querySelector('.category-total');
+        if (categoryTotalSpan) categoryTotalSpan.style.display = 'inline';
+    } else {
+        stockDisplay.textContent = '-';
+    }
+    
     stockDisplay.className = 'stock-display text-sm font-medium';
     if (unitDisplay) unitDisplay.textContent = '';
     quantityInput.removeAttribute('max');
@@ -1722,55 +1884,105 @@ document.getElementById('load_materials_btn').addEventListener('click', function
             const table = document.getElementById('mrnItemsTable');
             const existingItems = new Map(); // item_id to row index
 
-            // Build map of existing items
+            // Build map of existing items and categories
             Array.from(table.rows).forEach((row, index) => {
                 const select = row.querySelector('.item-select-mrn');
-                if (select) {
-                    const itemId = select.value;
-                    if (itemId) {
-                        existingItems.set(itemId, index);
-                    }
+                if (select && select.value) {
+                    existingItems.set(select.value, index);
+                }
+                // Also check for category rows
+                const categoryIdInput = row.querySelector('input[name*="[category_id]"]');
+                if (categoryIdInput && categoryIdInput.value) {
+                    existingItems.set('category_' + categoryIdInput.value, index);
                 }
             });
 
             data.materials.forEach(material => {
-                const itemId = material.item_id.toString();
-                if (existingItems.has(itemId)) {
-                    // Update existing row: add to quantity
-                    const rowIndex = existingItems.get(itemId);
-                    const row = table.rows[rowIndex];
-                    const quantityInput = row.querySelector('.quantity-input');
-                    const currentQty = parseFloat(quantityInput.value || 0);
-                    const newQty = currentQty + parseFloat(material.required_quantity);
-                    quantityInput.value = newQty.toFixed(3);
-                    // Re-validate stock for this row
-                    updateStockMrn(row.querySelector('.item-select-mrn'));
+                if (material.is_category) {
+                    // Check if this category already exists
+                    const categoryKey = 'category_' + material.category_id;
+                    if (existingItems.has(categoryKey)) {
+                        // Update existing category row: add to quantity
+                        const rowIndex = existingItems.get(categoryKey);
+                        const row = table.rows[rowIndex];
+                        const quantityInput = row.querySelector('.quantity-input');
+                        const currentQty = parseFloat(quantityInput.value || 0);
+                        const newQty = currentQty + parseFloat(material.required_quantity);
+                        quantityInput.value = newQty.toFixed(3);
+                        // Update max to reflect combined total stock
+                        const currentMax = parseFloat(quantityInput.getAttribute('max') || 0);
+                        quantityInput.setAttribute('max', (currentMax + parseFloat(material.total_available_stock)).toFixed(3));
+                        // Re-validate quantity
+                        validateQuantity(quantityInput);
+                    } else {
+                        // Category-based material - use all items in category proportionally
+                        const row = table.insertRow();
+                        row.className = 'mrn-item-row category-row';
+                        row.innerHTML = `
+                            <td class="px-4 py-2 border-r w-2/5">
+                                <div class="flex flex-col">
+                                    <span class="text-sm font-medium text-gray-700">${material.category_name} (Category)</span>
+                                    <span class="text-xs text-gray-600">Will use all items in this category proportionally</span>
+                                    <input type="hidden" name="items[${mrnItemCount}][category_id]" value="${material.category_id}">
+                                    <input type="hidden" name="items[${mrnItemCount}][is_category]" value="1">
+                                </div>
+                            </td>
+                            <td class="px-4 py-2 border-r w-1/4">
+                                <div class="flex items-center">
+                                    <span class="stock-display text-sm font-medium ${parseFloat(material.total_available_stock) === 0 ? 'text-red-600' : parseFloat(material.total_available_stock) < 50 ? 'text-yellow-600' : 'text-green-600'}">${parseFloat(material.total_available_stock).toFixed(3)}</span>
+                                    <span class="ml-1 text-xs text-gray-500 unit-display">${material.uom}</span>
+                                    <span class="ml-2 text-xs text-gray-600">(Total category stock)</span>
+                                </div>
+                            </td>
+                            <td class="px-4 py-2 border-r w-1/4">
+                                <input type="number" name="items[${mrnItemCount}][quantity]" step="0.001" min="0.001" max="${parseFloat(material.total_available_stock)}" value="${parseFloat(material.required_quantity).toFixed(3)}" class="w-full px-2 py-1 border border-gray-300 rounded text-sm quantity-input" placeholder="0.000" onchange="validateQuantity(this)" required>
+                            </td>
+                            <td class="px-4 py-2 text-center w-20 sticky right-0 bg-white border-l-2 border-gray-300">
+                                <button type="button" onclick="removeMrnItem(this)" class="text-red-600 hover:text-red-900 text-sm">Remove</button>
+                            </td>
+                        `;
+                        mrnItemCount++;
+                    }
                 } else {
-                    // Add new row
-                    const row = table.insertRow();
-                    row.className = 'mrn-item-row';
-                    row.innerHTML = `
-                        <td class="px-4 py-2 border-r">
-                            <select name="items[${mrnItemCount}][item_id]" class="w-full px-2 py-1 border border-gray-300 rounded text-sm item-select-mrn" onchange="updateStockMrn(this)" required>
-                                <option value="${material.item_id}" selected>${material.item_name} (${material.item_code})</option>
-                            </select>
-                        </td>
-                        <td class="px-4 py-2 border-r">
-                            <div class="flex items-center">
-                                <span class="stock-display text-sm font-medium text-blue-600">Loading...</span>
-                                <span class="ml-1 text-xs text-gray-500 unit-display">${material.uom}</span>
-                            </div>
-                        </td>
-                        <td class="px-4 py-2 border-r">
-                            <input type="number" name="items[${mrnItemCount}][quantity]" step="0.001" min="0.001" value="${parseFloat(material.required_quantity).toFixed(3)}" class="w-full px-2 py-1 border border-gray-300 rounded text-sm quantity-input" placeholder="0.000" onchange="validateQuantity(this)" required>
-                        </td>
-                        <td class="px-4 py-2 text-center">
-                            <button type="button" onclick="removeMrnItem(this)" class="text-red-600 hover:text-red-900 text-sm">Remove</button>
-                        </td>
-                    `;
-                    // Trigger stock update for the new row
-                    updateStockMrn(row.querySelector('.item-select-mrn'));
-                    mrnItemCount++;
+                    // Normal material - check if already exists
+                    const itemId = material.item_id.toString();
+                    if (existingItems.has(itemId)) {
+                        // Update existing row: add to quantity
+                        const rowIndex = existingItems.get(itemId);
+                        const row = table.rows[rowIndex];
+                        const quantityInput = row.querySelector('.quantity-input');
+                        const currentQty = parseFloat(quantityInput.value || 0);
+                        const newQty = currentQty + parseFloat(material.required_quantity);
+                        quantityInput.value = newQty.toFixed(3);
+                        // Re-validate stock for this row
+                        updateStockMrn(row.querySelector('.item-select-mrn'));
+                    } else {
+                        // Add new row for normal material
+                        const row = table.insertRow();
+                        row.className = 'mrn-item-row';
+                        row.innerHTML = `
+                            <td class="px-4 py-2 border-r">
+                                <select name="items[${mrnItemCount}][item_id]" class="w-full px-2 py-1 border border-gray-300 rounded text-sm item-select-mrn" onchange="updateStockMrn(this)" required>
+                                    <option value="${material.item_id}" selected>${material.item_name} (${material.item_code})</option>
+                                </select>
+                            </td>
+                            <td class="px-4 py-2 border-r">
+                                <div class="flex items-center">
+                                    <span class="stock-display text-sm font-medium text-blue-600">Loading...</span>
+                                    <span class="ml-1 text-xs text-gray-500 unit-display">${material.uom}</span>
+                                </div>
+                            </td>
+                            <td class="px-4 py-2 border-r">
+                                <input type="number" name="items[${mrnItemCount}][quantity]" step="0.001" min="0.001" value="${parseFloat(material.required_quantity).toFixed(3)}" class="w-full px-2 py-1 border border-gray-300 rounded text-sm quantity-input" placeholder="0.000" onchange="validateQuantity(this)" required>
+                            </td>
+                            <td class="px-4 py-2 text-center">
+                                <button type="button" onclick="removeMrnItem(this)" class="text-red-600 hover:text-red-900 text-sm">Remove</button>
+                            </td>
+                        `;
+                        // Trigger stock update for the new row
+                        updateStockMrn(row.querySelector('.item-select-mrn'));
+                        mrnItemCount++;
+                    }
                 }
             });
 
@@ -1783,25 +1995,38 @@ document.getElementById('load_materials_btn').addEventListener('click', function
 });
 
 // Basic validators (can be extended)
-function validateMrnForm(){ return true; }
+function validateMrnForm(){
+    // All validations are now handled by HTML required attributes and quantity validation
+    return true;
+}
 function validateReturnForm(){ return true; }
 
-// View details (placeholder; expects your get_mrn_details.php to return JSON)
+// Fetch and display MRN details
 function viewMrnDetails(mrnId) {
+    if (!mrnId || isNaN(mrnId)) {
+        showMrnError('Invalid MRN ID');
+        return;
+    }
+    
     openModal('viewMrnModal');
     showMrnLoading();
-    fetch(`get_mrn_details.php?mrn_id=${mrnId}`)
-        .then(r => r.text())
-        .then(t => {
-            try {
-                const data = JSON.parse(t);
-                if (data.success) displayMrnDetails(data);
-                else showMrnError(data.message || 'Unknown error occurred');
-            } catch(e) {
-                showMrnError('Invalid response from server: ' + t.substring(0, 200));
+    
+    fetch(`get_mrn_details.php?mrn_id=${encodeURIComponent(mrnId)}`)
+        .then(r => {
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            return r.json();
+        })
+        .then(data => {
+            if (data.success && data.mrn) {
+                displayMrnDetails(data);
+            } else {
+                showMrnError(data.message || 'No data found');
             }
         })
-        .catch(err => showMrnError(`Network error: ${err.message}`));
+        .catch(err => {
+            console.error('MRN View Error:', err);
+            showMrnError(`Error: ${err.message}`);
+        });
 }
 
 function showMrnLoading() {
@@ -1819,7 +2044,92 @@ function showMrnLoading() {
 
 function displayMrnDetails(data) {
     const content = document.getElementById('mrnDetailsContent');
-    content.innerHTML = `<pre class="p-4 bg-gray-50 rounded border overflow-auto text-xs">${JSON.stringify(data, null, 2)}</pre>`;
+    
+    if (!data.mrn || !data.items) {
+        showMrnError('Invalid data format received from server');
+        return;
+    }
+    
+    const mrn = data.mrn;
+    const items = data.items || [];
+    
+    let itemsHtml = '';
+    if (items.length > 0) {
+        itemsHtml = `
+            <table class="w-full border-collapse">
+                <thead>
+                    <tr class="bg-gray-100 border-b-2 border-gray-300">
+                        <th class="text-left px-4 py-2 font-semibold text-gray-700">Item Name</th>
+                        <th class="text-left px-4 py-2 font-semibold text-gray-700">Code</th>
+                        <th class="text-right px-4 py-2 font-semibold text-gray-700">Quantity</th>
+                        <th class="text-left px-4 py-2 font-semibold text-gray-700">Unit</th>
+                        <th class="text-left px-4 py-2 font-semibold text-gray-700">Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${items.map((item, idx) => `
+                        <tr class="${idx % 2 === 0 ? 'bg-white' : 'bg-gray-50'} border-b border-gray-200 hover:bg-blue-50">
+                            <td class="px-4 py-3 text-gray-900">${escapeHtml(item.item_name || 'N/A')}</td>
+                            <td class="px-4 py-3 text-gray-600 font-mono">${escapeHtml(item.item_code || 'N/A')}</td>
+                            <td class="px-4 py-3 text-right font-semibold">${parseFloat(item.quantity || 0).toFixed(3)}</td>
+                            <td class="px-4 py-3 text-gray-600">${escapeHtml(item.unit || 'kg')}</td>
+                            <td class="px-4 py-3"><span class="inline-block px-2 py-1 text-xs font-semibold rounded ${getStatusColor(item.status)}">${escapeHtml(item.status || 'pending')}</span></td>
+                        </tr>
+                    `).join('')}
+                </tbody>
+            </table>
+        `;
+    } else {
+        itemsHtml = '<p class="text-gray-600 mt-4 text-center">No items found</p>';
+    }
+    
+    const totalQty = items.reduce((sum, item) => sum + parseFloat(item.quantity || 0), 0);
+    
+    content.innerHTML = `
+        <div class="space-y-6">
+            <div class="grid grid-cols-2 gap-4 md:grid-cols-4 bg-gray-50 p-4 rounded-lg border border-gray-200">
+                <div><p class="text-xs font-semibold text-gray-500 uppercase">MRN No</p><p class="text-lg font-bold text-gray-900 font-mono mt-1">${escapeHtml(mrn.mrn_no || 'N/A')}</p></div>
+                <div><p class="text-xs font-semibold text-gray-500 uppercase">Date</p><p class="text-lg font-bold text-gray-900 mt-1">${escapeHtml(mrn.mrn_date || 'N/A')}</p></div>
+                <div><p class="text-xs font-semibold text-gray-500 uppercase">Status</p><p class="text-lg font-bold mt-1"><span class="inline-block px-3 py-1 text-sm rounded-full font-semibold ${getStatusColor(mrn.status)}">${escapeHtml(mrn.status || 'pending')}</span></p></div>
+                <div><p class="text-xs font-semibold text-gray-500 uppercase">Items</p><p class="text-lg font-bold text-gray-900 mt-1">${items.length}</p></div>
+            </div>
+            
+            <div class="bg-blue-50 border-l-4 border-blue-500 p-4 rounded">
+                <p class="text-xs font-semibold text-gray-600 uppercase mb-1">Purpose</p>
+                <p class="text-gray-900 text-base">${escapeHtml(mrn.purpose || 'No purpose specified')}</p>
+            </div>
+            
+            <div>
+                <h4 class="text-lg font-semibold text-gray-900 mb-3">Materials Requested</h4>
+                ${itemsHtml}
+            </div>
+            
+            <div class="bg-green-50 border border-green-200 p-4 rounded-lg">
+                <h4 class="font-semibold text-green-900 mb-2">Summary</h4>
+                <dl class="grid grid-cols-2 gap-2 text-sm">
+                    <dt class="text-gray-700">Total Items:</dt><dd class="font-semibold">${items.length}</dd>
+                    <dt class="text-gray-700">Total Quantity:</dt><dd class="font-semibold">${totalQty.toFixed(3)} kg</dd>
+                    <dt class="text-gray-700">Created:</dt><dd class="font-semibold">${escapeHtml(mrn.created_at ? mrn.created_at.split(' ')[0] : 'N/A')}</dd>
+                </dl>
+            </div>
+        </div>
+    `;
+}
+
+function getStatusColor(status) {
+    const colors = {
+        'pending': 'bg-yellow-100 text-yellow-800',
+        'approved': 'bg-blue-100 text-blue-800',
+        'issued': 'bg-green-100 text-green-800',
+        'completed': 'bg-green-100 text-green-800',
+        'rejected': 'bg-red-100 text-red-800'
+    };
+    return colors[status?.toLowerCase()] || 'bg-gray-100 text-gray-800';
+}
+
+function escapeHtml(text) {
+    const map = {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'};
+    return String(text).replace(/[&<>"']/g, char => map[char]);
 }
 
 function showMrnError(message) {

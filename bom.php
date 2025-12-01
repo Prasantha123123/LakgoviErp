@@ -535,6 +535,11 @@ try {
     $raw_materials = [];
 }
 
+/* Pagination and Tab Variables */
+$items_per_page = 10;
+$current_page = isset($_GET['page']) ? max(1, intval($_GET['page'])) : 1;
+$active_tab = isset($_GET['tab']) ? $_GET['tab'] : 'peetu'; // peetu, direct_bom, bom_product
+
 /* Group Peetu rows by peetu (semi-finished) */
 $grouped_peetu = [];
 // Debug: Log the raw rows before grouping
@@ -612,6 +617,12 @@ $peetu_stats = [
     'can_produce'      => count(array_filter($grouped_peetu, fn($b) => $b['can_produce'])),
     'cannot_produce'   => count(array_filter($grouped_peetu, fn($b) => !$b['can_produce']))
 ];
+
+/* Paginate Peetu */
+$total_peetu = count($grouped_peetu);
+$total_peetu_pages = ceil($total_peetu / $items_per_page);
+$peetu_offset = ($current_page - 1) * $items_per_page;
+$grouped_peetu_paginated = array_slice($grouped_peetu, $peetu_offset, $items_per_page, true);
 
 /* BOM Product rows (Finished → Peetu) */
 $bomprod_rows = [];
@@ -715,28 +726,82 @@ foreach ($direct_bom_rows as $r) {
         $grouped_direct_bom[$key]['can_produce'] = false;
     }
 }
+
+/* Pagination and Tab Variables */
+$items_per_page = 10;
+$current_page = isset($_GET['page']) ? max(1, intval($_GET['page'])) : 1;
+$active_tab = isset($_GET['tab']) ? $_GET['tab'] : 'peetu'; // peetu, direct_bom, bom_product
+
+/* Paginate Peetu */
+$total_peetu = count($grouped_peetu);
+$total_peetu_pages = $total_peetu > 0 ? ceil($total_peetu / $items_per_page) : 1;
+$peetu_offset = ($current_page - 1) * $items_per_page;
+$grouped_peetu_paginated = array_slice($grouped_peetu, $peetu_offset, $items_per_page, true);
+
+/* Paginate Direct BOM */
+$total_direct_bom = count($grouped_direct_bom);
+$total_direct_bom_pages = $total_direct_bom > 0 ? ceil($total_direct_bom / $items_per_page) : 1;
+$direct_bom_offset = ($current_page - 1) * $items_per_page;
+$grouped_direct_bom_paginated = array_slice($grouped_direct_bom, $direct_bom_offset, $items_per_page, true);
+
+/* Paginate BOM Product */
+$total_bom_product = count($grouped_bomprod);
+$total_bom_product_pages = $total_bom_product > 0 ? ceil($total_bom_product / $items_per_page) : 1;
+$bom_product_offset = ($current_page - 1) * $items_per_page;
+$grouped_bomprod_paginated = array_slice($grouped_bomprod, $bom_product_offset, $items_per_page, true);
 ?>
 
 <div class="space-y-10">
     <!-- Page Header -->
     <div class="flex justify-between items-center">
         <div>
-            <h1 class="text-3xl font-bold text-gray-900">Peetu (Semi-Finished) Map</h1>
-            <p class="text-gray-600">Define raw material requirements per unit of Semi-Finished (Peetu).</p>
+            <h1 class="text-3xl font-bold text-gray-900">Bill of Materials (BOM)</h1>
+            <p class="text-gray-600">Manage Peetu, Direct BOM, and BOM Product mappings</p>
         </div>
         <div class="flex gap-2">
             <button onclick="openModal('copyBomModal')" class="bg-green-600 text-white px-4 py-2 rounded-md hover:bg-green-700 transition-colors">
                 Copy Peetu Map
             </button>
-            <button onclick="openCreatePeetu()" class="bg-primary text-white px-4 py-2 rounded-md hover:bg-blue-600 transition-colors">
-                Add Peetu Entry
-            </button>
-            <button onclick="openCreateDirectBom()" class="bg-purple-600 text-white px-4 py-2 rounded-md hover:bg-purple-700 transition-colors">
-                Add Direct BOM
-            </button>
-            <button onclick="openCreateBomProduct()" class="bg-indigo-600 text-white px-4 py-2 rounded-md hover:bg-indigo-700 transition-colors">
-                Add BOM Product
-            </button>
+            <?php if ($active_tab === 'peetu'): ?>
+                <button onclick="openCreatePeetu()" class="bg-primary text-white px-4 py-2 rounded-md hover:bg-blue-600 transition-colors">
+                    Add Peetu Entry
+                </button>
+            <?php elseif ($active_tab === 'direct_bom'): ?>
+                <button onclick="openCreateDirectBom()" class="bg-purple-600 text-white px-4 py-2 rounded-md hover:bg-purple-700 transition-colors">
+                    Add Direct BOM
+                </button>
+            <?php elseif ($active_tab === 'bom_product'): ?>
+                <button onclick="openCreateBomProduct()" class="bg-indigo-600 text-white px-4 py-2 rounded-md hover:bg-indigo-700 transition-colors">
+                    Add BOM Product
+                </button>
+            <?php endif; ?>
+        </div>
+    </div>
+
+    <!-- Tab Navigation -->
+    <div class="bg-white shadow rounded-lg">
+        <div class="flex border-b border-gray-200">
+            <a href="?tab=peetu&page=1" class="<?php echo $active_tab === 'peetu' ? 'bg-blue-50 border-b-2 border-blue-600 text-blue-600' : 'text-gray-600 hover:text-gray-900 hover:bg-gray-50'; ?> px-6 py-3 font-medium text-sm transition-colors">
+                <div class="flex items-center gap-2">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+                    <span>Peetu (Semi-Finished)</span>
+                    <span class="bg-gray-200 text-gray-700 px-2 py-0.5 rounded-full text-xs"><?php echo $total_peetu; ?></span>
+                </div>
+            </a>
+            <a href="?tab=direct_bom&page=1" class="<?php echo $active_tab === 'direct_bom' ? 'bg-purple-50 border-b-2 border-purple-600 text-purple-600' : 'text-gray-600 hover:text-gray-900 hover:bg-gray-50'; ?> px-6 py-3 font-medium text-sm transition-colors">
+                <div class="flex items-center gap-2">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+                    <span>Direct BOM</span>
+                    <span class="bg-gray-200 text-gray-700 px-2 py-0.5 rounded-full text-xs"><?php echo $total_direct_bom; ?></span>
+                </div>
+            </a>
+            <a href="?tab=bom_product&page=1" class="<?php echo $active_tab === 'bom_product' ? 'bg-indigo-50 border-b-2 border-indigo-600 text-indigo-600' : 'text-gray-600 hover:text-gray-900 hover:bg-gray-50'; ?> px-6 py-3 font-medium text-sm transition-colors">
+                <div class="flex items-center gap-2">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"/></svg>
+                    <span>BOM Product</span>
+                    <span class="bg-gray-200 text-gray-700 px-2 py-0.5 rounded-full text-xs"><?php echo $total_bom_product; ?></span>
+                </div>
+            </a>
         </div>
     </div>
 
@@ -748,6 +813,7 @@ foreach ($direct_bom_rows as $r) {
         <div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded"><?php echo $error; ?></div>
     <?php endif; ?>
 
+    <!-- Tab Content -->   <?php if ($active_tab === 'peetu'): ?>
     <!-- Peetu Stats -->
     <div class="grid grid-cols-1 md:grid-cols-4 gap-6">
         <div class="bg-white p-6 rounded-lg shadow">
@@ -797,9 +863,9 @@ foreach ($direct_bom_rows as $r) {
     </div>
 
     <!-- Peetu Cards -->
-    <?php if (!empty($grouped_peetu)): ?>
+    <?php if (!empty($grouped_peetu_paginated)): ?>
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            <?php foreach ($grouped_peetu as $item_bom): ?>
+            <?php foreach ($grouped_peetu_paginated as $item_bom): ?>
             <div class="bg-white rounded-lg shadow hover:shadow-md transition-shadow <?php echo !$item_bom['can_produce'] ? 'ring-2 ring-red-200' : ''; ?>">
                 <div class="p-6">
                     <div class="flex justify-between items-start mb-4">
@@ -880,14 +946,39 @@ foreach ($direct_bom_rows as $r) {
         </div>
     <?php endif; ?>
 
+    <!-- Peetu Pagination -->
+    <?php if ($total_peetu_pages > 1): ?>
+    <div class="flex justify-center items-center gap-2 mt-6">
+        <?php if ($current_page > 1): ?>
+            <a href="?tab=peetu&page=<?php echo $current_page - 1; ?>" class="px-4 py-2 bg-white border border-gray-300 rounded-md hover:bg-gray-50">Previous</a>
+        <?php endif; ?>
+        
+        <?php for ($i = 1; $i <= $total_peetu_pages; $i++): ?>
+            <?php if ($i == 1 || $i == $total_peetu_pages || abs($i - $current_page) <= 2): ?>
+                <a href="?tab=peetu&page=<?php echo $i; ?>" class="px-4 py-2 <?php echo $i == $current_page ? 'bg-blue-600 text-white' : 'bg-white border border-gray-300 hover:bg-gray-50'; ?> rounded-md">
+                    <?php echo $i; ?>
+                </a>
+            <?php elseif (abs($i - $current_page) == 3): ?>
+                <span class="px-2 py-2 text-gray-500">...</span>
+            <?php endif; ?>
+        <?php endfor; ?>
+        
+        <?php if ($current_page < $total_peetu_pages): ?>
+            <a href="?tab=peetu&page=<?php echo $current_page + 1; ?>" class="px-4 py-2 bg-white border border-gray-300 rounded-md hover:bg-gray-50">Next</a>
+        <?php endif; ?>
+    </div>
+    <?php endif; ?>
+    <?php endif; // End Peetu Tab ?>
+
     <!-- ====================== DIRECT BOM SECTION ====================== -->
-    <div class="pt-6">
+    <?php if ($active_tab === 'direct_bom'): ?>
+    <div>
         <h2 class="text-2xl font-bold text-gray-900 mb-4">Direct BOM (Finished → Raw Materials)</h2>
         <p class="text-gray-600 mb-6">Finished products made directly from raw materials without Peetu intermediates.</p>
 
-        <?php if (!empty($grouped_direct_bom)): ?>
+        <?php if (!empty($grouped_direct_bom_paginated)): ?>
             <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                <?php foreach ($grouped_direct_bom as $item_bom): ?>
+                <?php foreach ($grouped_direct_bom_paginated as $item_bom): ?>
                 <div class="bg-white rounded-lg shadow hover:shadow-md transition-shadow <?php echo !$item_bom['can_produce'] ? 'ring-2 ring-red-200' : ''; ?>">
                     <div class="p-6">
                         <div class="flex justify-between items-start mb-4">
@@ -961,15 +1052,40 @@ foreach ($direct_bom_rows as $r) {
                 <button onclick="openCreateDirectBom()" class="bg-purple-600 text-white px-4 py-2 rounded-md hover:bg-purple-700 transition-colors">Add Direct BOM</button>
             </div>
         <?php endif; ?>
+        
+        <!-- Direct BOM Pagination -->
+        <?php if ($total_direct_bom_pages > 1): ?>
+        <div class="flex justify-center items-center gap-2 mt-6">
+            <?php if ($current_page > 1): ?>
+                <a href="?tab=direct_bom&page=<?php echo $current_page - 1; ?>" class="px-4 py-2 bg-white border border-gray-300 rounded-md hover:bg-gray-50">Previous</a>
+            <?php endif; ?>
+            
+            <?php for ($i = 1; $i <= $total_direct_bom_pages; $i++): ?>
+                <?php if ($i == 1 || $i == $total_direct_bom_pages || abs($i - $current_page) <= 2): ?>
+                    <a href="?tab=direct_bom&page=<?php echo $i; ?>" class="px-4 py-2 <?php echo $i == $current_page ? 'bg-purple-600 text-white' : 'bg-white border border-gray-300 hover:bg-gray-50'; ?> rounded-md">
+                        <?php echo $i; ?>
+                    </a>
+                <?php elseif (abs($i - $current_page) == 3): ?>
+                    <span class="px-2 py-2 text-gray-500">...</span>
+                <?php endif; ?>
+            <?php endfor; ?>
+            
+            <?php if ($current_page < $total_direct_bom_pages): ?>
+                <a href="?tab=direct_bom&page=<?php echo $current_page + 1; ?>" class="px-4 py-2 bg-white border border-gray-300 rounded-md hover:bg-gray-50">Next</a>
+            <?php endif; ?>
+        </div>
+        <?php endif; ?>
     </div>
+    <?php endif; // End Direct BOM Tab ?>
 
     <!-- ====================== BOM PRODUCT SECTION ====================== -->
-    <div class="pt-6">
+    <?php if ($active_tab === 'bom_product'): ?>
+    <div>
         <h2 class="text-2xl font-bold text-gray-900 mb-4">BOM Product (Finished → Peetu)</h2>
 
-        <?php if (!empty($grouped_bomprod)): ?>
+        <?php if (!empty($grouped_bomprod_paginated)): ?>
             <div class="grid grid-cols-1 gap-6">
-                <?php foreach ($grouped_bomprod as $grp): ?>
+                <?php foreach ($grouped_bomprod_paginated as $grp): ?>
                 <div class="bg-white rounded-lg shadow p-6">
                     <div class="mb-3">
                         <h3 class="text-lg font-semibold text-gray-900"><?php echo htmlspecialchars($grp['item_name']); ?></h3>
@@ -1033,6 +1149,31 @@ foreach ($direct_bom_rows as $r) {
                 </button>
             </div>
         <?php endif; ?>
+        
+        <!-- BOM Product Pagination -->
+        <?php if ($total_bom_product_pages > 1): ?>
+        <div class="flex justify-center items-center gap-2 mt-6">
+            <?php if ($current_page > 1): ?>
+                <a href="?tab=bom_product&page=<?php echo $current_page - 1; ?>" class="px-4 py-2 bg-white border border-gray-300 rounded-md hover:bg-gray-50">Previous</a>
+            <?php endif; ?>
+            
+            <?php for ($i = 1; $i <= $total_bom_product_pages; $i++): ?>
+                <?php if ($i == 1 || $i == $total_bom_product_pages || abs($i - $current_page) <= 2): ?>
+                    <a href="?tab=bom_product&page=<?php echo $i; ?>" class="px-4 py-2 <?php echo $i == $current_page ? 'bg-indigo-600 text-white' : 'bg-white border border-gray-300 hover:bg-gray-50'; ?> rounded-md">
+                        <?php echo $i; ?>
+                    </a>
+                <?php elseif (abs($i - $current_page) == 3): ?>
+                    <span class="px-2 py-2 text-gray-500">...</span>
+                <?php endif; ?>
+            <?php endfor; ?>
+            
+            <?php if ($current_page < $total_bom_product_pages): ?>
+                <a href="?tab=bom_product&page=<?php echo $current_page + 1; ?>" class="px-4 py-2 bg-white border border-gray-300 rounded-md hover:bg-gray-50">Next</a>
+            <?php endif; ?>
+        </div>
+        <?php endif; ?>
+    </div>
+    <?php endif; // End BOM Product Tab ?>
     </div>
 </div>
 

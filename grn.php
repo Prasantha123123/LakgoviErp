@@ -24,7 +24,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                     ]);
                     $grn_id = $db->lastInsertId();
                     
-                    // Insert GRN items and update stock ledger
+                    // Insert GRN items (without stock updates)
                     foreach ($_POST['items'] as $item) {
                         if (!empty($item['item_id']) && !empty($item['quantity'])) {
                             // Insert GRN item
@@ -38,38 +38,66 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                                 $item['rate'], 
                                 $item['amount']
                             ]);
-                            
-                            // Update PO item received quantity if linked to PO
-                            if (!empty($item['po_item_id'])) {
-                                $stmt = $db->prepare("UPDATE po_items SET received_quantity = received_quantity + ? WHERE id = ?");
-                                $stmt->execute([$item['quantity'], $item['po_item_id']]);
-                            }
-                            
-                            // Get current balance for stock ledger
-                            $stmt = $db->prepare("
-                                SELECT COALESCE(SUM(quantity_in - quantity_out), 0) as current_balance 
-                                FROM stock_ledger 
-                                WHERE item_id = ? AND location_id = ?
-                            ");
-                            $stmt->execute([$item['item_id'], $item['location_id']]);
-                            $current_balance = $stmt->fetch()['current_balance'];
-                            $new_balance = $current_balance + $item['quantity'];
-                            
-                            // Update stock ledger
-                            $stmt = $db->prepare("
-                                INSERT INTO stock_ledger (item_id, location_id, transaction_type, reference_id, reference_no, transaction_date, quantity_in, balance)
-                                VALUES (?, ?, 'grn', ?, ?, ?, ?, ?)
-                            ");
-                            $stmt->execute([$item['item_id'], $item['location_id'], $grn_id, $_POST['grn_no'], $_POST['grn_date'], $item['quantity'], $new_balance]);
-                            
-                            // Update item current stock
-                            $stmt = $db->prepare("UPDATE items SET current_stock = current_stock + ? WHERE id = ?");
-                            $stmt->execute([$item['quantity'], $item['item_id']]);
                         }
+                    }
+
+                    
+                    $db->commit();
+                    $success = "GRN created successfully!";
+                    break;
+                    
+                case 'complete':
+                    $db->beginTransaction();
+                    
+                    // Get GRN details
+                    $stmt = $db->prepare("SELECT * FROM grn WHERE id = ?");
+                    $stmt->execute([$_POST['id']]);
+                    $grn = $stmt->fetch();
+                    
+                    if (!$grn) {
+                        throw new Exception("GRN not found");
+                    }
+                    
+                    if ($grn['status'] === 'completed') {
+                        throw new Exception("GRN is already completed");
+                    }
+                    
+                    // Get GRN items and update stock ledger
+                    $stmt = $db->prepare("SELECT * FROM grn_items WHERE grn_id = ?");
+                    $stmt->execute([$_POST['id']]);
+                    $grn_items = $stmt->fetchAll();
+                    
+                    foreach ($grn_items as $item) {
+                        // Update PO item received quantity if linked to PO
+                        if (!empty($item['po_item_id'])) {
+                            $stmt = $db->prepare("UPDATE po_items SET received_quantity = received_quantity + ? WHERE id = ?");
+                            $stmt->execute([$item['quantity'], $item['po_item_id']]);
+                        }
+                        
+                        // Get current balance for stock ledger
+                        $stmt = $db->prepare("
+                            SELECT COALESCE(SUM(quantity_in - quantity_out), 0) as current_balance 
+                            FROM stock_ledger 
+                            WHERE item_id = ? AND location_id = ?
+                        ");
+                        $stmt->execute([$item['item_id'], $item['location_id']]);
+                        $current_balance = $stmt->fetch()['current_balance'];
+                        $new_balance = $current_balance + $item['quantity'];
+                        
+                        // Update stock ledger
+                        $stmt = $db->prepare("
+                            INSERT INTO stock_ledger (item_id, location_id, transaction_type, reference_id, reference_no, transaction_date, quantity_in, balance)
+                            VALUES (?, ?, 'grn', ?, ?, ?, ?, ?)
+                        ");
+                        $stmt->execute([$item['item_id'], $item['location_id'], $_POST['id'], $grn['grn_no'], $grn['grn_date'], $item['quantity'], $new_balance]);
+                        
+                        // Update item current stock
+                        $stmt = $db->prepare("UPDATE items SET current_stock = current_stock + ? WHERE id = ?");
+                        $stmt->execute([$item['quantity'], $item['item_id']]);
                     }
                     
                     // Update PO status if all items are fully received
-                    if ($_POST['po_id']) {
+                    if ($grn['po_id']) {
                         $stmt = $db->prepare("
                             SELECT 
                                 SUM(quantity) as total_ordered,
@@ -77,51 +105,77 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                             FROM po_items 
                             WHERE po_id = ?
                         ");
-                        $stmt->execute([$_POST['po_id']]);
+                        $stmt->execute([$grn['po_id']]);
                         $po_totals = $stmt->fetch();
                         
                         if ($po_totals['total_received'] >= $po_totals['total_ordered']) {
                             $stmt = $db->prepare("UPDATE purchase_orders SET status = 'completed' WHERE id = ?");
-                            $stmt->execute([$_POST['po_id']]);
+                            $stmt->execute([$grn['po_id']]);
                         } else if ($po_totals['total_received'] > 0) {
                             $stmt = $db->prepare("UPDATE purchase_orders SET status = 'partial_received' WHERE id = ?");
-                            $stmt->execute([$_POST['po_id']]);
+                            $stmt->execute([$grn['po_id']]);
                         }
                     }
                     
-                    $db->commit();
-                    $success = "GRN created successfully!";
-                    break;
-                    
-                case 'complete':
+                    // Update GRN status to completed
                     $stmt = $db->prepare("UPDATE grn SET status = 'completed' WHERE id = ?");
                     $stmt->execute([$_POST['id']]);
-                    $success = "GRN marked as completed!";
+                    
+                    $db->commit();
+                    $success = "GRN completed and stock ledger updated successfully!";
                     break;
                     
                 case 'delete':
                     $db->beginTransaction();
                     
-                    // Get GRN items to reverse stock and PO quantities
+                    // Get GRN details first
+                    $stmt = $db->prepare("SELECT * FROM grn WHERE id = ?");
+                    $stmt->execute([$_POST['id']]);
+                    $grn = $stmt->fetch();
+                    
+                    if (!$grn) {
+                        throw new Exception("GRN not found");
+                    }
+                    
+                    // Get GRN items
                     $stmt = $db->prepare("SELECT * FROM grn_items WHERE grn_id = ?");
                     $stmt->execute([$_POST['id']]);
                     $grn_items = $stmt->fetchAll();
                     
-                    foreach ($grn_items as $item) {
-                        // Update item current stock (reverse)
-                        $stmt = $db->prepare("UPDATE items SET current_stock = current_stock - ? WHERE id = ?");
-                        $stmt->execute([$item['quantity'], $item['item_id']]);
+                    // Only reverse stock movements if GRN was completed
+                    if ($grn['status'] === 'completed') {
+                        foreach ($grn_items as $item) {
+                            // Update item current stock (reverse)
+                            $stmt = $db->prepare("UPDATE items SET current_stock = current_stock - ? WHERE id = ?");
+                            $stmt->execute([$item['quantity'], $item['item_id']]);
+                            
+                            // Reverse PO item received quantity if linked
+                            if ($item['po_item_id']) {
+                                $stmt = $db->prepare("UPDATE po_items SET received_quantity = received_quantity - ? WHERE id = ?");
+                                $stmt->execute([$item['quantity'], $item['po_item_id']]);
+                            }
+                        }
                         
-                        // Reverse PO item received quantity if linked
-                        if ($item['po_item_id']) {
-                            $stmt = $db->prepare("UPDATE po_items SET received_quantity = received_quantity - ? WHERE id = ?");
-                            $stmt->execute([$item['quantity'], $item['po_item_id']]);
+                        // Delete stock ledger entries (only if GRN was completed)
+                        $stmt = $db->prepare("DELETE FROM stock_ledger WHERE transaction_type = 'grn' AND reference_id = ?");
+                        $stmt->execute([$_POST['id']]);
+                    } else {
+                        // For pending GRNs, we might still need to reverse PO received quantities if they were updated
+                        // (This shouldn't happen with the new workflow, but kept for safety)
+                        foreach ($grn_items as $item) {
+                            if ($item['po_item_id']) {
+                                // Check if PO item has received quantity that matches this GRN item
+                                $stmt = $db->prepare("SELECT received_quantity FROM po_items WHERE id = ?");
+                                $stmt->execute([$item['po_item_id']]);
+                                $received_qty = $stmt->fetch()['received_quantity'] ?? 0;
+                                
+                                if ($received_qty >= $item['quantity']) {
+                                    $stmt = $db->prepare("UPDATE po_items SET received_quantity = received_quantity - ? WHERE id = ?");
+                                    $stmt->execute([$item['quantity'], $item['po_item_id']]);
+                                }
+                            }
                         }
                     }
-                    
-                    // Delete stock ledger entries
-                    $stmt = $db->prepare("DELETE FROM stock_ledger WHERE transaction_type = 'grn' AND reference_id = ?");
-                    $stmt->execute([$_POST['id']]);
                     
                     // Delete GRN
                     $stmt = $db->prepare("DELETE FROM grn WHERE id = ?");

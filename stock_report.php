@@ -153,27 +153,29 @@ if ((isset($_GET['download']) && $_GET['download'] === 'pdf') || (isset($_GET['p
                 $detailed_data_by_loc[$locId] = $stmt->fetchAll();
                 $detailed_location_names[$locId] = $location_map[$locId] ?? ("Location #" . $locId);
                 
-                // Get repacking records for this location
+                // Get repacking records for this location - Using remaining_qty to prevent double counting
                 $repack_sql = "
                     SELECT 
                         r.id, r.repack_code, r.repack_date as created_at,
                         i1.name as source_item_name, i1.code as source_item_code,
                         i2.name as repack_item_name, i2.code as repack_item_code,
                         r.source_quantity, r.repack_quantity, r.repack_unit_size,
+                        r.remaining_qty,
+                        (r.repack_quantity - r.remaining_qty) as consumed_qty,
                         u1.symbol as source_unit_symbol, u2.symbol as repack_unit_symbol,
-                        COALESCE(SUM(b.source_quantity), 0) as packs_used_in_bundles,
-                        (r.repack_quantity - COALESCE(SUM(b.source_quantity), 0)) as balance_packs
+                        r.remaining_qty as balance_packs,
+                        CASE 
+                            WHEN r.remaining_qty = 0 THEN 'Fully Consumed'
+                            WHEN r.remaining_qty = r.repack_quantity THEN 'Available'
+                            WHEN r.remaining_qty > 0 THEN 'Partially Consumed'
+                            ELSE 'Over-consumed'
+                        END as status
                     FROM repacking r
                     JOIN items i1 ON r.source_item_id = i1.id
                     JOIN items i2 ON r.repack_item_id = i2.id
                     JOIN units u1 ON r.source_unit_id = u1.id
                     JOIN units u2 ON r.repack_unit_id = u2.id
-                    LEFT JOIN bundles b ON b.source_item_id = r.repack_item_id
                     WHERE r.location_id = ?
-                    GROUP BY r.id, r.repack_code, r.repack_date, 
-                             i1.name, i1.code, i2.name, i2.code, 
-                             r.source_quantity, r.repack_quantity, r.repack_unit_size, 
-                             u1.symbol, u2.symbol
                     ORDER BY r.repack_date DESC
                 ";
                 $stmt = $db->prepare($repack_sql);
@@ -362,33 +364,39 @@ if ((isset($_GET['download']) && $_GET['download'] === 'pdf') || (isset($_GET['p
                 }
                 $html .= '</table>';
                 
-                // Add Repacking Records for this location
+                // Add Repacking Records for this location - Only show items with remaining_qty > 0
                 if ((int)$locationId == $PRODUCTION_ID && !empty($repacking_data_by_loc[$locationId])) {
-                    $html .= '<h3>Repacking Records</h3>
-                        <table>
-                            <tr>
-                                <th>Repack Code</th>
-                                <th>Date</th>
-                                <th>Source Item</th>
-                                <th>Source Qty</th>
-                                <th>Repack Item</th>
-                                <th>Packs Created</th>
-                                <th>Status</th>
-                            </tr>';
+                    $repacking_available = array_filter($repacking_data_by_loc[$locationId], function($item) {
+                        return floatval($item['remaining_qty']) > 0;
+                    });
                     
-                    foreach ($repacking_data_by_loc[$locationId] as $repack) {
-                        $status = $repack['used_in_bundles'] > 0 ? 'Used in Bundle' : 'Not Used';
-                        $html .= '<tr>
-                            <td>' . htmlspecialchars($repack['repack_code']) . '</td>
-                            <td>' . date('M d, Y', strtotime($repack['created_at'])) . '</td>
-                            <td>' . htmlspecialchars($repack['source_item_name'] . ' (' . $repack['source_item_code'] . ')') . '</td>
-                            <td class="text-right">' . number_format($repack['source_quantity'], 3) . ' ' . htmlspecialchars($repack['source_unit_symbol']) . '</td>
-                            <td>' . htmlspecialchars($repack['repack_item_name'] . ' (' . $repack['repack_item_code'] . ')') . '</td>
-                            <td class="text-right">' . number_format($repack['repack_quantity'], 3) . '</td>
-                            <td>' . htmlspecialchars($status) . '</td>
-                        </tr>';
+                    if (!empty($repacking_available)) {
+                        $html .= '<h3>Repacking Records</h3>
+                            <table>
+                                <tr>
+                                    <th>Repack Code</th>
+                                    <th>Date</th>
+                                    <th>Source Item</th>
+                                    <th>Source Qty</th>
+                                    <th>Repack Item</th>
+                                    <th>Packs Created</th>
+                                    <th>Status</th>
+                                </tr>';
+                        
+                        foreach ($repacking_available as $repack) {
+                            $status = $repack['consumed_qty'] > 0 ? 'Used in Bundle' : 'Not Used';
+                            $html .= '<tr>
+                                <td>' . htmlspecialchars($repack['repack_code']) . '</td>
+                                <td>' . date('M d, Y', strtotime($repack['created_at'])) . '</td>
+                                <td>' . htmlspecialchars($repack['source_item_name'] . ' (' . $repack['source_item_code'] . ')') . '</td>
+                                <td class="text-right">' . number_format($repack['source_quantity'], 3) . ' ' . htmlspecialchars($repack['source_unit_symbol']) . '</td>
+                                <td>' . htmlspecialchars($repack['repack_item_name'] . ' (' . $repack['repack_item_code'] . ')') . '</td>
+                                <td class="text-right">' . number_format($repack['repack_quantity'], 3) . '</td>
+                                <td>' . htmlspecialchars($status) . '</td>
+                            </tr>';
+                        }
+                        $html .= '</table>';
                     }
-                    $html .= '</table>';
                 }
                 
                 // Add Rolls Records for this location
@@ -684,27 +692,29 @@ try {
                 $detailed_location_names[$locId] = $location_map[$locId] ?? ("Location #" . $locId);
             }
             
-            // Get repacking records for this location
+            // Get repacking records for this location - Using remaining_qty to prevent double counting
             $repack_sql = "
                 SELECT 
                     r.id, r.repack_code, r.repack_date as created_at,
                     i1.name as source_item_name, i1.code as source_item_code,
                     i2.name as repack_item_name, i2.code as repack_item_code,
                     r.source_quantity, r.repack_quantity, r.repack_unit_size,
+                    r.remaining_qty,
+                    (r.repack_quantity - r.remaining_qty) as consumed_qty,
                     u1.symbol as source_unit_symbol, u2.symbol as repack_unit_symbol,
-                    COALESCE(SUM(b.source_quantity), 0) as packs_used_in_bundles,
-                    (r.repack_quantity - COALESCE(SUM(b.source_quantity), 0)) as balance_packs
+                    r.remaining_qty as balance_packs,
+                    CASE 
+                        WHEN r.remaining_qty = 0 THEN 'Fully Consumed'
+                        WHEN r.remaining_qty = r.repack_quantity THEN 'Available'
+                        WHEN r.remaining_qty > 0 THEN 'Partially Consumed'
+                        ELSE 'Over-consumed'
+                    END as status
                 FROM repacking r
                 JOIN items i1 ON r.source_item_id = i1.id
                 JOIN items i2 ON r.repack_item_id = i2.id
                 JOIN units u1 ON r.source_unit_id = u1.id
                 JOIN units u2 ON r.repack_unit_id = u2.id
-                LEFT JOIN bundles b ON b.source_item_id = r.repack_item_id
                 WHERE r.location_id = ?
-                GROUP BY r.id, r.repack_code, r.repack_date, 
-                         i1.name, i1.code, i2.name, i2.code, 
-                         r.source_quantity, r.repack_quantity, r.repack_unit_size, 
-                         u1.symbol, u2.symbol
                 ORDER BY r.repack_date DESC
             ";
             $stmt = $db->prepare($repack_sql);
@@ -1173,10 +1183,10 @@ try {
                 <?php endif; ?>
             </div>
             
-            <!-- Repacking Records for Production Floor -->
-            <?php if ((int)$locId == $PRODUCTION_ID && !empty($repacking_data_by_loc[$locId])): ?>
+            <!-- Repacking Records -->
+            <?php if (!empty($repacking_data_by_loc[$locId])): ?>
             <div class="mt-6 px-6 py-4 border-t border-gray-200">
-                <h4 class="text-md font-medium text-gray-900 mb-4">📦 Repacking Records (Production Floor)</h4>
+                <h4 class="text-md font-medium text-gray-900 mb-4">📦 Repacking Records (<?php echo htmlspecialchars($detailed_location_names[$locId] ?? 'Location'); ?>)</h4>
                 <div class="overflow-x-auto">
                     <table class="min-w-full divide-y divide-gray-200">
                         <thead class="bg-gray-50">
@@ -1192,7 +1202,17 @@ try {
                             </tr>
                         </thead>
                         <tbody class="bg-white divide-y divide-gray-200">
-                            <?php foreach ($repacking_data_by_loc[$locId] as $repack): ?>
+                            <?php 
+                            $repacking_available = array_filter($repacking_data_by_loc[$locId], function($item) {
+                                return floatval($item['remaining_qty']) > 0;
+                            });
+                            if (empty($repacking_available)): 
+                            ?>
+                            <tr>
+                                <td colspan="8" class="px-6 py-4 text-center text-gray-500">No repacking records with available stock</td>
+                            </tr>
+                            <?php else: ?>
+                            <?php foreach ($repacking_available as $repack): ?>
                             <tr class="hover:bg-gray-50">
                                 <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-blue-600">
                                     <?php echo htmlspecialchars($repack['repack_code']); ?>
@@ -1233,12 +1253,12 @@ try {
                                     }
                                     ?>
                                     <div class="font-medium <?php echo $color_class; ?>"><?php echo number_format($balance, 0); ?></div>
-                                    <?php if ($repack['packs_used_in_bundles'] > 0): ?>
-                                        <div class="text-xs text-gray-500">Used: <?php echo number_format($repack['packs_used_in_bundles'], 0); ?></div>
+                                    <?php if ($repack['consumed_qty'] > 0): ?>
+                                        <div class="text-xs text-gray-500">Used: <?php echo number_format($repack['consumed_qty'], 0); ?></div>
                                     <?php endif; ?>
                                 </td>
                                 <td class="px-6 py-4 whitespace-nowrap text-center">
-                                    <?php if ($repack['packs_used_in_bundles'] > 0): ?>
+                                    <?php if ($repack['consumed_qty'] > 0): ?>
                                         <span class="px-3 py-1 inline-flex text-xs leading-5 font-semibold rounded-full bg-green-100 text-green-800">
                                             ✅ Used in Bundle
                                         </span>
@@ -1250,16 +1270,17 @@ try {
                                 </td>
                             </tr>
                             <?php endforeach; ?>
+                            <?php endif; ?>
                         </tbody>
                     </table>
                 </div>
             </div>
             <?php endif; ?>
             
-            <!-- Rolls Records for Production Floor -->
-            <?php if ((int)$locId == $PRODUCTION_ID && !empty($rolls_data_by_loc[$locId])): ?>
+            <!-- Rolls Records -->
+            <?php if (!empty($rolls_data_by_loc[$locId])): ?>
             <div class="mt-6 px-6 py-4 border-t border-gray-200">
-                <h4 class="text-md font-medium text-gray-900 mb-4">🎯 Rolls Records (Production Floor)</h4>
+                <h4 class="text-md font-medium text-gray-900 mb-4">🎯 Rolls Records (<?php echo htmlspecialchars($detailed_location_names[$locId] ?? 'Location'); ?>)</h4>
                 <div class="overflow-x-auto">
                     <table class="min-w-full divide-y divide-gray-200">
                         <thead class="bg-gray-50">
@@ -1305,10 +1326,10 @@ try {
             </div>
             <?php endif; ?>
             
-            <!-- Bundles Records for Production Floor -->
-            <?php if ((int)$locId == $PRODUCTION_ID && !empty($bundles_data_by_loc[$locId])): ?>
+            <!-- Bundles Records -->
+            <?php if (!empty($bundles_data_by_loc[$locId])): ?>
             <div class="mt-6 px-6 py-4 border-t border-gray-200">
-                <h4 class="text-md font-medium text-gray-900 mb-4">📦 Bundle Records (Production Floor)</h4>
+                <h4 class="text-md font-medium text-gray-900 mb-4">📦 Bundle Records (<?php echo htmlspecialchars($detailed_location_names[$locId] ?? 'Location'); ?>)</h4>
                 <div class="overflow-x-auto">
                     <table class="min-w-full divide-y divide-gray-200">
                         <thead class="bg-gray-50">

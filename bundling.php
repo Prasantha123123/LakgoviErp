@@ -1,5 +1,26 @@
 <?php
 // bundling.php - Bundling Module (Bundle repacked items into larger packages)
+// 
+// CRITICAL DOUBLE-COUNTING PREVENTION SYSTEM:
+// ==========================================
+// This module implements a remaining_qty tracking system to prevent double counting
+// of repacked items that have been consumed in bundling operations.
+//
+// FLOW: Repacking → Bundling → Stock Reports
+// 1. Repacking creates items with remaining_qty = repack_quantity (all available)
+// 2. Bundling consumes repacked items using FIFO, reducing remaining_qty
+// 3. Stock reports only count items with remaining_qty > 0 (prevents double counting)
+//
+// FIFO (First In, First Out) CONSUMPTION:
+// - When bundling consumes repacked items, oldest repacking records are used first
+// - This ensures proper inventory turnover and accurate aging of stock
+//
+// SAFETY MECHANISMS:
+// 1. validateRepackedAvailability() - Prevents over-consumption before bundling
+// 2. updateRemainingRepackQty() - FIFO consumption tracking during bundling
+// 3. restoreRemainingRepackQty() - LIFO restoration when bundles are deleted
+// 4. Source item selection - Only shows items with available repacked stock
+//
 require_once 'database.php';
 require_once 'config/simple_auth.php';
 
@@ -8,6 +29,127 @@ $database = new Database();
 $db = $database->getConnection();
 $auth = new SimpleAuth($db);
 $auth->requireAuth();
+
+/**
+ * Update remaining repacked quantity after bundling consumption
+ * This prevents double counting of repacked stock in reports
+ */
+function updateRemainingRepackQty($db, $source_item_id, $consumed_qty, $location_id) {
+    // Get available repacking records for this item at this location, ordered by creation date (FIFO)
+    $stmt = $db->prepare("
+        SELECT id, remaining_qty 
+        FROM repacking 
+        WHERE repack_item_id = ? AND location_id = ? AND remaining_qty > 0 
+        ORDER BY repack_date ASC, id ASC
+    ");
+    $stmt->execute([$source_item_id, $location_id]);
+    $repack_records = $stmt->fetchAll();
+    
+    $remaining_to_consume = $consumed_qty;
+    
+    foreach ($repack_records as $record) {
+        if ($remaining_to_consume <= 0) break;
+        
+        $available = floatval($record['remaining_qty']);
+        $to_consume = min($remaining_to_consume, $available);
+        
+        // Update this repacking record's remaining quantity
+        $update_stmt = $db->prepare(
+            "UPDATE repacking SET remaining_qty = remaining_qty - ? WHERE id = ?"
+        );
+        $update_stmt->execute([$to_consume, $record['id']]);
+        
+        $remaining_to_consume -= $to_consume;
+    }
+    
+    if ($remaining_to_consume > 0) {
+        throw new Exception("Unable to consume full quantity. Missing: {$remaining_to_consume} units from repacking records.");
+    }
+}
+
+/**
+ * Restore remaining repacked quantity when bundle is deleted
+ * This restores availability for future bundling operations
+ * Uses reverse FIFO (LIFO) approach to restore quantities
+ */
+function restoreRemainingRepackQty($db, $source_item_id, $restore_qty, $location_id) {
+    // Get repacking records for this item at this location, ordered by creation date (reverse FIFO for restoration)
+    $stmt = $db->prepare("
+        SELECT id, remaining_qty, repack_quantity 
+        FROM repacking 
+        WHERE repack_item_id = ? AND location_id = ? 
+        ORDER BY repack_date DESC, id DESC
+    ");
+    $stmt->execute([$source_item_id, $location_id]);
+    $repack_records = $stmt->fetchAll();
+    
+    $remaining_to_restore = $restore_qty;
+    
+    foreach ($repack_records as $record) {
+        if ($remaining_to_restore <= 0) break;
+        
+        $current_remaining = floatval($record['remaining_qty']);
+        $total_repack_qty = floatval($record['repack_quantity']);
+        $max_restorable = $total_repack_qty - $current_remaining;
+        
+        if ($max_restorable <= 0) continue; // This record is already fully available
+        
+        $to_restore = min($remaining_to_restore, $max_restorable);
+        
+        // Update this repacking record's remaining quantity
+        $update_stmt = $db->prepare(
+            "UPDATE repacking SET remaining_qty = remaining_qty + ? WHERE id = ?"
+        );
+        $update_stmt->execute([$to_restore, $record['id']]);
+        
+        $remaining_to_restore -= $to_restore;
+    }
+    
+    // Note: If there's still remaining_to_restore > 0 here, it means the bundle was created
+    // before proper tracking was implemented. In this case, we can't restore fully but 
+    // this is an acceptable limitation for legacy data.
+}
+
+/**
+ * Get available repacked stock quantity for an item at a location
+ * This checks both stock_ledger balance and remaining repacked quantities
+ * CRITICAL: This prevents double counting by using remaining_qty from repacking table
+ */
+function getAvailableRepackedStock($db, $item_id, $location_id) {
+    // Get total remaining from repacking records (this is what's actually available for bundling)
+    $stmt = $db->prepare("
+        SELECT COALESCE(SUM(remaining_qty), 0) as available_repacked
+        FROM repacking 
+        WHERE repack_item_id = ? AND location_id = ? AND remaining_qty > 0
+    ");
+    $stmt->execute([$item_id, $location_id]);
+    $available_repacked = floatval($stmt->fetchColumn());
+    
+    // For repacked items, the remaining_qty is the authoritative source
+    // Stock_ledger balance can become inconsistent due to bundling operations
+    // So we prioritize remaining_qty from repacking table for bundling validation
+    return $available_repacked;
+}
+
+/**
+ * Validate that there's sufficient remaining repacked quantity before bundling
+ * This is a safety check to prevent over-consumption of repacked items
+ */
+function validateRepackedAvailability($db, $item_id, $location_id, $requested_qty) {
+    $available_qty = getAvailableRepackedStock($db, $item_id, $location_id);
+    
+    if ($requested_qty > $available_qty) {
+        // Get item name for better error message
+        $stmt = $db->prepare("SELECT name FROM items WHERE id = ?");
+        $stmt->execute([$item_id]);
+        $item_info = $stmt->fetch();
+        $item_name = $item_info ? $item_info['name'] : "Item #$item_id";
+        
+        throw new Exception("Insufficient repacked stock for '{$item_name}'! Available: {$available_qty}, Requested: {$requested_qty}");
+    }
+    
+    return true;
+}
 
 // Handle form submissions BEFORE any output
 if ($_SERVER['REQUEST_METHOD'] == 'POST') {
@@ -45,20 +187,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         throw new Exception("Packs per bundle must be greater than zero");
                     }
                     
-                    // Check available stock for source item
-                    $stmt = $db->prepare("
-                        SELECT COALESCE(balance, 0) as available_stock 
-                        FROM stock_ledger 
-                        WHERE item_id = ? AND location_id = ? 
-                        ORDER BY id DESC LIMIT 1
-                    ");
-                    $stmt->execute([$_POST['source_item_id'], $_POST['location_id']]);
-                    $stock_info = $stmt->fetch();
-                    $available_stock = $stock_info ? floatval($stock_info['available_stock']) : 0;
-                    
-                    if ($source_quantity > $available_stock) {
-                        throw new Exception("Insufficient stock! Available: {$available_stock}, Requested: {$source_quantity}");
-                    }
+                    // Check available repacked stock for source item
+                    validateRepackedAvailability($db, $_POST['source_item_id'], $_POST['location_id'], $source_quantity);
                     
                     // Calculate how many bundles can be made
                     $bundle_quantity = floor($source_quantity / $packs_per_bundle);
@@ -184,6 +314,9 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         $bundle_quantity
                     ]);
                     
+                    // Update remaining repacked quantities (FIFO consumption)
+                    updateRemainingRepackQty($db, $_POST['source_item_id'], $source_quantity, $_POST['location_id']);
+                    
                     // Deduct bundling materials from stock
                     if (!empty($_POST['material_items']) && is_array($_POST['material_items'])) {
                         $stmt_material_stock = $db->prepare("
@@ -232,6 +365,14 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         throw new Exception("Bundle record not found");
                     }
                     
+                    // Restore remaining quantities in repacking table (reverse the consumption)
+                    restoreRemainingRepackQty(
+                        $db, 
+                        $bundle['source_item_id'], 
+                        $bundle['source_quantity'], 
+                        $bundle['location_id']
+                    );
+                    
                     // Delete stock ledger entries
                     $stmt = $db->prepare("DELETE FROM stock_ledger WHERE transaction_type IN ('bundle_in', 'bundle_out') AND reference_id = ?");
                     $stmt->execute([$_POST['bundle_id']]);
@@ -241,7 +382,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                     $stmt->execute([$_POST['bundle_id']]);
                     
                     $db->commit();
-                    $_SESSION['success_message'] = "Bundle record deleted successfully!";
+                    $_SESSION['success_message'] = "Bundle record deleted successfully! Repacked quantities restored.";
                     header("Location: bundling.php");
                     exit();
             }
@@ -312,7 +453,26 @@ try {
     $bundle_records = [];
 }
 
-// Fetch finished items for source selection (repacked items)
+// Fetch finished items with available repacked stock for source selection
+// CRITICAL: Only show items that have remaining_qty > 0 to prevent over-consumption
+try {
+    $stmt = $db->query("
+        SELECT DISTINCT 
+            i.id, i.code, i.name, u.symbol AS unit_symbol,
+            COALESCE(SUM(r.remaining_qty), 0) as total_available_qty
+        FROM items i
+        JOIN units u ON u.id = i.unit_id
+        LEFT JOIN repacking r ON r.repack_item_id = i.id AND r.remaining_qty > 0
+        WHERE i.type = 'finished'
+        GROUP BY i.id, i.code, i.name, u.symbol
+        ORDER BY i.name
+    ");
+    $finished_items = $stmt->fetchAll();
+} catch(PDOException $e) {
+    $finished_items = [];
+}
+
+// Fetch all finished items for bundle product selection (destination)
 try {
     $stmt = $db->query("
         SELECT i.id, i.code, i.name, u.symbol AS unit_symbol
@@ -321,9 +481,9 @@ try {
         WHERE i.type = 'finished'
         ORDER BY i.name
     ");
-    $finished_items = $stmt->fetchAll();
+    $bundle_finished_items = $stmt->fetchAll();
 } catch(PDOException $e) {
-    $finished_items = [];
+    $bundle_finished_items = [];
 }
 
 // Fetch raw materials for bundling materials
@@ -547,7 +707,7 @@ try {
                         <select name="bundle_item_id" id="bundle_item_id" required
                                 class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary">
                             <option value="">-- Select Bundle Product --</option>
-                            <?php foreach ($finished_items as $item): ?>
+                            <?php foreach ($bundle_finished_items as $item): ?>
                                 <option value="<?php echo $item['id']; ?>" data-unit="<?php echo htmlspecialchars($item['unit_symbol']); ?>">
                                     <?php echo htmlspecialchars($item['name']); ?> (<?php echo htmlspecialchars($item['code']); ?>)
                                 </option>
@@ -690,7 +850,77 @@ function removeMaterialRow(index) {
 }
 
 function viewDetails(id) {
-    alert('View details for bundle ID: ' + id);
+    fetch(`get_bundle_details.php?id=${id}`)
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                const record = data.record;
+                const modal = document.createElement('div');
+                modal.className = 'fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full z-50';
+                modal.innerHTML = `
+                    <div class="relative top-20 mx-auto p-5 border w-11/12 max-w-4xl shadow-lg rounded-md bg-white">
+                        <div class="flex justify-between items-center mb-4">
+                            <h3 class="text-xl font-bold text-gray-900">Bundle Details - ${record.bundle_code}</h3>
+                            <button onclick="this.closest('.fixed').remove()" class="text-gray-400 hover:text-gray-600">
+                                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                                </svg>
+                            </button>
+                        </div>
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            <div class="space-y-4">
+                                <div class="bg-gray-50 p-4 rounded-lg">
+                                    <h4 class="font-semibold text-gray-900 mb-2">Bundle Information</h4>
+                                    <div class="space-y-2 text-sm">
+                                        <div><span class="font-medium">Code:</span> ${record.bundle_code}</div>
+                                        <div><span class="font-medium">Date:</span> ${new Date(record.bundle_date).toLocaleDateString()}</div>
+                                        <div><span class="font-medium">Location:</span> ${record.location_name || 'N/A'}</div>
+                                        <div><span class="font-medium">Created By:</span> ${record.created_by_name || 'N/A'}</div>
+                                        <div><span class="font-medium">Created:</span> ${new Date(record.created_at).toLocaleString()}</div>
+                                    </div>
+                                </div>
+
+                                <div class="bg-blue-50 p-4 rounded-lg">
+                                    <h4 class="font-semibold text-blue-900 mb-2">Source Product (Individual Packs)</h4>
+                                    <div class="space-y-2 text-sm">
+                                        <div><span class="font-medium">Name:</span> ${record.source_item_name}</div>
+                                        <div><span class="font-medium">Code:</span> ${record.source_item_code}</div>
+                                        <div><span class="font-medium">Packs Used:</span> ${record.source_quantity} ${record.source_unit_symbol}</div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="space-y-4">
+                                <div class="bg-green-50 p-4 rounded-lg">
+                                    <h4 class="font-semibold text-green-900 mb-2">Bundle Product</h4>
+                                    <div class="space-y-2 text-sm">
+                                        <div><span class="font-medium">Name:</span> ${record.bundle_item_name}</div>
+                                        <div><span class="font-medium">Code:</span> ${record.bundle_item_code}</div>
+                                        <div><span class="font-medium">Bundles Created:</span> ${record.bundle_quantity} ${record.bundle_unit_symbol}</div>
+                                        <div><span class="font-medium">Packs per Bundle:</span> ${record.bundle_unit_size} ${record.source_unit_symbol}</div>
+                                        <div><span class="font-medium">Total Packs Bundled:</span> ${parseFloat(record.bundle_quantity) * parseInt(record.bundle_unit_size)} ${record.source_unit_symbol}</div>
+                                    </div>
+                                </div>
+
+                                ${record.notes ? `
+                                <div class="bg-yellow-50 p-4 rounded-lg">
+                                    <h4 class="font-semibold text-yellow-900 mb-2">Notes</h4>
+                                    <p class="text-sm text-gray-700">${record.notes}</p>
+                                </div>
+                                ` : ''}
+                            </div>
+                        </div>
+                    </div>
+                `;
+                document.body.appendChild(modal);
+            } else {
+                alert('Error loading bundle details: ' + data.message);
+            }
+        })
+        .catch(error => {
+            console.error('Error:', error);
+            alert('Error loading bundle details');
+        });
 }
 
 function deleteBundle(id, code) {

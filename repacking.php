@@ -1,5 +1,25 @@
 <?php
 // repacking.php - Repacking Module (Convert finished products into smaller units)
+//
+// REMAINING QUANTITY TRACKING SYSTEM:
+// ==================================
+// This module tracks remaining_qty to prevent double counting in bundling operations.
+//
+// KEY FIELDS:
+// - repack_quantity: Total repacked units produced (never changes)
+// - remaining_qty: Available units for bundling (decreases when used in bundling)
+// - consumed_qty: repack_quantity - remaining_qty (calculated field)
+//
+// INTEGRATION WITH BUNDLING:
+// - When bundling.php consumes repacked items, it calls updateRemainingRepackQty()
+// - This ensures repacking records show accurate availability
+// - Reports use remaining_qty > 0 to filter out fully consumed repacking
+//
+// STOCK CONSISTENCY RULES:
+// - stock_ledger balance = current physical stock in warehouse
+// - remaining_qty = available for future bundling operations
+// - Only repacking records with remaining_qty > 0 appear as "available"
+//
 
 // Start session and initialize database before any output
 if (session_status() === PHP_SESSION_NONE) {
@@ -14,6 +34,7 @@ $db = $database->getConnection();
 /**
  * Update item current_stock from stock_ledger (ALL locations)
  * GLOBAL RULE: current_stock = total across all locations
+ * This ensures stock reports use stock_ledger as single source of truth
  */
 function updateItemCurrentStock($db, $item_id) {
     $stmt = $db->prepare("
@@ -26,6 +47,23 @@ function updateItemCurrentStock($db, $item_id) {
     
     $upd = $db->prepare("UPDATE items SET current_stock = ? WHERE id = ?");
     $upd->execute([$total, $item_id]);
+}
+
+/**
+ * Get current stock for item at specific location from stock_ledger
+ * This prevents double counting by using only stock_ledger data
+ */
+function getCurrentStockAtLocation($db, $item_id, $location_id) {
+    $stmt = $db->prepare("
+        SELECT COALESCE(balance, 0) as current_stock
+        FROM stock_ledger
+        WHERE item_id = ? AND location_id = ?
+        ORDER BY id DESC
+        LIMIT 1
+    ");
+    $stmt->execute([$item_id, $location_id]);
+    $result = $stmt->fetch();
+    return $result ? floatval($result['current_stock']) : 0;
 }
 
 $success = '';
@@ -147,8 +185,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         INSERT INTO repacking (
                             repack_code, repack_date, source_item_id, source_batch_code,
                             source_quantity, source_unit_id, repack_item_id, repack_quantity,
-                            repack_unit_id, repack_unit_size, location_id, notes, created_by
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            repack_unit_id, repack_unit_size, remaining_qty, location_id, notes, created_by
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ");
                     
                     $stmt->execute([
@@ -162,6 +200,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         $repack_quantity,
                         $repack_item['unit_id'],
                         $repack_unit_size,
+                        $repack_quantity, // Initialize remaining_qty with full repack_quantity
                         $_POST['location_id'],
                         $_POST['notes'] ?? null,
                         $_SESSION['user_id']
@@ -477,20 +516,30 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
 // Now include header after POST processing
 include 'header.php';
 
-// Fetch all repacking records
+// Fetch all repacking records 
+// Option: Add WHERE r.remaining_qty > 0 to show only pending repacking records
 try {
+    // Check if user wants to see all records or only pending ones
+    $show_only_pending = isset($_GET['filter']) && $_GET['filter'] === 'pending';
+    $where_clause = $show_only_pending ? "WHERE r.remaining_qty > 0" : "";
+    
     $stmt = $db->query("
         SELECT 
             r.id, r.repack_code, r.repack_date, r.source_item_id, r.repack_item_id,
-            r.source_quantity, r.repack_quantity, r.repack_unit_size,
+            r.source_quantity, r.repack_quantity, r.repack_unit_size, r.remaining_qty,
             r.source_unit_id, r.repack_unit_id, r.location_id, r.notes,
             r.created_by, r.created_at, r.updated_at,
             i1.code AS source_item_code, i1.name AS source_item_name, u1.symbol AS source_unit_symbol,
             i2.code AS repack_item_code, i2.name AS repack_item_name, u2.symbol AS repack_unit_symbol,
             l.name AS location_name,
             au.full_name AS created_by_name,
-            COALESCE(SUM(b.source_quantity), 0) as packs_used_in_bundles,
-            r.repack_quantity - COALESCE(SUM(b.source_quantity), 0) as balance_packs
+            (r.repack_quantity - r.remaining_qty) as consumed_qty,
+            CASE 
+                WHEN r.remaining_qty = 0 THEN 'Fully Consumed'
+                WHEN r.remaining_qty = r.repack_quantity THEN 'Available'
+                WHEN r.remaining_qty > 0 THEN 'Partially Consumed'
+                ELSE 'Over-consumed'
+            END as status
         FROM repacking r
         LEFT JOIN items i1 ON r.source_item_id = i1.id
         LEFT JOIN items i2 ON r.repack_item_id = i2.id
@@ -498,13 +547,7 @@ try {
         LEFT JOIN units u2 ON r.repack_unit_id = u2.id
         LEFT JOIN locations l ON r.location_id = l.id
         LEFT JOIN admin_users au ON r.created_by = au.id
-        LEFT JOIN bundles b ON b.source_item_id = r.repack_item_id
-        GROUP BY r.id, r.repack_code, r.repack_date, r.source_item_id, r.repack_item_id,
-                 r.source_quantity, r.repack_quantity, r.repack_unit_size,
-                 r.source_unit_id, r.repack_unit_id, r.location_id, r.notes,
-                 r.created_by, r.created_at, r.updated_at,
-                 i1.code, i1.name, u1.symbol, i2.code, i2.name, u2.symbol,
-                 l.name, au.full_name
+        $where_clause
         ORDER BY r.repack_date DESC, r.created_at DESC
     ");
     $repacking_records = $stmt->fetchAll();
@@ -604,8 +647,22 @@ try {
 
     <!-- Repacking Records Table -->
     <div class="bg-white shadow rounded-lg overflow-hidden">
-        <div class="px-6 py-4 border-b border-gray-200">
+        <div class="px-6 py-4 border-b border-gray-200 flex justify-between items-center">
             <h2 class="text-lg font-semibold text-gray-900">Repacking History</h2>
+            <div class="flex space-x-2">
+                <?php 
+                $current_filter = isset($_GET['filter']) ? $_GET['filter'] : 'all';
+                $base_url = 'repacking.php';
+                ?>
+                <a href="<?php echo $base_url; ?>" 
+                   class="px-3 py-1 text-sm rounded <?php echo $current_filter === 'all' ? 'bg-blue-100 text-blue-800' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'; ?>">
+                    All Records
+                </a>
+                <a href="<?php echo $base_url; ?>?filter=pending" 
+                   class="px-3 py-1 text-sm rounded <?php echo $current_filter === 'pending' ? 'bg-blue-100 text-blue-800' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'; ?>">
+                    Available Only
+                </a>
+            </div>
         </div>
         <div class="overflow-x-auto">
             <table class="min-w-full divide-y divide-gray-200">
@@ -618,7 +675,7 @@ try {
                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Repack Product</th>
                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Packs Created</th>
                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Unit Size</th>
-                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Balance Packs</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Available Packs</th>
                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Location</th>
                         <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
@@ -664,9 +721,10 @@ try {
                             </td>
                             <td class="px-6 py-4 whitespace-nowrap">
                                 <?php 
-                                $balance = floatval($record['balance_packs']);
+                                $remaining = floatval($record['remaining_qty']);
                                 $total = floatval($record['repack_quantity']);
-                                $percentage = $total > 0 ? ($balance / $total) * 100 : 0;
+                                $consumed = floatval($record['consumed_qty']);
+                                $percentage = $total > 0 ? ($remaining / $total) * 100 : 0;
                                 
                                 if ($percentage >= 80) {
                                     $color_class = 'bg-green-100 text-green-800';
@@ -679,11 +737,11 @@ try {
                                 }
                                 ?>
                                 <span class="px-2 py-1 text-sm font-semibold rounded-full <?php echo $color_class; ?>">
-                                    <?php echo number_format($balance, 0); ?> packs
+                                    <?php echo number_format($remaining, 0); ?> packs
                                 </span>
-                                <?php if ($balance < $total): ?>
+                                <?php if ($consumed > 0): ?>
                                     <div class="text-xs text-gray-500 mt-1">
-                                        Used: <?php echo number_format($record['packs_used_in_bundles'], 0); ?>
+                                        Used: <?php echo number_format($consumed, 0); ?>
                                     </div>
                                 <?php endif; ?>
                             </td>
@@ -691,15 +749,19 @@ try {
                                 <?php echo htmlspecialchars($record['location_name']); ?>
                             </td>
                             <td class="px-6 py-4 whitespace-nowrap text-center">
-                                <?php if ($record['packs_used_in_bundles'] > 0): ?>
-                                    <span class="px-3 py-1 inline-flex text-xs leading-5 font-semibold rounded-full bg-green-100 text-green-800">
-                                        ✅ Used in Bundle
-                                    </span>
-                                <?php else: ?>
-                                    <span class="px-3 py-1 inline-flex text-xs leading-5 font-semibold rounded-full bg-gray-100 text-gray-600">
-                                        ⚪ Not Used
-                                    </span>
-                                <?php endif; ?>
+                                <?php 
+                                $status = $record['status'];
+                                $status_colors = [
+                                    'Available' => 'bg-green-100 text-green-800',
+                                    'Partially Consumed' => 'bg-yellow-100 text-yellow-800',
+                                    'Fully Consumed' => 'bg-gray-100 text-gray-800',
+                                    'Over-consumed' => 'bg-red-100 text-red-800'
+                                ];
+                                $status_color = $status_colors[$status] ?? 'bg-gray-100 text-gray-500';
+                                ?>
+                                <span class="px-3 py-1 inline-flex text-xs leading-5 font-semibold rounded-full <?php echo $status_color; ?>">
+                                    <?php echo htmlspecialchars($status); ?>
+                                </span>
                             </td>
                             <td class="px-6 py-4 whitespace-nowrap text-sm font-medium">
                                 <button onclick="viewDetails(<?php echo $record['id']; ?>)" 
@@ -993,8 +1055,82 @@ function removeMaterialRow(index) {
 }
 
 function viewDetails(id) {
-    // You can implement a view details modal here
-    alert('View details for repacking ID: ' + id);
+    // Fetch repacking details via AJAX
+    fetch('get_repacking_details.php?id=' + id)
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                const record = data.record;
+                const modal = document.createElement('div');
+                modal.className = 'fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full z-50';
+                modal.innerHTML = `
+                    <div class="relative top-20 mx-auto p-5 border w-11/12 max-w-4xl shadow-lg rounded-md bg-white">
+                        <div class="flex justify-between items-center mb-4">
+                            <h3 class="text-xl font-bold text-gray-900">Repacking Details - ${record.repack_code}</h3>
+                            <button onclick="this.closest('.fixed').remove()" class="text-gray-400 hover:text-gray-600">
+                                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                                </svg>
+                            </button>
+                        </div>
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            <div class="space-y-4">
+                                <div class="bg-gray-50 p-4 rounded-lg">
+                                    <h4 class="font-semibold text-gray-900 mb-2">Repacking Information</h4>
+                                    <div class="space-y-2 text-sm">
+                                        <div><span class="font-medium">Code:</span> ${record.repack_code}</div>
+                                        <div><span class="font-medium">Date:</span> ${new Date(record.repack_date).toLocaleDateString()}</div>
+                                        <div><span class="font-medium">Location:</span> ${record.location_name || 'N/A'}</div>
+                                        <div><span class="font-medium">Created By:</span> ${record.created_by_name || 'N/A'}</div>
+                                        <div><span class="font-medium">Created:</span> ${new Date(record.created_at).toLocaleString()}</div>
+                                    </div>
+                                </div>
+
+                                <div class="bg-blue-50 p-4 rounded-lg">
+                                    <h4 class="font-semibold text-blue-900 mb-2">Source Product</h4>
+                                    <div class="space-y-2 text-sm">
+                                        <div><span class="font-medium">Name:</span> ${record.source_item_name}</div>
+                                        <div><span class="font-medium">Code:</span> ${record.source_item_code}</div>
+                                        <div><span class="font-medium">Quantity Used:</span> ${record.source_quantity} ${record.source_unit_symbol}</div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="space-y-4">
+                                <div class="bg-green-50 p-4 rounded-lg">
+                                    <h4 class="font-semibold text-green-900 mb-2">Repack Product</h4>
+                                    <div class="space-y-2 text-sm">
+                                        <div><span class="font-medium">Name:</span> ${record.repack_item_name}</div>
+                                        <div><span class="font-medium">Code:</span> ${record.repack_item_code}</div>
+                                        <div><span class="font-medium">Packs Created:</span> ${record.repack_quantity}</div>
+                                        <div><span class="font-medium">Unit Size:</span> ${record.repack_unit_size} ${record.repack_unit_symbol}</div>
+                                        <div><span class="font-medium">Available Packs:</span> ${record.remaining_qty}</div>
+                                        <div><span class="font-medium">Consumed Packs:</span> ${record.consumed_qty}</div>
+                                        <div><span class="font-medium">Status:</span> 
+                                            <span class="px-2 py-1 text-xs rounded-full bg-blue-100 text-blue-800">${record.status}</span>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                ${record.notes ? `
+                                <div class="bg-yellow-50 p-4 rounded-lg">
+                                    <h4 class="font-semibold text-yellow-900 mb-2">Notes</h4>
+                                    <p class="text-sm text-gray-700">${record.notes}</p>
+                                </div>
+                                ` : ''}
+                            </div>
+                        </div>
+                    </div>
+                `;
+                document.body.appendChild(modal);
+            } else {
+                alert('Error loading repacking details: ' + data.message);
+            }
+        })
+        .catch(error => {
+            console.error('Error:', error);
+            alert('Error loading repacking details');
+        });
 }
 
 function deleteRepack(id, code) {

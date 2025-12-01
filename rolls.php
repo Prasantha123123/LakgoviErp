@@ -424,7 +424,7 @@ try {
                 <tbody class="bg-white divide-y divide-gray-200">
                     <?php if (empty($batches)): ?>
                         <tr>
-                            <td colspan="9" class="px-6 py-4 text-center text-gray-500">
+                            <td colspan="10" class="px-6 py-4 text-center text-gray-500">
                                 No rolls batches found. Click "Start Rolls Production" to create one.
                             </td>
                         </tr>
@@ -740,8 +740,103 @@ function completeBatchModal(batchId) {
 }
 
 function viewBatchDetails(batchId) {
-    // TODO: Implement detailed view
-    alert('View batch details for ID: ' + batchId);
+    // Fetch batch details via AJAX
+    fetch('get_batch_details.php?id=' + batchId)
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                const batch = data.batch;
+                const materials = data.materials;
+                const modal = document.createElement('div');
+                modal.className = 'fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full z-50';
+                modal.innerHTML = `
+                    <div class="relative top-20 mx-auto p-5 border w-11/12 max-w-5xl shadow-lg rounded-md bg-white">
+                        <div class="flex justify-between items-center mb-4">
+                            <h3 class="text-xl font-bold text-gray-900">Batch Details - ${batch.batch_code}</h3>
+                            <button onclick="this.closest('.fixed').remove()" class="text-gray-400 hover:text-gray-600">
+                                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                                </svg>
+                            </button>
+                        </div>
+                        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                            <div class="lg:col-span-1 space-y-4">
+                                <div class="bg-gray-50 p-4 rounded-lg">
+                                    <h4 class="font-semibold text-gray-900 mb-2">Batch Information</h4>
+                                    <div class="space-y-2 text-sm">
+                                        <div><span class="font-medium">Code:</span> ${batch.batch_code}</div>
+                                        <div><span class="font-medium">Date:</span> ${new Date(batch.batch_date).toLocaleDateString()}</div>
+                                        <div><span class="font-medium">Status:</span>
+                                            <span class="px-2 py-1 text-xs font-semibold rounded-full ml-1
+                                                ${batch.status === 'pending' ? 'bg-yellow-100 text-yellow-800' :
+                                                  batch.status === 'started' ? 'bg-blue-100 text-blue-800' :
+                                                  'bg-green-100 text-green-800'}">
+                                                ${batch.status.charAt(0).toUpperCase() + batch.status.slice(1)}
+                                            </span>
+                                        </div>
+                                        <div><span class="font-medium">Location:</span> ${batch.location_name || 'N/A'}</div>
+                                        <div><span class="font-medium">Created:</span> ${new Date(batch.created_at).toLocaleString()}</div>
+                                        ${batch.started_at ? `<div><span class="font-medium">Started:</span> ${new Date(batch.started_at).toLocaleString()}</div>` : ''}
+                                        ${batch.completed_at ? `<div><span class="font-medium">Completed:</span> ${new Date(batch.completed_at).toLocaleString()}</div>` : ''}
+                                    </div>
+                                </div>
+
+                                <div class="bg-blue-50 p-4 rounded-lg">
+                                    <h4 class="font-semibold text-blue-900 mb-2">Rolls Product</h4>
+                                    <div class="space-y-2 text-sm">
+                                        <div><span class="font-medium">Name:</span> ${batch.rolls_item_name || 'N/A'}</div>
+                                        <div><span class="font-medium">Code:</span> ${batch.rolls_item_code || 'N/A'}</div>
+                                        <div><span class="font-medium">Quantity Produced:</span> ${batch.rolls_quantity || 0}</div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="lg:col-span-2 space-y-4">
+                                <div class="bg-green-50 p-4 rounded-lg">
+                                    <h4 class="font-semibold text-green-900 mb-2">Materials Used (${materials.length} items)</h4>
+                                    <div class="overflow-x-auto">
+                                        <table class="min-w-full text-sm">
+                                            <thead>
+                                                <tr class="border-b">
+                                                    <th class="text-left py-2 font-medium">Item</th>
+                                                    <th class="text-left py-2 font-medium">Code</th>
+                                                    <th class="text-right py-2 font-medium">Quantity</th>
+                                                    <th class="text-left py-2 font-medium">Unit</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                ${materials.map(material => `
+                                                    <tr class="border-b border-green-100">
+                                                        <td class="py-2">${material.item_name}</td>
+                                                        <td class="py-2 text-gray-600">${material.item_code}</td>
+                                                        <td class="py-2 text-right font-medium">${material.quantity_used}</td>
+                                                        <td class="py-2 text-gray-600">${material.unit_symbol}</td>
+                                                    </tr>
+                                                `).join('')}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+
+                                ${batch.notes ? `
+                                <div class="bg-yellow-50 p-4 rounded-lg">
+                                    <h4 class="font-semibold text-yellow-900 mb-2">Notes</h4>
+                                    <p class="text-sm text-gray-700">${batch.notes}</p>
+                                </div>
+                                ` : ''}
+                            </div>
+                        </div>
+                    </div>
+                `;
+                document.body.appendChild(modal);
+            } else {
+                alert('Error loading batch details: ' + data.message);
+            }
+        })
+        .catch(error => {
+            console.error('Error:', error);
+            alert('Error loading batch details');
+        });
 }
 
 function deleteBatch(id, code) {

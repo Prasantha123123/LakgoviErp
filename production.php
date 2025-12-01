@@ -1190,79 +1190,95 @@ try {
 
 <!-- Production Details Modal -->
 <div id="productionDetailsModal" class="fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full modal-backdrop hidden z-50">
-  <div class="relative top-10 mx-auto p-6 border w-full max-w-4xl shadow-lg rounded-md bg-white mb-10">
-    <div class="flex justify-between items-center mb-4">
-      <h3 class="text-2xl font-bold text-gray-900">Production Details</h3>
-      <button onclick="closeModal('productionDetailsModal')" class="text-gray-400 hover:text-gray-600">
-        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
-      </button>
-    </div>
-    
-    <div class="space-y-6">
-      <!-- Production Batch Info -->
-      <div class="grid grid-cols-2 gap-4 pb-4 border-b">
-        <div>
-          <p class="text-sm text-gray-600">Batch Number</p>
-          <p class="text-lg font-semibold" id="pd_batch"></p>
-        </div>
-        <div>
-          <p class="text-sm text-gray-600">Item</p>
-          <p class="text-lg font-semibold" id="pd_item"></p>
-        </div>
-        <div>
-          <p class="text-sm text-gray-600">Planned Quantity</p>
-          <p class="text-lg font-semibold" id="pd_planned"></p>
-        </div>
-        <div>
-          <p class="text-sm text-gray-600">Actual Quantity</p>
-          <p class="text-lg font-semibold" id="pd_actual"></p>
-        </div>
-        <div>
-          <p class="text-sm text-gray-600">Status</p>
-          <p class="text-lg font-semibold" id="pd_status"></p>
-        </div>
-        <div>
-          <p class="text-sm text-gray-600">Location</p>
-          <p class="text-lg font-semibold" id="pd_location"></p>
-        </div>
-        <div class="col-span-2">
-          <p class="text-sm text-gray-600">Production Date</p>
-          <p class="text-lg font-semibold" id="pd_date"></p>
-        </div>
+  <div class="relative top-10 mx-auto p-0 w-full max-w-5xl mb-10">
+    <div class="bg-white rounded-lg shadow-2xl overflow-hidden">
+      <!-- Header -->
+      <div class="bg-gradient-to-r from-blue-600 to-blue-700 px-6 py-4 flex justify-between items-center">
+        <h3 class="text-2xl font-bold text-white">Production Batch Details</h3>
+        <button onclick="closeModal('productionDetailsModal')" class="text-blue-100 hover:text-white">
+          <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+        </button>
       </div>
 
-      <!-- Transfers to Store -->
-      <div>
-        <h4 class="text-lg font-semibold mb-2">Transfers to Store</h4>
-        <div class="overflow-x-auto">
-          <table class="min-w-full border-collapse border border-gray-300">
-            <thead>
-              <tr class="bg-gray-50">
-                <th class="px-4 py-2 border border-gray-300 text-left">Trolley Batch</th>
-                <th class="px-4 py-2 border border-gray-300 text-left">Expected Weight</th>
-                <th class="px-4 py-2 border border-gray-300 text-left">Actual Weight</th>
-                <th class="px-4 py-2 border border-gray-300 text-left">Status</th>
-                <th class="px-4 py-2 border border-gray-300 text-left">Date</th>
-              </tr>
-            </thead>
-            <tbody id="pd_transfers">
-              <!-- Transfers will be populated here -->
-            </tbody>
-          </table>
+      <div class="p-6 space-y-6">
+        <!-- Production Batch Info Grid -->
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+          <div class="bg-blue-50 p-4 rounded-lg border border-blue-200">
+            <p class="text-xs font-medium text-blue-600 uppercase tracking-wide">Batch Number</p>
+            <p class="text-2xl font-bold text-gray-900 mt-1" id="pd_batch">-</p>
+          </div>
+          <div class="bg-purple-50 p-4 rounded-lg border border-purple-200 md:col-span-2 lg:col-span-2">
+            <p class="text-xs font-medium text-purple-600 uppercase tracking-wide">Item</p>
+            <p class="text-lg font-bold text-gray-900 mt-1" id="pd_item">-</p>
+          </div>
+          <div class="bg-green-50 p-4 rounded-lg border border-green-200">
+            <p class="text-xs font-medium text-green-600 uppercase tracking-wide">Status</p>
+            <p class="text-lg font-bold text-gray-900 mt-1" id="pd_status">-</p>
+          </div>
         </div>
-      </div>
 
-      <!-- Remaining Completion -->
-      <div>
-        <h4 class="text-lg font-semibold mb-2">Remaining Verification</h4>
-        <div id="pd_remaining" class="bg-gray-50 p-4 rounded">
-          <!-- Remaining completion will be populated here -->
+        <!-- Quantities Section -->
+        <div class="border-t pt-6">
+          <h4 class="text-lg font-semibold text-gray-900 mb-4">Quantities</h4>
+          <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+            <div class="bg-gradient-to-br from-yellow-50 to-yellow-100 p-4 rounded-lg border border-yellow-200">
+              <p class="text-xs font-medium text-yellow-700 uppercase tracking-wide">Planned</p>
+              <p class="text-2xl font-bold text-yellow-900 mt-2" id="pd_planned">0</p>
+            </div>
+            <div class="bg-gradient-to-br from-green-50 to-green-100 p-4 rounded-lg border border-green-200">
+              <p class="text-xs font-medium text-green-700 uppercase tracking-wide">Actual</p>
+              <p class="text-2xl font-bold text-green-900 mt-2" id="pd_actual">0</p>
+            </div>
+            <div class="bg-gradient-to-br from-indigo-50 to-indigo-100 p-4 rounded-lg border border-indigo-200">
+              <p class="text-xs font-medium text-indigo-700 uppercase tracking-wide">Location</p>
+              <p class="text-lg font-bold text-indigo-900 mt-2" id="pd_location">-</p>
+            </div>
+            <div class="bg-gradient-to-br from-orange-50 to-orange-100 p-4 rounded-lg border border-orange-200">
+              <p class="text-xs font-medium text-orange-700 uppercase tracking-wide">Date</p>
+              <p class="text-lg font-bold text-orange-900 mt-2" id="pd_date">-</p>
+            </div>
+          </div>
         </div>
-      </div>
 
-      <!-- Close Button -->
-      <div class="flex justify-end pt-4 border-t">
-        <button onclick="closeModal('productionDetailsModal')" class="px-4 py-2 border border-gray-300 rounded-md text-gray-700 hover:bg-gray-50">Close</button>
+        <!-- Transfers to Store Section -->
+        <div class="border-t pt-6">
+          <h4 class="text-lg font-semibold text-gray-900 mb-4 flex items-center gap-2">
+            <svg class="w-5 h-5 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+            Transfers to Store
+          </h4>
+          <div class="overflow-x-auto bg-gray-50 rounded-lg border border-gray-200">
+            <table class="min-w-full divide-y divide-gray-200">
+              <thead class="bg-gray-100">
+                <tr>
+                  <th class="px-4 py-3 text-left text-xs font-medium text-gray-700 uppercase tracking-wider">Trolley Batch</th>
+                  <th class="px-4 py-3 text-left text-xs font-medium text-gray-700 uppercase tracking-wider">Expected Weight</th>
+                  <th class="px-4 py-3 text-left text-xs font-medium text-gray-700 uppercase tracking-wider">Actual Weight</th>
+                  <th class="px-4 py-3 text-left text-xs font-medium text-gray-700 uppercase tracking-wider">Status</th>
+                  <th class="px-4 py-3 text-left text-xs font-medium text-gray-700 uppercase tracking-wider">Date</th>
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-gray-200" id="pd_transfers">
+                <tr><td colspan="5" class="px-4 py-6 text-center text-gray-500 text-sm">Loading...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Remaining Verification Section -->
+        <div class="border-t pt-6">
+          <h4 class="text-lg font-semibold text-gray-900 mb-4 flex items-center gap-2">
+            <svg class="w-5 h-5 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+            Remaining Verification
+          </h4>
+          <div id="pd_remaining" class="bg-gradient-to-r from-purple-50 to-pink-50 p-4 rounded-lg border border-purple-200">
+            <p class="text-gray-600 text-center">No remaining verification completed</p>
+          </div>
+        </div>
+
+        <!-- Footer -->
+        <div class="flex justify-end pt-4 border-t">
+          <button onclick="closeModal('productionDetailsModal')" class="px-6 py-2 bg-gray-200 text-gray-800 rounded-lg hover:bg-gray-300 transition-colors font-medium">Close</button>
+        </div>
       </div>
     </div>
   </div>
@@ -1422,53 +1438,81 @@ function viewProductionDetails(productionId) {
       // Populate production info
       document.getElementById('pd_batch').textContent = data.production.batch_no;
       document.getElementById('pd_item').textContent = `${data.production.item_name} (${data.production.item_code})`;
-      document.getElementById('pd_planned').textContent = `${Number(data.production.planned_qty).toFixed(3)} ${data.production.unit_symbol}`;
-      document.getElementById('pd_actual').textContent = `${Number(data.production.actual_qty).toFixed(3)} ${data.production.unit_symbol}`;
-      document.getElementById('pd_status').textContent = data.production.status;
-      document.getElementById('pd_location').textContent = data.production.location_name;
-      document.getElementById('pd_date').textContent = new Date(data.production.production_date).toLocaleDateString();
+      document.getElementById('pd_planned').innerHTML = `<span class="text-sm text-yellow-700">${Number(data.production.planned_qty).toFixed(3)}</span> <span class="text-sm text-yellow-600">${data.production.unit_symbol}</span>`;
+      document.getElementById('pd_actual').innerHTML = `<span class="text-sm text-green-700">${Number(data.production.actual_qty).toFixed(3)}</span> <span class="text-sm text-green-600">${data.production.unit_symbol}</span>`;
+      
+      const statusEl = document.getElementById('pd_status');
+      const statusClass = {
+        'pending': 'bg-yellow-100 text-yellow-800',
+        'started': 'bg-blue-100 text-blue-800',
+        'completed': 'bg-green-100 text-green-800',
+        'on_hold': 'bg-red-100 text-red-800'
+      };
+      statusEl.innerHTML = `<span class="px-3 py-1 rounded-full text-sm font-medium ${statusClass[data.production.status] || 'bg-gray-100 text-gray-800'}">${data.production.status.replace('_', ' ').toUpperCase()}</span>`;
+      
+      document.getElementById('pd_location').textContent = data.production.location_name || 'N/A';
+      document.getElementById('pd_date').textContent = new Date(data.production.production_date).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
       
       // Populate transfers
       const transfersContainer = document.getElementById('pd_transfers');
-      if (data.transfers.length > 0) {
-        transfersContainer.innerHTML = data.transfers.map(transfer => `
-          <tr>
-            <td class="px-4 py-2 border">${transfer.trolley_batch}</td>
-            <td class="px-4 py-2 border">${Number(transfer.expected_weight_kg).toFixed(3)} kg</td>
-            <td class="px-4 py-2 border">${Number(transfer.actual_weight_kg).toFixed(3)} kg</td>
-            <td class="px-4 py-2 border">${transfer.status_text}</td>
-            <td class="px-4 py-2 border">${new Date(transfer.movement_date).toLocaleString()}</td>
-          </tr>
-        `).join('');
+      if (data.transfers && data.transfers.length > 0) {
+        transfersContainer.innerHTML = data.transfers.map(transfer => {
+          const statusColorMap = {
+            'pending': 'bg-yellow-50 text-yellow-700',
+            'completed': 'bg-green-50 text-green-700',
+            'on_hold': 'bg-red-50 text-red-700'
+          };
+          return `
+            <tr class="hover:bg-gray-50 transition-colors">
+              <td class="px-4 py-3 text-sm font-medium text-gray-900">${transfer.trolley_batch}</td>
+              <td class="px-4 py-3 text-sm text-gray-600">
+                <span class="font-medium text-blue-600">${Number(transfer.expected_weight_kg).toFixed(3)}</span> kg
+              </td>
+              <td class="px-4 py-3 text-sm text-gray-600">
+                <span class="font-medium text-green-600">${Number(transfer.actual_weight_kg).toFixed(3)}</span> kg
+              </td>
+              <td class="px-4 py-3 text-sm">
+                <span class="px-2 py-1 rounded-full text-xs font-medium ${statusColorMap[transfer.status_text] || 'bg-gray-100 text-gray-700'}">
+                  ${transfer.status_text.replace('_', ' ').toUpperCase()}
+                </span>
+              </td>
+              <td class="px-4 py-3 text-sm text-gray-600">
+                ${new Date(transfer.movement_date).toLocaleDateString()} ${new Date(transfer.movement_date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+              </td>
+            </tr>
+          `;
+        }).join('');
       } else {
-        transfersContainer.innerHTML = '<tr><td colspan="5" class="px-4 py-2 border text-center text-gray-500">No transfers found</td></tr>';
+        transfersContainer.innerHTML = '<tr><td colspan="5" class="px-4 py-6 text-center text-gray-500 text-sm">No transfers found</td></tr>';
       }
       
       // Populate remaining completion
       const remainingContainer = document.getElementById('pd_remaining');
       if (data.remaining_completion) {
         remainingContainer.innerHTML = `
-          <div class="grid grid-cols-2 gap-4">
-            <div>
-              <p class="text-sm text-gray-600">Remaining Before</p>
-              <p class="font-semibold">${Number(data.remaining_completion.remaining_qty_before).toFixed(3)} pcs / ${Number(data.remaining_completion.remaining_weight_before).toFixed(3)} kg</p>
+          <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <div class="bg-white p-4 rounded-lg border border-purple-200">
+              <p class="text-xs font-medium text-purple-600 uppercase tracking-wide">Remaining Before</p>
+              <p class="text-xl font-bold text-gray-900 mt-2">${Number(data.remaining_completion.remaining_qty_before).toFixed(3)} pcs</p>
+              <p class="text-xs text-gray-600 mt-1">${Number(data.remaining_completion.remaining_weight_before).toFixed(3)} kg</p>
             </div>
-            <div>
-              <p class="text-sm text-gray-600">Actual Measured</p>
-              <p class="font-semibold">${Number(data.remaining_completion.actual_weight_measured).toFixed(3)} kg</p>
+            <div class="bg-white p-4 rounded-lg border border-blue-200">
+              <p class="text-xs font-medium text-blue-600 uppercase tracking-wide">Measured</p>
+              <p class="text-xl font-bold text-gray-900 mt-2">${Number(data.remaining_completion.actual_weight_measured).toFixed(3)} kg</p>
             </div>
-            <div>
-              <p class="text-sm text-gray-600">New Remaining</p>
-              <p class="font-semibold">${Number(data.remaining_completion.actual_units_rounded).toFixed(3)} pcs</p>
+            <div class="bg-white p-4 rounded-lg border border-green-200">
+              <p class="text-xs font-medium text-green-600 uppercase tracking-wide">New Remaining</p>
+              <p class="text-xl font-bold text-gray-900 mt-2">${Number(data.remaining_completion.actual_units_rounded).toFixed(3)} pcs</p>
             </div>
-            <div>
-              <p class="text-sm text-gray-600">Completed At</p>
-              <p class="font-semibold">${new Date(data.remaining_completion.completed_at).toLocaleString()}</p>
+            <div class="bg-white p-4 rounded-lg border border-indigo-200">
+              <p class="text-xs font-medium text-indigo-600 uppercase tracking-wide">Completed</p>
+              <p class="text-lg font-bold text-gray-900 mt-2">${new Date(data.remaining_completion.completed_at).toLocaleDateString()}</p>
+              <p class="text-xs text-gray-600 mt-1">${new Date(data.remaining_completion.completed_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</p>
             </div>
           </div>
         `;
       } else {
-        remainingContainer.innerHTML = '<p class="text-gray-500">No remaining verification completed</p>';
+        remainingContainer.innerHTML = '<div class="bg-white p-4 rounded-lg border border-dashed border-gray-300 text-center text-gray-600"><p class="text-sm">No remaining verification completed</p></div>';
       }
     })
     .catch(error => {
