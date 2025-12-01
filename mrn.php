@@ -25,13 +25,13 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         $stmt->execute([$_POST['mrn_no'], $_POST['mrn_date'], $_POST['purpose']]);
                         $mrn_id = $db->lastInsertId();
                         
-                        $items_inserted = 0;
+                        $items_requested = 0;
                         
                         // Always FROM Store (1) TO Production (2)
                         $source_location_id = 1;      // Store
                         $destination_location_id = 2; // Production
                         
-                        // Process each MRN item
+                        // Process each MRN item (just create records, no stock movement yet)
                         foreach ($_POST['items'] as $item) {
                             if (!empty($item['item_id']) && !empty($item['quantity'])) {
                                 $requested_qty = floatval($item['quantity']);
@@ -78,9 +78,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                                     }
                                 }
                                 
-                                // Use $requested_qty_kg for all stock operations (stock is stored in KG)
-                                
-                                // Get current stock in STORE (source) - from ledger
+                                // Validate available stock in STORE (check KG amount) - for request validation only
                                 $stmt = $db->prepare("
                                     SELECT COALESCE(SUM(quantity_in - quantity_out), 0) as current_balance 
                                     FROM stock_ledger 
@@ -95,23 +93,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                                     $stmt = $db->prepare("SELECT COALESCE(current_stock, 0) as stock FROM items WHERE id = ?");
                                     $stmt->execute([$item['item_id']]);
                                     $fallback_stock = floatval($stmt->fetchColumn());
-                                    if ($fallback_stock > 0) {
-                                        $source_balance = $fallback_stock;
-                                        // Create initial_stock entry for this item in Store to bootstrap the ledger
-                                        $stmt = $db->prepare("
-                                            INSERT INTO stock_ledger (
-                                                item_id, location_id, transaction_type, reference_id, reference_no,
-                                                transaction_date, quantity_in, quantity_out, balance, created_at
-                                            ) VALUES (?, ?, 'initial_stock', 0, 'FALLBACK', ?, ?, 0, ?, NOW())
-                                        ");
-                                        $stmt->execute([
-                                            $item['item_id'],
-                                            $source_location_id,
-                                            $_POST['mrn_date'],
-                                            $source_balance,
-                                            $source_balance
-                                        ]);
-                                    }
+                                    $source_balance = $fallback_stock;
                                 }
                                 
                                 // Validate available stock in STORE (check KG amount)
@@ -119,61 +101,15 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                                     throw new Exception("Insufficient stock in Store for {$item_data['name']}. Available: " . number_format($source_balance, 3) . " kg, Requested: " . number_format($requested_qty_kg, 3) . " kg (" . number_format($requested_qty, 0) . " " . $item_data['unit_symbol'] . ")");
                                 }
                                 
-                                // Balance in PRODUCTION (dest)
-                                $stmt = $db->prepare("
-                                    SELECT COALESCE(SUM(quantity_in - quantity_out), 0) as current_balance 
-                                    FROM stock_ledger 
-                                    WHERE item_id = ? AND location_id = ?
-                                ");
-                                $stmt->execute([$item['item_id'], $destination_location_id]);
-                                $dest_balance = floatval($stmt->fetchColumn());
-                                
-                                $new_source_balance = $source_balance - $requested_qty_kg;
-                                $new_dest_balance   = $dest_balance + $requested_qty_kg;
-                                
-                                // Insert MRN item (store requested qty in pieces for display, but stock ledger uses KG)
+                                // Insert MRN item (store requested qty in pieces for display)
                                 $stmt = $db->prepare("INSERT INTO mrn_items (mrn_id, item_id, location_id, quantity) VALUES (?, ?, ?, ?)");
                                 $stmt->execute([$mrn_id, $item['item_id'], $destination_location_id, $requested_qty]);
-                                $items_inserted++;
-                                
-                                // 1) OUT from STORE (use KG)
-                                $stmt = $db->prepare("
-                                    INSERT INTO stock_ledger (
-                                        item_id, location_id, transaction_type, reference_id, reference_no,
-                                        transaction_date, quantity_in, quantity_out, balance, created_at
-                                    ) VALUES (?, ?, 'mrn', ?, ?, ?, 0, ?, ?, NOW())
-                                ");
-                                $stmt->execute([
-                                    $item['item_id'], 
-                                    $source_location_id,
-                                    $mrn_id, 
-                                    $_POST['mrn_no'], 
-                                    $_POST['mrn_date'], 
-                                    $requested_qty_kg, 
-                                    $new_source_balance
-                                ]);
-                                
-                                // 2) IN to PRODUCTION (use KG)
-                                $stmt = $db->prepare("
-                                    INSERT INTO stock_ledger (
-                                        item_id, location_id, transaction_type, reference_id, reference_no,
-                                        transaction_date, quantity_in, quantity_out, balance, created_at
-                                    ) VALUES (?, ?, 'mrn', ?, ?, ?, ?, 0, ?, NOW())
-                                ");
-                                $stmt->execute([
-                                    $item['item_id'], 
-                                    $destination_location_id,
-                                    $mrn_id, 
-                                    $_POST['mrn_no'], 
-                                    $_POST['mrn_date'], 
-                                    $requested_qty_kg, 
-                                    $new_dest_balance
-                                ]);
+                                $items_requested++;
                             }
                         }
                         
-                        if ($items_inserted == 0) {
-                            throw new Exception("No items were processed. Please add items to the MRN.");
+                        if ($items_requested == 0) {
+                            throw new Exception("No items were requested. Please add items to the MRN.");
                         }
                         
                         $db->commit();
@@ -184,7 +120,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                             $stmt->execute([$_POST['production_batch']]);
                         }
                         
-                        $success = "MRN created successfully! {$items_inserted} items transferred from Store to Production Floor.";
+                        $success = "MRN request created successfully! {$items_requested} items requested. Click 'Complete' to execute the material transfer.";
                     } catch(Exception $e) {
                         $db->rollback();
                         throw $e;
@@ -355,11 +291,445 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                     }
                     break;
 
-                // Mark completed (works for both MRN and Return MRN)
+                // Mark completed (works for MRN, Return MRN, and Transfer TRN)
                 case 'complete':
-                    $stmt = $db->prepare("UPDATE mrn SET status = 'completed' WHERE id = ?");
-                    $stmt->execute([$_POST['id']]);
-                    $success = "Record marked as completed!";
+                    $db->beginTransaction();
+                    try {
+                        // Get MRN details to check if it's a TRN (transfer) or regular MRN
+                        $stmt = $db->prepare("SELECT mrn_no, mrn_date FROM mrn WHERE id = ?");
+                        $stmt->execute([$_POST['id']]);
+                        $mrn_record = $stmt->fetch(PDO::FETCH_ASSOC);
+                        
+                        if (!$mrn_record) {
+                            throw new Exception("MRN record not found");
+                        }
+                        
+                        $is_return = (strpos($mrn_record['mrn_no'], 'RTN') === 0);
+                        $is_transfer = (strpos($mrn_record['mrn_no'], 'TRN') === 0);
+                        
+                        if ($is_transfer) {
+                            // Execute the transfer: get items and do stock movements
+                            $stmt = $db->prepare("
+                                SELECT mi.*, i.name as item_name 
+                                FROM mrn_items mi 
+                                JOIN items i ON mi.item_id = i.id 
+                                WHERE mi.mrn_id = ?
+                            ");
+                            $stmt->execute([$_POST['id']]);
+                            $transfer_items = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                            
+                            if (empty($transfer_items)) {
+                                throw new Exception("No items found for transfer");
+                            }
+                            
+                            // Resolve locations
+                            $stmt = $db->prepare("SELECT id, name FROM locations WHERE name IN ('Production Floor', 'Store')");
+                            $stmt->execute();
+                            $locations = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                            
+                            $production_floor_id = null;
+                            $store_id = null;
+                            foreach ($locations as $loc) {
+                                if ($loc['name'] == 'Production Floor') $production_floor_id = $loc['id'];
+                                if ($loc['name'] == 'Store') $store_id = $loc['id'];
+                            }
+                            
+                            if (!$production_floor_id || !$store_id) {
+                                throw new Exception("Required locations 'Production Floor' and 'Store' not found in database.");
+                            }
+                            
+                            $affected_items = [];
+                            
+                            foreach ($transfer_items as $item) {
+                                $item_id = $item['item_id'];
+                                $transfer_qty = floatval($item['quantity']);
+                                
+                                // Double-check stock availability in Production Floor
+                                $stmt = $db->prepare("
+                                    SELECT COALESCE(SUM(quantity_in - quantity_out), 0) as current_balance 
+                                    FROM stock_ledger 
+                                    WHERE item_id = ? AND location_id = ?
+                                ");
+                                $stmt->execute([$item_id, $production_floor_id]);
+                                $production_balance = floatval($stmt->fetchColumn());
+                                
+                                if ($production_balance < $transfer_qty) {
+                                    throw new Exception("Insufficient stock in Production Floor for {$item['item_name']}. Available: " . number_format($production_balance, 3) . ", Requested: " . number_format($transfer_qty, 3));
+                                }
+                                
+                                // Get Store balance for correct new balance
+                                $stmt = $db->prepare("
+                                    SELECT COALESCE(SUM(quantity_in - quantity_out), 0) as current_balance 
+                                    FROM stock_ledger 
+                                    WHERE item_id = ? AND location_id = ?
+                                ");
+                                $stmt->execute([$item_id, $store_id]);
+                                $store_balance = floatval($stmt->fetchColumn());
+                                
+                                $new_production_balance = $production_balance - $transfer_qty;
+                                $new_store_balance = $store_balance + $transfer_qty;
+                                
+                                // OUT from Production Floor
+                                $stmt = $db->prepare("
+                                    INSERT INTO stock_ledger (
+                                        item_id, location_id, transaction_type, reference_id, reference_no,
+                                        transaction_date, quantity_in, quantity_out, balance, created_at
+                                    ) VALUES (?, ?, 'transfer_out', ?, ?, ?, 0, ?, ?, NOW())
+                                ");
+                                $stmt->execute([
+                                    $item_id, 
+                                    $production_floor_id,
+                                    $_POST['id'], 
+                                    $mrn_record['mrn_no'], 
+                                    $mrn_record['mrn_date'], 
+                                    $transfer_qty, 
+                                    $new_production_balance
+                                ]);
+                                
+                                // IN to Store
+                                $stmt = $db->prepare("
+                                    INSERT INTO stock_ledger (
+                                        item_id, location_id, transaction_type, reference_id, reference_no,
+                                        transaction_date, quantity_in, quantity_out, balance, created_at
+                                    ) VALUES (?, ?, 'transfer_in', ?, ?, ?, ?, 0, ?, NOW())
+                                ");
+                                $stmt->execute([
+                                    $item_id, 
+                                    $store_id,
+                                    $_POST['id'], 
+                                    $mrn_record['mrn_no'], 
+                                    $mrn_record['mrn_date'], 
+                                    $transfer_qty, 
+                                    $new_store_balance
+                                ]);
+                                
+                                $affected_items[] = $item_id;
+                            }
+                            
+                            // Update current_stock for all affected items
+                            foreach ($affected_items as $item_id) {
+                                $stmt = $db->prepare("
+                                    SELECT COALESCE(SUM(quantity_in - quantity_out), 0) as total_stock
+                                    FROM stock_ledger
+                                    WHERE item_id = ?
+                                ");
+                                $stmt->execute([$item_id]);
+                                $total_stock = floatval($stmt->fetchColumn());
+                                
+                                $stmt = $db->prepare("UPDATE items SET current_stock = ? WHERE id = ?");
+                                $stmt->execute([$total_stock, $item_id]);
+                            }
+                        } elseif ($is_return) {
+                            // Execute return: get items and do stock movements (Production -> Store)
+                            $stmt = $db->prepare("
+                                SELECT mi.*, i.name as item_name, i.type, u.symbol as unit_symbol
+                                FROM mrn_items mi 
+                                JOIN items i ON mi.item_id = i.id 
+                                JOIN units u ON i.unit_id = u.id 
+                                WHERE mi.mrn_id = ?
+                            ");
+                            $stmt->execute([$_POST['id']]);
+                            $return_items = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                            
+                            if (empty($return_items)) {
+                                throw new Exception("No items found for return");
+                            }
+                            
+                            $source_location_id = 2; // Production
+                            $destination_location_id = 1; // Store
+                            $affected_items = [];
+                            
+                            foreach ($return_items as $item) {
+                                $item_id = $item['item_id'];
+                                $requested_qty = floatval($item['quantity']);
+                                
+                                // CONVERT PIECES TO KG if needed
+                                $requested_qty_kg = $requested_qty; // Default: assume already in kg
+                                
+                                // If unit is PCS/PC, convert to KG using BOM data
+                                if (strtolower($item['unit_symbol']) == 'pcs' || strtolower($item['unit_symbol']) == 'pc') {
+                                    $kg_per_piece = 0;
+                                    
+                                    // Try bom_product first
+                                    $stmt = $db->prepare("SELECT product_unit_qty FROM bom_product WHERE finished_item_id = ? LIMIT 1");
+                                    $stmt->execute([$item_id]);
+                                    $bom_product = $stmt->fetch();
+                                    
+                                    if ($bom_product && $bom_product['product_unit_qty'] > 0) {
+                                        $kg_per_piece = floatval($bom_product['product_unit_qty']);
+                                    } else {
+                                        // Try bom_direct
+                                        $stmt = $db->prepare("SELECT finished_unit_qty FROM bom_direct WHERE finished_item_id = ? LIMIT 1");
+                                        $stmt->execute([$item_id]);
+                                        $bom_direct = $stmt->fetch();
+                                        
+                                        if ($bom_direct && $bom_direct['finished_unit_qty'] > 0) {
+                                            $kg_per_piece = floatval($bom_direct['finished_unit_qty']);
+                                        }
+                                    }
+                                    
+                                    if ($kg_per_piece > 0) {
+                                        $requested_qty_kg = $requested_qty * $kg_per_piece;
+                                    } else {
+                                        // If no BOM data, treat as 1:1
+                                        $requested_qty_kg = $requested_qty;
+                                    }
+                                }
+                                
+                                // Stock in PRODUCTION (source) - from ledger
+                                $stmt = $db->prepare("
+                                    SELECT COALESCE(SUM(quantity_in - quantity_out), 0) as current_balance 
+                                    FROM stock_ledger 
+                                    WHERE item_id = ? AND location_id = ?
+                                ");
+                                $stmt->execute([$item_id, $source_location_id]);
+                                $ledger_balance = floatval($stmt->fetchColumn());
+                                
+                                // If no ledger entry, check items.current_stock as fallback
+                                $source_balance = $ledger_balance;
+                                if ($source_balance == 0) {
+                                    $stmt = $db->prepare("SELECT COALESCE(current_stock, 0) as stock FROM items WHERE id = ?");
+                                    $stmt->execute([$item_id]);
+                                    $fallback_stock = floatval($stmt->fetchColumn());
+                                    $source_balance = $fallback_stock;
+                                }
+                                
+                                if ($source_balance < $requested_qty_kg) {
+                                    throw new Exception("Insufficient stock in Production for {$item['item_name']}. Available: " . number_format($source_balance, 3) . " kg, Requested: " . number_format($requested_qty_kg, 3) . " kg (" . number_format($requested_qty, 0) . " " . $item['unit_symbol'] . ")");
+                                }
+                                
+                                // Stock in STORE (dest)
+                                $stmt = $db->prepare("
+                                    SELECT COALESCE(SUM(quantity_in - quantity_out), 0) as current_balance 
+                                    FROM stock_ledger 
+                                    WHERE item_id = ? AND location_id = ?
+                                ");
+                                $stmt->execute([$item_id, $destination_location_id]);
+                                $dest_balance = floatval($stmt->fetchColumn());
+                                
+                                $new_source_balance = $source_balance - $requested_qty_kg;
+                                $new_dest_balance   = $dest_balance + $requested_qty_kg;
+                                
+                                // 1) OUT from PRODUCTION (transaction_type='mrn_return', use KG)
+                                $stmt = $db->prepare("
+                                    INSERT INTO stock_ledger (
+                                        item_id, location_id, transaction_type, reference_id, reference_no,
+                                        transaction_date, quantity_in, quantity_out, balance, created_at
+                                    ) VALUES (?, ?, 'mrn_return', ?, ?, ?, 0, ?, ?, NOW())
+                                ");
+                                $stmt->execute([
+                                    $item_id, 
+                                    $source_location_id,
+                                    $_POST['id'], 
+                                    $mrn_record['mrn_no'], 
+                                    $mrn_record['mrn_date'], 
+                                    $requested_qty_kg, 
+                                    $new_source_balance
+                                ]);
+                                
+                                // 2) IN to STORE        (transaction_type='mrn_return', use KG)
+                                $stmt = $db->prepare("
+                                    INSERT INTO stock_ledger (
+                                        item_id, location_id, transaction_type, reference_id, reference_no,
+                                        transaction_date, quantity_in, quantity_out, balance, created_at
+                                    ) VALUES (?, ?, 'mrn_return', ?, ?, ?, ?, 0, ?, NOW())
+                                ");
+                                $stmt->execute([
+                                    $item_id, 
+                                    $destination_location_id,
+                                    $_POST['id'], 
+                                    $mrn_record['mrn_no'], 
+                                    $mrn_record['mrn_date'], 
+                                    $requested_qty_kg, 
+                                    $new_dest_balance
+                                ]);
+                                
+                                $affected_items[] = $item_id;
+                            }
+                            
+                            // Update current_stock for all affected items
+                            foreach ($affected_items as $item_id) {
+                                $stmt = $db->prepare("
+                                    SELECT COALESCE(SUM(quantity_in - quantity_out), 0) as total_stock
+                                    FROM stock_ledger
+                                    WHERE item_id = ?
+                                ");
+                                $stmt->execute([$item_id]);
+                                $total_stock = floatval($stmt->fetchColumn());
+                                
+                                $stmt = $db->prepare("UPDATE items SET current_stock = ? WHERE id = ?");
+                                $stmt->execute([$total_stock, $item_id]);
+                            }
+                        } else {
+                            // Execute regular MRN: get items and do stock movements (Store -> Production)
+                            $stmt = $db->prepare("
+                                SELECT mi.*, i.name as item_name, i.type, u.symbol as unit_symbol
+                                FROM mrn_items mi 
+                                JOIN items i ON mi.item_id = i.id 
+                                JOIN units u ON i.unit_id = u.id 
+                                WHERE mi.mrn_id = ?
+                            ");
+                            $stmt->execute([$_POST['id']]);
+                            $mrn_items = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                            
+                            if (empty($mrn_items)) {
+                                throw new Exception("No items found for MRN");
+                            }
+                            
+                            $source_location_id = 1;      // Store
+                            $destination_location_id = 2; // Production
+                            $affected_items = [];
+                            
+                            foreach ($mrn_items as $item) {
+                                $item_id = $item['item_id'];
+                                $requested_qty = floatval($item['quantity']);
+                                
+                                // CONVERT PIECES TO KG if needed
+                                $requested_qty_kg = $requested_qty; // Default: assume already in kg
+                                
+                                // If unit is PCS/PC, convert to KG using BOM data
+                                if (strtolower($item['unit_symbol']) == 'pcs' || strtolower($item['unit_symbol']) == 'pc') {
+                                    $kg_per_piece = 0;
+                                    
+                                    // Try bom_product first
+                                    $stmt = $db->prepare("SELECT product_unit_qty FROM bom_product WHERE finished_item_id = ? LIMIT 1");
+                                    $stmt->execute([$item_id]);
+                                    $bom_product = $stmt->fetch();
+                                    
+                                    if ($bom_product && $bom_product['product_unit_qty'] > 0) {
+                                        $kg_per_piece = floatval($bom_product['product_unit_qty']);
+                                    } else {
+                                        // Try bom_direct
+                                        $stmt = $db->prepare("SELECT finished_unit_qty FROM bom_direct WHERE finished_item_id = ? LIMIT 1");
+                                        $stmt->execute([$item_id]);
+                                        $bom_direct = $stmt->fetch();
+                                        
+                                        if ($bom_direct && $bom_direct['finished_unit_qty'] > 0) {
+                                            $kg_per_piece = floatval($bom_direct['finished_unit_qty']);
+                                        }
+                                    }
+                                    
+                                    if ($kg_per_piece > 0) {
+                                        $requested_qty_kg = $requested_qty * $kg_per_piece;
+                                    } else {
+                                        // If no BOM data, treat as 1:1
+                                        $requested_qty_kg = $requested_qty;
+                                    }
+                                }
+                                
+                                // Get current stock in STORE (source) - from ledger
+                                $stmt = $db->prepare("
+                                    SELECT COALESCE(SUM(quantity_in - quantity_out), 0) as current_balance 
+                                    FROM stock_ledger 
+                                    WHERE item_id = ? AND location_id = ?
+                                ");
+                                $stmt->execute([$item_id, $source_location_id]);
+                                $ledger_balance = floatval($stmt->fetchColumn());
+                                
+                                // If no ledger entry, check items.current_stock as fallback
+                                $source_balance = $ledger_balance;
+                                if ($source_balance == 0) {
+                                    $stmt = $db->prepare("SELECT COALESCE(current_stock, 0) as stock FROM items WHERE id = ?");
+                                    $stmt->execute([$item_id]);
+                                    $fallback_stock = floatval($stmt->fetchColumn());
+                                    if ($fallback_stock > 0) {
+                                        $source_balance = $fallback_stock;
+                                        // Create initial_stock entry for this item in Store to bootstrap the ledger
+                                        $stmt = $db->prepare("
+                                            INSERT INTO stock_ledger (
+                                                item_id, location_id, transaction_type, reference_id, reference_no,
+                                                transaction_date, quantity_in, quantity_out, balance, created_at
+                                            ) VALUES (?, ?, 'initial_stock', 0, 'FALLBACK', ?, ?, 0, ?, NOW())
+                                        ");
+                                        $stmt->execute([
+                                            $item_id,
+                                            $source_location_id,
+                                            $mrn_record['mrn_date'],
+                                            $source_balance,
+                                            $source_balance
+                                        ]);
+                                    }
+                                }
+                                
+                                // Double-check available stock in STORE (check KG amount)
+                                if ($source_balance < $requested_qty_kg) {
+                                    throw new Exception("Insufficient stock in Store for {$item['item_name']}. Available: " . number_format($source_balance, 3) . " kg, Requested: " . number_format($requested_qty_kg, 3) . " kg (" . number_format($requested_qty, 0) . " " . $item['unit_symbol'] . ")");
+                                }
+                                
+                                // Balance in PRODUCTION (dest)
+                                $stmt = $db->prepare("
+                                    SELECT COALESCE(SUM(quantity_in - quantity_out), 0) as current_balance 
+                                    FROM stock_ledger 
+                                    WHERE item_id = ? AND location_id = ?
+                                ");
+                                $stmt->execute([$item_id, $destination_location_id]);
+                                $dest_balance = floatval($stmt->fetchColumn());
+                                
+                                $new_source_balance = $source_balance - $requested_qty_kg;
+                                $new_dest_balance   = $dest_balance + $requested_qty_kg;
+                                
+                                // 1) OUT from STORE (use KG)
+                                $stmt = $db->prepare("
+                                    INSERT INTO stock_ledger (
+                                        item_id, location_id, transaction_type, reference_id, reference_no,
+                                        transaction_date, quantity_in, quantity_out, balance, created_at
+                                    ) VALUES (?, ?, 'mrn', ?, ?, ?, 0, ?, ?, NOW())
+                                ");
+                                $stmt->execute([
+                                    $item_id, 
+                                    $source_location_id,
+                                    $_POST['id'], 
+                                    $mrn_record['mrn_no'], 
+                                    $mrn_record['mrn_date'], 
+                                    $requested_qty_kg, 
+                                    $new_source_balance
+                                ]);
+                                
+                                // 2) IN to PRODUCTION (use KG)
+                                $stmt = $db->prepare("
+                                    INSERT INTO stock_ledger (
+                                        item_id, location_id, transaction_type, reference_id, reference_no,
+                                        transaction_date, quantity_in, quantity_out, balance, created_at
+                                    ) VALUES (?, ?, 'mrn', ?, ?, ?, ?, 0, ?, NOW())
+                                ");
+                                $stmt->execute([
+                                    $item_id, 
+                                    $destination_location_id,
+                                    $_POST['id'], 
+                                    $mrn_record['mrn_no'], 
+                                    $mrn_record['mrn_date'], 
+                                    $requested_qty_kg, 
+                                    $new_dest_balance
+                                ]);
+                                
+                                $affected_items[] = $item_id;
+                            }
+                            
+                            // Update current_stock for all affected items
+                            foreach ($affected_items as $item_id) {
+                                $stmt = $db->prepare("
+                                    SELECT COALESCE(SUM(quantity_in - quantity_out), 0) as total_stock
+                                    FROM stock_ledger
+                                    WHERE item_id = ?
+                                ");
+                                $stmt->execute([$item_id]);
+                                $total_stock = floatval($stmt->fetchColumn());
+                                
+                                $stmt = $db->prepare("UPDATE items SET current_stock = ? WHERE id = ?");
+                                $stmt->execute([$total_stock, $item_id]);
+                            }
+                        }
+                        
+                        // Mark as completed
+                        $stmt = $db->prepare("UPDATE mrn SET status = 'completed' WHERE id = ?");
+                        $stmt->execute([$_POST['id']]);
+                        
+                        $db->commit();
+                        $success = $is_transfer ? "Transfer completed successfully! Stock movements executed." : ($is_return ? "Return MRN completed successfully! Stock movements executed." : "MRN completed successfully! Stock movements executed.");
+                    } catch(Exception $e) {
+                        $db->rollback();
+                        throw $e;
+                    }
                     break;
 
                 // Delete (support MRN or Return MRN by detecting prefix)
@@ -384,9 +754,21 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
 
                         // Detect transaction type based on prefix
                         $is_return = (strpos($mrn_no, 'RTN') === 0);
-                        // Use MRN types for returns
-                        $ledger_type   = $is_return ? 'mrn_return' : 'mrn';
-                        $reversal_type = $is_return ? 'mrn_return_reversal' : 'mrn_reversal';
+                        $is_transfer = (strpos($mrn_no, 'TRN') === 0);
+                        
+                        if ($is_transfer) {
+                            // Transfer records use 'transfer_in' and 'transfer_out'
+                            $ledger_types = ['transfer_in', 'transfer_out'];
+                            $reversal_type = 'transfer_reversal';
+                        } elseif ($is_return) {
+                            // Return records use 'mrn_return'
+                            $ledger_types = ['mrn_return'];
+                            $reversal_type = 'mrn_return_reversal';
+                        } else {
+                            // Regular MRN records use 'mrn'
+                            $ledger_types = ['mrn'];
+                            $reversal_type = 'mrn_reversal';
+                        }
                         
                         foreach ($mrn_items as $item) {
                             // Balance at stored location_id (dest saved in items)
@@ -422,9 +804,10 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                             $stmt->execute([$item['quantity'], $item['item_id']]);
                         }
 
-                        // Delete original stock ledger entries for this ref & type
-                        $stmt = $db->prepare("DELETE FROM stock_ledger WHERE transaction_type = ? AND reference_id = ?");
-                        $stmt->execute([$ledger_type, $_POST['id']]);
+                        // Delete original stock ledger entries for this ref & types
+                        $placeholders = str_repeat('?,', count($ledger_types) - 1) . '?';
+                        $stmt = $db->prepare("DELETE FROM stock_ledger WHERE transaction_type IN ($placeholders) AND reference_id = ?");
+                        $stmt->execute(array_merge($ledger_types, [$_POST['id']]));
 
                         // Delete MRN items
                         $stmt = $db->prepare("DELETE FROM mrn_items WHERE mrn_id = ?");
@@ -436,6 +819,95 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         
                         $db->commit();
                         $success = "Record deleted successfully and stock restored!";
+                    } catch(Exception $e) {
+                        $db->rollback();
+                        throw $e;
+                    }
+                    break;
+
+                // =========================
+                // TRANSFER FINISHED GOODS (Production Floor -> Store)
+                // =========================
+                case 'transfer_finished':
+                    $db->beginTransaction();
+                    try {
+                        // Resolve locations
+                        $stmt = $db->prepare("SELECT id, name FROM locations WHERE name IN ('Production Floor', 'Store')");
+                        $stmt->execute();
+                        $locations = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                        
+                        $production_floor_id = null;
+                        $store_id = null;
+                        foreach ($locations as $loc) {
+                            if ($loc['name'] == 'Production Floor') $production_floor_id = $loc['id'];
+                            if ($loc['name'] == 'Store') $store_id = $loc['id'];
+                        }
+                        
+                        if (!$production_floor_id || !$store_id) {
+                            throw new Exception("Required locations 'Production Floor' and 'Store' not found in database.");
+                        }
+                        
+                        // Generate TRN number
+                        $trn_count = (int)$db->query("SELECT COUNT(*) FROM mrn WHERE mrn_no LIKE 'TRN%'")->fetchColumn();
+                        $trn_no = 'TRN' . str_pad($trn_count + 1, 3, '0', STR_PAD_LEFT);
+                        
+                        // Insert MRN header
+                        $purpose = $_POST['purpose'] ?? 'Rolls & Bundles Transfer Production → Store';
+                        $transfer_date = $_POST['transfer_date'] ?? date('Y-m-d');
+                        
+                        $stmt = $db->prepare("INSERT INTO mrn (mrn_no, mrn_date, purpose, status, created_at) VALUES (?, ?, ?, 'pending', NOW())");
+                        $stmt->execute([$trn_no, $transfer_date, $purpose]);
+                        $mrn_id = $db->lastInsertId();
+                        
+                        $items_requested = 0;
+                        
+                        // Process transfer items (just create records, no stock movement yet)
+                        foreach ($_POST['transfer_items'] as $item) {
+                            if (!empty($item['item_id']) && !empty($item['quantity'])) {
+                                $item_id = intval($item['item_id']);
+                                $transfer_qty = floatval($item['quantity']);
+                                
+                                if ($transfer_qty <= 0) continue;
+                                
+                                // Verify item exists and is finished
+                                $stmt = $db->prepare("SELECT id, name, type FROM items WHERE id = ?");
+                                $stmt->execute([$item_id]);
+                                $item_data = $stmt->fetch(PDO::FETCH_ASSOC);
+                                
+                                if (!$item_data) {
+                                    throw new Exception("Item not found");
+                                }
+                                
+                                if ($item_data['type'] !== 'finished') {
+                                    throw new Exception("Only finished goods can be transferred: {$item_data['name']}");
+                                }
+                                
+                                // Check stock in Production Floor (for validation only)
+                                $stmt = $db->prepare("
+                                    SELECT COALESCE(SUM(quantity_in - quantity_out), 0) as current_balance 
+                                    FROM stock_ledger 
+                                    WHERE item_id = ? AND location_id = ?
+                                ");
+                                $stmt->execute([$item_id, $production_floor_id]);
+                                $production_balance = floatval($stmt->fetchColumn());
+                                
+                                if ($production_balance < $transfer_qty) {
+                                    throw new Exception("Insufficient stock in Production Floor for {$item_data['name']}. Available: " . number_format($production_balance, 3) . ", Requested: " . number_format($transfer_qty, 3));
+                                }
+                                
+                                // Insert into mrn_items (location_id = Store, quantity = requested amount)
+                                $stmt = $db->prepare("INSERT INTO mrn_items (mrn_id, item_id, location_id, quantity) VALUES (?, ?, ?, ?)");
+                                $stmt->execute([$mrn_id, $item_id, $store_id, $transfer_qty]);
+                                $items_requested++;
+                            }
+                        }
+                        
+                        if ($items_requested == 0) {
+                            throw new Exception("No items were requested for transfer. Please select items and quantities.");
+                        }
+                        
+                        $db->commit();
+                        $success = "Transfer request created successfully! {$items_requested} items requested for transfer. Click 'Complete' to execute the transfer.";
                     } catch(Exception $e) {
                         $db->rollback();
                         throw $e;
@@ -490,8 +962,31 @@ try {
 try {
     $mrn_count = (int)$db->query("SELECT COUNT(*) FROM mrn WHERE mrn_no LIKE 'MRN%'")->fetchColumn();
     $rtn_count = (int)$db->query("SELECT COUNT(*) FROM mrn WHERE mrn_no LIKE 'RTN%'")->fetchColumn();
+    $trn_count = (int)$db->query("SELECT COUNT(*) FROM mrn WHERE mrn_no LIKE 'TRN%'")->fetchColumn();
 } catch(PDOException $e) {
-    $mrn_count = 0; $rtn_count = 0;
+    $mrn_count = 0; $rtn_count = 0; $trn_count = 0;
+}
+
+// Fetch finished items that are bundles or rolls with stock in Production Floor
+try {
+    $stmt = $db->query("
+        SELECT DISTINCT i.id, i.code, i.name, u.symbol as unit_symbol,
+               COALESCE((
+                   SELECT SUM(quantity_in - quantity_out) 
+                   FROM stock_ledger 
+                   WHERE item_id = i.id AND location_id = (SELECT id FROM locations WHERE name = 'Production Floor')
+               ), 0) as production_stock
+        FROM items i
+        JOIN units u ON i.unit_id = u.id
+        LEFT JOIN bundles b ON b.bundle_item_id = i.id
+        LEFT JOIN rolls_batches rb ON rb.rolls_item_id = i.id
+        WHERE i.type = 'finished' AND (b.id IS NOT NULL OR rb.id IS NOT NULL)
+        HAVING production_stock > 0
+        ORDER BY i.name
+    ");
+    $transfer_items = $stmt->fetchAll();
+} catch(PDOException $e) {
+    $transfer_items = [];
 }
 ?>
 
@@ -500,14 +995,19 @@ try {
     <div class="flex justify-between items-center">
         <div>
             <h1 class="text-3xl font-bold text-gray-900">Material Request Note (MRN) & Return MRN</h1>
-            <p class="text-gray-600">MRN: Store → Production | Return MRN: Production → Store</p>
+            <p class="text-gray-600">MRN: Store → Production | Return MRN: Production → Store | Transfer: Production → Store</p>
         </div>
-        <div class="space-x-2">
-            <button onclick="openModal('createMrnModal')" class="bg-primary text-white px-4 py-2 rounded-md hover:bg-blue-600 transition-colors">
-                Create New MRN
-            </button>
-            <button onclick="openModal('createReturnModal')" class="bg-indigo-600 text-white px-4 py-2 rounded-md hover:bg-indigo-700 transition-colors">
-                Create Return MRN
+        <div class="flex flex-col sm:flex-row gap-2 sm:gap-3">
+            <div class="flex flex-col sm:flex-row gap-2">
+                <button onclick="openModal('createMrnModal')" class="bg-primary text-white px-4 py-2 rounded-md hover:bg-blue-600 transition-colors text-sm font-medium">
+                    Create New MRN
+                </button>
+                <button onclick="openModal('createReturnModal')" class="bg-indigo-600 text-white px-4 py-2 rounded-md hover:bg-indigo-700 transition-colors text-sm font-medium">
+                    Create Return MRN
+                </button>
+            </div>
+            <button onclick="openModal('transferFinishedModal')" class="bg-green-600 text-white px-4 py-2 rounded-md hover:bg-green-700 transition-colors text-sm font-medium whitespace-nowrap">
+                Transfer Rolls & Bundles<br class="hidden sm:block"><span class="text-xs">(Production → Store)</span>
             </button>
         </div>
     </div>
@@ -557,11 +1057,21 @@ try {
             </thead>
             <tbody class="bg-white divide-y divide-gray-200">
                 <?php foreach ($mrns as $mrn): 
-                    $is_return = strpos($mrn['mrn_no'], 'RTN') === 0; ?>
+                    $is_return = strpos($mrn['mrn_no'], 'RTN') === 0;
+                    $is_transfer = strpos($mrn['mrn_no'], 'TRN') === 0; ?>
                 <tr class="hover:bg-gray-50">
                     <td class="px-6 py-4 whitespace-nowrap">
-                        <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium <?php echo $is_return ? 'bg-indigo-100 text-indigo-800' : 'bg-blue-100 text-blue-800'; ?>">
-                            <?php echo $is_return ? 'Return MRN' : 'MRN'; ?>
+                        <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium 
+                            <?php 
+                            if ($is_transfer) echo 'bg-green-100 text-green-800';
+                            elseif ($is_return) echo 'bg-indigo-100 text-indigo-800';
+                            else echo 'bg-blue-100 text-blue-800';
+                            ?>">
+                            <?php 
+                            if ($is_transfer) echo 'Transfer';
+                            elseif ($is_return) echo 'Return MRN';
+                            else echo 'MRN';
+                            ?>
                         </span>
                     </td>
                     <td class="px-6 py-4 whitespace-nowrap">
@@ -799,6 +1309,85 @@ try {
     </div>
 </div>
 
+<!-- Transfer Finished Goods Modal (Production Floor -> Store) -->
+<div id="transferFinishedModal" class="fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full modal-backdrop hidden">
+    <div class="relative top-10 mx-auto p-5 border w-5/6 max-w-4xl shadow-lg rounded-md bg-white">
+        <div class="flex justify-between items-center mb-4">
+            <h3 class="text-lg font-bold text-gray-900">Transfer Rolls & Bundles (Production Floor → Store)</h3>
+            <button onclick="closeModal('transferFinishedModal')" class="text-gray-400 hover:text-gray-600">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+            </button>
+        </div>
+        <form method="POST" class="space-y-6" onsubmit="return validateTransferForm()">
+            <input type="hidden" name="action" value="transfer_finished">
+            
+            <!-- Transfer Header -->
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Transfer Date *</label>
+                    <input type="date" name="transfer_date" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent" value="<?php echo date('Y-m-d'); ?>">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Purpose</label>
+                    <input type="text" name="purpose" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent" placeholder="Rolls & Bundles Transfer Production → Store" value="Rolls & Bundles Transfer Production → Store">
+                </div>
+            </div>
+
+            <!-- Items Section -->
+            <div>
+                <div class="flex justify-between items-center mb-4">
+                    <h4 class="text-md font-semibold text-gray-900">Items to Transfer (Bundles & Rolls from Production Floor)</h4>
+                    <button type="button" onclick="addTransferItem()" class="bg-green-600 text-white px-3 py-1 rounded text-sm hover:bg-green-700">Add Item</button>
+                </div>
+                
+                <div class="overflow-x-auto">
+                    <table class="min-w-full border border-gray-300">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase border-r">Item</th>
+                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase border-r">Available in Production Floor</th>
+                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase border-r">Transfer Quantity</th>
+                                <th class="px-4 py-2 text-center text-xs font-medium text-gray-500 uppercase">Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="transferItemsTable">
+                            <tr class="transfer-item-row">
+                                <td class="px-4 py-2 border-r">
+                                    <select name="transfer_items[0][item_id]" class="w-full px-2 py-1 border border-gray-300 rounded text-sm item-select-transfer" onchange="updateTransferStock(this)" required>
+                                        <option value="">Select Item</option>
+                                        <?php foreach ($transfer_items as $item): ?>
+                                            <option value="<?php echo $item['id']; ?>" data-stock="<?php echo $item['production_stock']; ?>" data-unit="<?php echo $item['unit_symbol']; ?>">
+                                                <?php echo htmlspecialchars($item['name'] . ' (' . $item['code'] . ')'); ?>
+                                            </option>
+                                        <?php endforeach; ?>
+                                    </select>
+                                </td>
+                                <td class="px-4 py-2 border-r">
+                                    <div class="flex items-center">
+                                        <span class="stock-display text-sm font-medium">-</span>
+                                        <span class="ml-1 text-xs text-gray-500 unit-display"></span>
+                                    </div>
+                                </td>
+                                <td class="px-4 py-2 border-r">
+                                    <input type="number" name="transfer_items[0][quantity]" step="0.001" min="0.001" class="w-full px-2 py-1 border border-gray-300 rounded text-sm quantity-input" placeholder="0.000" onchange="validateTransferQuantity(this)" required>
+                                </td>
+                                <td class="px-4 py-2 text-center">
+                                    <button type="button" onclick="removeTransferItem(this)" class="text-red-600 hover:text-red-900 text-sm">Remove</button>
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="flex justify-end space-x-3 pt-4">
+                <button type="button" onclick="closeModal('transferFinishedModal')" class="px-4 py-2 border border-gray-300 rounded-md text-gray-700 hover:bg-gray-50">Cancel</button>
+                <button type="submit" class="px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700">Transfer Items</button>
+            </div>
+        </form>
+    </div>
+</div>
+
 <!-- View MRN Details Modal (simple placeholder; hook up to your get_mrn_details.php) -->
 <div id="viewMrnModal" class="fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full modal-backdrop hidden">
     <div class="relative top-4 mx-auto p-5 border w-11/12 max-w-7xl shadow-lg rounded-md bg-white">
@@ -900,6 +1489,108 @@ function addReturnItem() {
 function removeReturnItem(button) {
     const table = document.getElementById('returnItemsTable');
     if (table.rows.length > 1) { button.closest('tr').remove(); }
+}
+
+// ===== Add/Remove rows (Transfer)
+let transferItemCount = 1;
+
+function addTransferItem() {
+    const table = document.getElementById('transferItemsTable');
+    const row = document.createElement('tr');
+    row.className = 'transfer-item-row';
+    row.innerHTML = `
+        <td class="px-4 py-2 border-r">
+            <select name="transfer_items[${transferItemCount}][item_id]" class="w-full px-2 py-1 border border-gray-300 rounded text-sm item-select-transfer" onchange="updateTransferStock(this)" required>
+                <option value="">Select Item</option>
+                <?php foreach ($transfer_items as $item): ?>
+                    <option value="<?php echo $item['id']; ?>" data-stock="<?php echo $item['production_stock']; ?>" data-unit="<?php echo $item['unit_symbol']; ?>">
+                        <?php echo htmlspecialchars($item['name'] . ' (' . $item['code'] . ')'); ?>
+                    </option>
+                <?php endforeach; ?>
+            </select>
+        </td>
+        <td class="px-4 py-2 border-r">
+            <div class="flex items-center">
+                <span class="stock-display text-sm font-medium">-</span>
+                <span class="ml-1 text-xs text-gray-500 unit-display"></span>
+            </div>
+        </td>
+        <td class="px-4 py-2 border-r">
+            <input type="number" name="transfer_items[${transferItemCount}][quantity]" step="0.001" min="0.001" class="w-full px-2 py-1 border border-gray-300 rounded text-sm quantity-input" placeholder="0.000" onchange="validateTransferQuantity(this)" required>
+        </td>
+        <td class="px-4 py-2 text-center">
+            <button type="button" onclick="removeTransferItem(this)" class="text-red-600 hover:text-red-900 text-sm">Remove</button>
+        </td>
+    `;
+    table.appendChild(row);
+    transferItemCount++;
+}
+
+function removeTransferItem(button) {
+    const table = document.getElementById('transferItemsTable');
+    if (table.rows.length > 1) { button.closest('tr').remove(); }
+}
+
+function updateTransferStock(select) {
+    const row = select.closest('tr');
+    const option = select.options[select.selectedIndex];
+    if (option.value) {
+        const stock = parseFloat(option.getAttribute('data-stock') || 0);
+        const unit = option.getAttribute('data-unit') || '';
+        const stockDisplay = row.querySelector('.stock-display');
+        const unitDisplay = row.querySelector('.unit-display');
+        const quantityInput = row.querySelector('.quantity-input');
+        
+        stockDisplay.textContent = stock.toFixed(3);
+        stockDisplay.className = 'stock-display text-sm font-medium ' + 
+            (stock === 0 ? 'text-red-600' : stock < 50 ? 'text-yellow-600' : 'text-green-600');
+        
+        if (unitDisplay) unitDisplay.textContent = unit;
+        
+        quantityInput.setAttribute('max', stock);
+    } else {
+        resetStockDisplay(row);
+    }
+}
+
+function validateTransferQuantity(input) {
+    const row = input.closest('tr');
+    const maxStock = parseFloat(input.getAttribute('max') || 0);
+    const requestedQty = parseFloat(input.value || 0);
+    if (requestedQty > maxStock) {
+        input.style.borderColor = '#ef4444';
+        input.title = `Insufficient stock! Available: ${maxStock.toFixed(3)}, Requested: ${requestedQty.toFixed(3)}`;
+        row.classList.add('insufficient-stock');
+        let warningDiv = row.querySelector('.stock-warning');
+        if (!warningDiv) {
+            warningDiv = document.createElement('div');
+            warningDiv.className = 'stock-warning text-xs text-red-600 mt-1';
+            row.cells[1].appendChild(warningDiv);
+        }
+        warningDiv.textContent = `Insufficient: Avail ${maxStock.toFixed(3)}, Req ${requestedQty.toFixed(3)}`;
+        return false;
+    } else {
+        input.style.borderColor = '#d1d5db';
+        input.title = '';
+        row.classList.remove('insufficient-stock');
+        const warningDiv = row.querySelector('.stock-warning');
+        if (warningDiv) warningDiv.remove();
+        return true;
+    }
+}
+
+function validateTransferForm() {
+    let isValid = true;
+    const quantityInputs = document.querySelectorAll('#transferItemsTable .quantity-input');
+    quantityInputs.forEach(input => {
+        if (!validateTransferQuantity(input)) {
+            isValid = false;
+        }
+    });
+    if (!isValid) {
+        alert('Please correct the quantity errors before submitting.');
+    }
+    return isValid;
 }
 
 // ===== Stock helpers

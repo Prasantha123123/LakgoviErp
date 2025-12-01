@@ -1488,7 +1488,9 @@ try {
                                         'production_in' => 'bg-purple-100 text-purple-800',
                                         'production_out' => 'bg-orange-100 text-orange-800',
                                         'trolley' => 'bg-yellow-100 text-yellow-800',
-                                        'opening_stock' => 'bg-gray-100 text-gray-800'
+                                        'opening_stock' => 'bg-gray-100 text-gray-800',
+                                        'transfer_in' => 'bg-teal-100 text-teal-800',
+                                        'transfer_out' => 'bg-red-100 text-red-800'
                                     ];
                                     echo $type_colors[$movement['transaction_type']] ?? 'bg-gray-100 text-gray-800';
                                 ?>">
