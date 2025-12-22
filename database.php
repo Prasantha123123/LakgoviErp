@@ -3,8 +3,8 @@
 class Database {
     private $host = 'localhost';
     private $db_name = 'lakgovi_erp';
-    private $username = 'root';
-    private $password = '';
+     private $username = 'dbuser';
+    private $password = 'L{582Phb1Lh5';
     private $conn;
 
     public function getConnection() {
@@ -14,7 +14,7 @@ class Database {
                                 $this->username, $this->password);
             $this->conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
         } catch(PDOException $exception) {
-            throw new Exception("Connection error: " . $exception->getMessage());
+            echo "Connection error: " . $exception->getMessage();
         }
         return $this->conn;
     }
