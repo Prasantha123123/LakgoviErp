@@ -107,11 +107,12 @@ try {
                     FROM items i
                     JOIN units u ON u.id = i.unit_id
                     LEFT JOIN stock_ledger sl ON sl.item_id = i.id AND sl.location_id = 1
-                    WHERE i.category_id = ? AND i.type = 'raw'
+                    LEFT JOIN item_categories ic ON ic.item_id = i.id
+                    WHERE (i.category_id = ? OR ic.category_id = ?) AND i.type = 'raw'
                     GROUP BY i.id, i.code, i.name, u.symbol
                     ORDER BY i.name
                 ");
-                $stmt->execute([$category_id]);
+                $stmt->execute([$category_id, $category_id]);
                 $category_items = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
                 // Calculate total available stock for the category
@@ -189,11 +190,12 @@ try {
                     FROM items i
                     JOIN units u ON u.id = i.unit_id
                     LEFT JOIN stock_ledger sl ON sl.item_id = i.id AND sl.location_id = 1
-                    WHERE i.category_id = ? AND i.type = 'raw'
+                    LEFT JOIN item_categories ic ON ic.item_id = i.id
+                    WHERE (i.category_id = ? OR ic.category_id = ?) AND i.type = 'raw'
                     GROUP BY i.id, i.code, i.name, u.symbol
                     ORDER BY i.name
                 ");
-                $stmt->execute([$category_id]);
+                $stmt->execute([$category_id, $category_id]);
                 $category_items = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
                 // Calculate total available stock for the category

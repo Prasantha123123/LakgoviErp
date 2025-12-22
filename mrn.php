@@ -39,18 +39,20 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                                 $total_requested_qty = floatval($item['quantity']);
                                 
                                 // Get all items in this category with their current stock
+                                // Includes items from both items.category_id AND item_categories junction table
                                 $stmt = $db->prepare("
                                     SELECT i.id AS item_id, i.name, i.code, u.symbol as unit_symbol,
                                            COALESCE(SUM(sl.quantity_in - sl.quantity_out), 0) as available_stock
                                     FROM items i
                                     JOIN units u ON u.id = i.unit_id
                                     LEFT JOIN stock_ledger sl ON sl.item_id = i.id AND sl.location_id = ?
-                                    WHERE i.category_id = ? AND i.type = 'raw'
+                                    LEFT JOIN item_categories ic ON ic.item_id = i.id
+                                    WHERE (i.category_id = ? OR ic.category_id = ?) AND i.type = 'raw'
                                     GROUP BY i.id, i.name, i.code, u.symbol
                                     HAVING available_stock > 0
                                     ORDER BY available_stock DESC
                                 ");
-                                $stmt->execute([$source_location_id, $category_id]);
+                                $stmt->execute([$source_location_id, $category_id, $category_id]);
                                 $category_items = $stmt->fetchAll(PDO::FETCH_ASSOC);
                                 
                                 if (empty($category_items)) {
@@ -67,23 +69,17 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                                     throw new Exception("Insufficient stock in category. Available: " . number_format($total_category_stock, 3) . " kg, Requested: " . number_format($total_requested_qty, 3) . " kg");
                                 }
                                 
-                                // Distribute quantity proportionally across items
+                                // Distribute quantity sequentially - use first item fully, then move to next
                                 $remaining_qty = $total_requested_qty;
-                                $item_count = count($category_items);
                                 
-                                foreach ($category_items as $index => $cat_item) {
-                                    $item_stock = floatval($cat_item['available_stock']);
-                                    $allocated_qty = 0;
+                                foreach ($category_items as $cat_item) {
+                                    if ($remaining_qty <= 0) break; // No more quantity to allocate
                                     
-                                    if ($index == $item_count - 1) {
-                                        // Last item gets remaining quantity
-                                        $allocated_qty = $remaining_qty;
-                                    } else {
-                                        // Proportional allocation
-                                        $proportion = $item_stock / $total_category_stock;
-                                        $allocated_qty = round($total_requested_qty * $proportion, 3);
-                                        $allocated_qty = min($allocated_qty, $item_stock, $remaining_qty);
-                                    }
+                                    $item_stock = floatval($cat_item['available_stock']);
+                                    if ($item_stock <= 0) continue; // Skip items with no stock
+                                    
+                                    // Take minimum of what's needed vs what's available
+                                    $allocated_qty = min($remaining_qty, $item_stock);
                                     
                                     if ($allocated_qty > 0) {
                                         // Insert MRN item for this specific item
