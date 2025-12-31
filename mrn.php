@@ -1266,11 +1266,18 @@ try {
                     <select name="production_batch" id="production_batch" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent">
                         <option value="">Select Production Batch</option>
                         <?php
-                        $stmt = $db->query("SELECT id, batch_no, status FROM production WHERE status IN ('planned', 'pending_material', '') OR status IS NULL ORDER BY batch_no");
+                        $stmt = $db->query("
+                            SELECT p.id, p.batch_no, p.status, i.name as item_name 
+                            FROM production p 
+                            LEFT JOIN items i ON p.item_id = i.id 
+                            WHERE p.status IN ('planned', 'pending_material', '') OR p.status IS NULL 
+                            ORDER BY p.batch_no
+                        ");
                         while ($row = $stmt->fetch()) {
                             $effective_status = empty($row['status']) ? 'planned' : $row['status'];
                             $status_label = $effective_status === 'pending_material' ? ' (Pending Materials)' : '';
-                            echo "<option value='{$row['id']}'>{$row['batch_no']}{$status_label}</option>";
+                            $item_name = $row['item_name'] ? ' - ' . $row['item_name'] : '';
+                            echo "<option value='{$row['id']}'>{$row['batch_no']}{$item_name}{$status_label}</option>";
                         }
                         ?>
                     </select>
@@ -1300,28 +1307,7 @@ try {
                             </tr>
                         </thead>
                         <tbody id="mrnItemsTable">
-                            <tr class="mrn-item-row">
-                                <td class="px-4 py-2 border-r" style="width: calc(100% - 160px);">
-                                    <select name="items[0][item_id]" class="w-full px-2 py-1 border border-gray-300 rounded text-sm item-select-mrn" onchange="updateStockMrn(this)" required>
-                                        <option value="">Select Item</option>
-                                        <?php foreach ($items as $item): ?>
-                                            <option value="<?php echo $item['id']; ?>"><?php echo htmlspecialchars($item['name'] . ' (' . $item['code'] . ')'); ?></option>
-                                        <?php endforeach; ?>
-                                    </select>
-                                </td>
-                                <td class="px-4 py-2 border-r" style="width: 80px;">
-                                    <div class="flex items-center">
-                                        <span class="stock-display text-sm font-medium">-</span>
-                                        <span class="ml-1 text-xs text-gray-500 unit-display"></span>
-                                    </div>
-                                </td>
-                                <td class="px-4 py-2 border-r" style="width: 80px;">
-                                    <input type="number" name="items[0][quantity]" step="0.001" min="0.001" class="w-full px-2 py-1 border border-gray-300 rounded text-sm quantity-input" placeholder="0.000" onchange="validateQuantity(this)" required>
-                                </td>
-                                <td class="px-4 py-2 text-center" style="width: 80px;">
-                                    <button type="button" onclick="removeMrnItem(this)" class="text-red-600 hover:text-red-900 text-sm">Remove</button>
-                                </td>
-                            </tr>
+                            <!-- Items will be added dynamically -->
                         </tbody>
                     </table>
                 </div>
@@ -1577,7 +1563,8 @@ function addMrnItem() {
 }
 function removeMrnItem(button) {
     const table = document.getElementById('mrnItemsTable');
-    if (table.rows.length > 1) { button.closest('tr').remove(); }
+    // Allow removal as long as there are rows (no minimum required)
+    button.closest('tr').remove();
 }
 
 // ===== Add/Remove rows (Return MRN)
