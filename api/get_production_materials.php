@@ -53,7 +53,7 @@ try {
         // Direct BOM: finished item made directly from raw materials
         // First, get all BOM lines (both direct items and category-based)
         $stmt = $db->prepare("
-            SELECT bd.raw_material_id, bd.category_id, bd.quantity, c.name as category_name
+            SELECT bd.raw_material_id, bd.category_id, bd.quantity, bd.finished_unit_qty, c.name as category_name
             FROM bom_direct bd
             LEFT JOIN categories c ON bd.category_id = c.id
             WHERE bd.finished_item_id = ?
@@ -62,7 +62,17 @@ try {
         $bom_lines = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
         foreach ($bom_lines as $bom_line) {
-            $required_quantity = round($bom_line['quantity'] * $planned_qty, 3);
+            // Calculate required quantity: Use BOM quantity directly (per unit requirement)
+            // Previously: $unit_qty = floatval($bom_line['finished_unit_qty'] ?: 1.0);
+            // $material_per_unit = floatval($bom_line['quantity']);
+            // $pieces_to_produce = floatval($planned_qty) / $unit_qty;
+            // $required_quantity = $material_per_unit * $pieces_to_produce;
+            
+            // Now use the BOM quantity directly as the required quantity
+            $required_quantity = floatval($bom_line['quantity']);
+            
+            // Format with appropriate precision (3 decimal places) but avoid unnecessary rounding
+            $display_quantity = round($required_quantity, 3); // Display precision
 
             if ($bom_line['raw_material_id']) {
                 // Normal BOM line with specific raw material
@@ -126,6 +136,7 @@ try {
                     'category_id' => $category_id,
                     'category_name' => $category_name,
                     'required_quantity' => $required_quantity,
+                    'display_quantity' => $display_quantity,
                     'uom' => 'kg', // Assume kg for category-based lines
                     'total_available_stock' => round($total_available_stock, 3),
                     'candidate_items' => $category_items
@@ -145,7 +156,7 @@ try {
         $bom_lines = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
         foreach ($bom_lines as $bom_line) {
-            $required_quantity = round($bom_line['quantity'] * $peetu_qty, 3);
+            $required_quantity = round($bom_line['quantity'], 3);
 
             if ($bom_line['raw_material_id']) {
                 // Normal BOM line with specific raw material

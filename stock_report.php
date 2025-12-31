@@ -16,6 +16,27 @@ if ((isset($_GET['download']) && $_GET['download'] === 'pdf') || (isset($_GET['p
     $low_stock_only = isset($_GET['low_stock']);
     $view_mode = $_GET['view'] ?? 'summary';
     
+    // Production Report date filters
+    $start_date = $_GET['start_date'] ?? '';
+    $end_date = $_GET['end_date'] ?? '';
+    $date_range = $_GET['range'] ?? '';
+    
+    // Set default dates if not provided
+    if (empty($start_date) && empty($end_date)) {
+        if ($date_range === 'month') {
+            $start_date = date('Y-m-01');
+            $end_date = date('Y-m-t');
+        } else {
+            // Default to today
+            $start_date = $end_date = date('Y-m-d');
+        }
+    }
+    
+    // Production Report Configuration
+    $PRODUCTION_TYPES = ['production_in', 'repack_in'];
+    $TRANSFER_TYPES = ['transfer', 'production_out'];
+    $RAW_CONSUMPTION_TYPES = ['production_out', 'mrn'];
+    
     // Determine if this is for print or download
     $is_print_mode = isset($_GET['print']) && $_GET['print'] === 'pdf';
     
@@ -62,6 +83,12 @@ if ((isset($_GET['download']) && $_GET['download'] === 'pdf') || (isset($_GET['p
         $detailed_location_names = [];
         $stock_data = [];
         $recent_movements = [];
+        $production_summary = ['total_production' => 0, 'total_trolley_movements' => 0, 'total_transfers' => 0, 'total_raw_consumed' => 0];
+        $production_by_item = [];
+        $trolley_movements_by_item = [];
+        $transfers_by_item = [];
+        $raw_consumed_by_item = [];
+        $daily_breakdown = [];
         
         // Get type value analysis
         $stmt = $db->query("
@@ -278,6 +305,137 @@ if ((isset($_GET['download']) && $_GET['download'] === 'pdf') || (isset($_GET['p
                 LIMIT 100
             ");
             $recent_movements = $stmt->fetchAll();
+        }
+        
+        // Production Report Data for PDF
+        if ($view_mode === 'production_report') {
+            $PRODUCTION_TYPES = ['production_in', 'repack_in'];
+            $TRANSFER_TYPES = ['transfer', 'production_out'];
+            $RAW_CONSUMPTION_TYPES = ['production_out', 'mrn'];
+            
+            // Production quantity
+            $production_types = "'" . implode("','", $PRODUCTION_TYPES) . "'";
+            $stmt = $db->query("
+                SELECT 
+                    i.code as item_code,
+                    i.name as item_name,
+                    i.type as item_type,
+                    u.symbol as unit_symbol,
+                    SUM(sl.quantity_in) as total_produced,
+                    COUNT(*) as transaction_count
+                FROM stock_ledger sl
+                JOIN items i ON sl.item_id = i.id
+                JOIN units u ON i.unit_id = u.id
+                WHERE sl.transaction_date BETWEEN '$start_date' AND '$end_date'
+                    AND sl.transaction_type IN ($production_types)
+                    AND i.type IN ('finished', 'semi_finished')
+                    AND sl.quantity_in > 0
+                GROUP BY i.id, i.code, i.name, i.type, u.symbol
+                ORDER BY total_produced DESC
+            ");
+            $production_data = $stmt->fetchAll();
+            
+            foreach ($production_data as $prod) {
+                $production_by_item[] = $prod;
+                $production_summary['total_production'] += $prod['total_produced'];
+            }
+            
+            // Trolley movements for PDF
+            $stmt = $db->query("
+                SELECT 
+                    i.code as item_code,
+                    i.name as item_name,
+                    l.name as location_name,
+                    u.symbol as unit_symbol,
+                    SUM(sl.quantity_in) as total_moved,
+                    COUNT(*) as transaction_count,
+                    sl.reference_no
+                FROM stock_ledger sl
+                JOIN items i ON sl.item_id = i.id
+                JOIN locations l ON sl.location_id = l.id
+                JOIN units u ON i.unit_id = u.id
+                WHERE sl.transaction_date BETWEEN '$start_date' AND '$end_date'
+                    AND sl.transaction_type = 'production_in'
+                    AND sl.reference_no LIKE 'TM%'
+                    AND sl.quantity_in > 0
+                GROUP BY i.id, l.id, i.code, i.name, l.name, u.symbol, sl.reference_no
+                ORDER BY total_moved DESC
+            ");
+            $trolley_movements_by_item = $stmt->fetchAll();
+            
+            foreach ($trolley_movements_by_item as $trolley) {
+                $production_summary['total_trolley_movements'] += $trolley['total_moved'];
+            }
+            
+            // Transfer quantity
+            $transfer_types = "'" . implode("','", $TRANSFER_TYPES) . "'";
+            $stmt = $db->query("
+                SELECT 
+                    i.code as item_code,
+                    i.name as item_name,
+                    l.name as location_name,
+                    u.symbol as unit_symbol,
+                    SUM(COALESCE(sl.quantity_in, 0) + COALESCE(sl.quantity_out, 0)) as total_transferred,
+                    COUNT(*) as transaction_count
+                FROM stock_ledger sl
+                JOIN items i ON sl.item_id = i.id
+                JOIN locations l ON sl.location_id = l.id
+                JOIN units u ON i.unit_id = u.id
+                WHERE sl.transaction_date BETWEEN '$start_date' AND '$end_date'
+                    AND sl.transaction_type IN ($transfer_types)
+                GROUP BY i.id, l.id, i.code, i.name, l.name, u.symbol
+                ORDER BY total_transferred DESC
+            ");
+            $transfers_by_item = $stmt->fetchAll();
+            
+            foreach ($transfers_by_item as $trans) {
+                $production_summary['total_transfers'] += $trans['total_transferred'];
+            }
+            
+            // Raw material consumption
+            $raw_types = "'" . implode("','", $RAW_CONSUMPTION_TYPES) . "'";
+            $stmt = $db->query("
+                SELECT 
+                    i.code as item_code,
+                    i.name as item_name,
+                    l.name as location_name,
+                    u.symbol as unit_symbol,
+                    SUM(sl.quantity_out) as total_consumed,
+                    COUNT(*) as transaction_count
+                FROM stock_ledger sl
+                JOIN items i ON sl.item_id = i.id
+                JOIN locations l ON sl.location_id = l.id
+                JOIN units u ON i.unit_id = u.id
+                WHERE sl.transaction_date BETWEEN '$start_date' AND '$end_date'
+                    AND sl.transaction_type IN ($raw_types)
+                    AND i.type = 'raw'
+                    AND sl.quantity_out > 0
+                GROUP BY i.id, l.id, i.code, i.name, l.name, u.symbol
+                ORDER BY total_consumed DESC
+            ");
+            $raw_consumed_by_item = $stmt->fetchAll();
+            
+            foreach ($raw_consumed_by_item as $raw) {
+                $production_summary['total_raw_consumed'] += $raw['total_consumed'];
+            }
+            
+            // Daily breakdown
+            $stmt = $db->query("
+                SELECT 
+                    DATE(sl.transaction_date) as report_date,
+                    SUM(CASE WHEN sl.transaction_type IN ($production_types) AND i.type IN ('finished', 'semi_finished') AND sl.quantity_in > 0 
+                             THEN sl.quantity_in ELSE 0 END) as daily_production,
+                    SUM(CASE WHEN sl.transaction_type IN ($transfer_types) 
+                             THEN COALESCE(sl.quantity_in, 0) + COALESCE(sl.quantity_out, 0) ELSE 0 END) as daily_transfers,
+                    SUM(CASE WHEN sl.transaction_type IN ($raw_types) AND i.type = 'raw' AND sl.quantity_out > 0 
+                             THEN sl.quantity_out ELSE 0 END) as daily_raw_consumed
+                FROM stock_ledger sl
+                JOIN items i ON sl.item_id = i.id
+                WHERE sl.transaction_date BETWEEN '$start_date' AND '$end_date'
+                GROUP BY DATE(sl.transaction_date)
+                ORDER BY report_date DESC
+            ");
+            $daily_breakdown = $stmt->fetchAll();
         }
         
         // Generate PDF HTML
@@ -511,6 +669,151 @@ if ((isset($_GET['download']) && $_GET['download'] === 'pdf') || (isset($_GET['p
             $html .= '</table>';
         }
         
+        if ($view_mode === 'production_report') {
+            $html .= '<h2>Production Report (' . $start_date . ' to ' . $end_date . ')</h2>';
+            
+            $table_type = $_GET['table_type'] ?? 'all';
+            
+            if ($table_type === 'all') {
+                // Summary totals
+                $html .= '<div class="summary-box">
+                    <h3>Production Summary</h3>
+                    <p><strong>Total Production:</strong> ' . number_format($production_summary['total_production'], 2) . ' units</p>
+                    <p><strong>Total Trolley Movements:</strong> ' . number_format($production_summary['total_trolley_movements'], 2) . ' units</p>
+                    <p><strong>Total Transfers:</strong> ' . number_format($production_summary['total_transfers'], 2) . ' units</p>
+                    <p><strong>Total Raw Material Used:</strong> ' . number_format($production_summary['total_raw_consumed'], 2) . ' units</p>
+                </div>';
+            }
+            
+            // Production by item
+            if (($table_type === 'all' || $table_type === 'production') && !empty($production_by_item)) {
+                $html .= '<h3>Production by Finished Item</h3>
+                    <table>
+                        <tr>
+                            <th>Item Code</th>
+                            <th>Item Name</th>
+                            <th>Type</th>
+                            <th>Quantity Produced</th>
+                            <th>Unit</th>
+                            <th>Transactions</th>
+                        </tr>';
+                
+                foreach ($production_by_item as $item) {
+                    $html .= '<tr>
+                        <td>' . htmlspecialchars($item['item_code']) . '</td>
+                        <td>' . htmlspecialchars($item['item_name']) . '</td>
+                        <td>' . ucfirst(str_replace('_', ' ', $item['item_type'])) . '</td>
+                        <td class="text-right">' . number_format($item['total_quantity'], 3) . '</td>
+                        <td>' . htmlspecialchars($item['unit_symbol']) . '</td>
+                        <td class="text-right">' . $item['transaction_count'] . '</td>
+                    </tr>';
+                }
+                $html .= '</table>';
+            }
+            
+            // Trolley movements table
+            if (($table_type === 'all' || $table_type === 'trolley') && !empty($trolley_movements_by_item)) {
+                $html .= '<h3>Trolley Movements</h3>
+                    <table>
+                        <tr>
+                            <th>Item Code</th>
+                            <th>Item Name</th>
+                            <th>Location</th>
+                            <th>Reference</th>
+                            <th>Quantity Moved</th>
+                            <th>Unit</th>
+                        </tr>';
+                
+                foreach ($trolley_movements_by_item as $item) {
+                    $html .= '<tr>
+                        <td>' . htmlspecialchars($item['item_code']) . '</td>
+                        <td>' . htmlspecialchars($item['item_name']) . '</td>
+                        <td>' . htmlspecialchars($item['location_name']) . '</td>
+                        <td>' . htmlspecialchars($item['reference_no']) . '</td>
+                        <td class="text-right">' . number_format($item['total_moved'], 3) . '</td>
+                        <td>' . htmlspecialchars($item['unit_symbol']) . '</td>
+                    </tr>';
+                }
+                $html .= '</table>';
+            }
+            
+            // Raw material consumption
+            if (($table_type === 'all' || $table_type === 'raw_consumption') && !empty($raw_consumed_by_item)) {
+                $html .= '<h3>Raw Material Consumption</h3>
+                    <table>
+                        <tr>
+                            <th>Item Code</th>
+                            <th>Item Name</th>
+                            <th>Location</th>
+                            <th>Quantity Consumed</th>
+                            <th>Unit</th>
+                            <th>Transactions</th>
+                        </tr>';
+                
+                foreach ($raw_consumed_by_item as $item) {
+                    $html .= '<tr>
+                        <td>' . htmlspecialchars($item['item_code']) . '</td>
+                        <td>' . htmlspecialchars($item['item_name']) . '</td>
+                        <td>' . htmlspecialchars($item['location_name']) . '</td>
+                        <td class="text-right">' . number_format($item['total_consumed'], 3) . '</td>
+                        <td>' . htmlspecialchars($item['unit_symbol']) . '</td>
+                        <td class="text-right">' . $item['transaction_count'] . '</td>
+                    </tr>';
+                }
+                $html .= '</table>';
+            }
+            
+            // Transfers
+            if (($table_type === 'all' || $table_type === 'transfers') && !empty($transfers_by_item)) {
+                $html .= '<h3>Transfers Between Locations</h3>
+                    <table>
+                        <tr>
+                            <th>Item Code</th>
+                            <th>Item Name</th>
+                            <th>Location</th>
+                            <th>Quantity Transferred</th>
+                            <th>Unit</th>
+                            <th>Transactions</th>
+                        </tr>';
+                
+                foreach ($transfers_by_item as $item) {
+                    $html .= '<tr>
+                        <td>' . htmlspecialchars($item['item_code']) . '</td>
+                        <td>' . htmlspecialchars($item['item_name']) . '</td>
+                        <td>' . htmlspecialchars($item['location_name']) . '</td>
+                        <td class="text-right">' . number_format($item['total_transferred'], 3) . '</td>
+                        <td>' . htmlspecialchars($item['unit_symbol']) . '</td>
+                        <td class="text-right">' . $item['transaction_count'] . '</td>
+                    </tr>';
+                }
+                $html .= '</table>';
+            }
+            
+            // Daily breakdown
+            if (($table_type === 'all' || $table_type === 'daily_breakdown') && !empty($daily_breakdown)) {
+                $html .= '<h3>Daily Breakdown</h3>
+                    <table>
+                        <tr>
+                            <th>Date</th>
+                            <th>Production</th>
+                            <th>Trolley Movements</th>
+                            <th>Transfers</th>
+                            <th>Raw Material Used</th>
+                        </tr>';
+                
+                foreach ($daily_breakdown as $day) {
+                    $html .= '<tr>
+                        <td>' . htmlspecialchars($day['report_date']) . '</td>
+                        <td class="text-right">' . number_format($day['daily_production'], 2) . '</td>
+                        <td class="text-right">' . number_format($day['daily_trolley_movements'], 2) . '</td>
+                        <td class="text-right">' . number_format($day['daily_transfers'], 2) . '</td>
+                        <td class="text-right">' . number_format($day['daily_raw_consumed'], 2) . '</td>
+                    </tr>';
+                }
+                $html .= '</table>';
+            }
+        }
+        
         $html .= '</body></html>';
         
         // Add print JavaScript for print mode
@@ -555,11 +858,47 @@ include 'header.php';
 $location_filter = $_GET['location'] ?? '';
 $item_type_filter = $_GET['item_type'] ?? '';
 $low_stock_only = isset($_GET['low_stock']);
-$view_mode = $_GET['view'] ?? 'summary'; // summary, detailed, movements, value_analysis
+$view_mode = $_GET['view'] ?? 'summary'; // summary, detailed, movements, value_analysis, production_report
+
+// Production Report date filters
+$start_date = $_GET['start_date'] ?? '';
+$end_date = $_GET['end_date'] ?? '';
+$date_range = $_GET['range'] ?? '';
+
+// Pagination parameters - separate for each table type
+$production_page = isset($_GET['production_page']) ? max(1, intval($_GET['production_page'])) : 1;
+$trolley_page = isset($_GET['trolley_page']) ? max(1, intval($_GET['trolley_page'])) : 1;
+$raw_page = isset($_GET['raw_page']) ? max(1, intval($_GET['raw_page'])) : 1;
+$transfers_page = isset($_GET['transfers_page']) ? max(1, intval($_GET['transfers_page'])) : 1;
+$daily_page = isset($_GET['daily_page']) ? max(1, intval($_GET['daily_page'])) : 1;
+$limit = 10; // Items per page
+$production_offset = ($production_page - 1) * $limit;
+$trolley_offset = ($trolley_page - 1) * $limit;
+$raw_offset = ($raw_page - 1) * $limit;
+$transfers_offset = ($transfers_page - 1) * $limit;
+$daily_offset = ($daily_page - 1) * $limit;
+$table_type = $_GET['table_type'] ?? ''; // For individual table PDF export
+
+// Set default dates if not provided
+if (empty($start_date) && empty($end_date)) {
+    if ($date_range === 'month') {
+        $start_date = date('Y-m-01');
+        $end_date = date('Y-m-t');
+    } else {
+        // Default to today
+        $start_date = $end_date = date('Y-m-d');
+    }
+}
 
 // Constants (adjust if your IDs differ)
 $STORE_ID = 1;
 $PRODUCTION_ID = 2;
+
+// Production Report Configuration  
+$PRODUCTION_TYPES = ['production_in', 'repack_in'];  // Types that indicate production
+$TROLLEY_TYPES = ['production_in'];  // Trolley movements (production_in with TM reference)
+$TRANSFER_TYPES = ['transfer', 'production_out'];     // Types that indicate transfers
+$RAW_CONSUMPTION_TYPES = ['production_out', 'mrn'];  // Types that indicate raw material usage
 
 // Initialize variables to prevent errors
 $summary_stats = [
@@ -819,6 +1158,253 @@ try {
         ");
         $recent_movements = $stmt->fetchAll();
     }
+    
+    // Production Report Data
+    $production_summary = [
+        'total_production' => 0,
+        'total_trolley_movements' => 0,
+        'total_transfers' => 0,
+        'total_raw_consumed' => 0
+    ];
+    $production_by_item = [];
+    $trolley_movements_by_item = [];
+    $transfers_by_item = [];
+    $raw_consumed_by_item = [];
+    $daily_breakdown = [];
+    
+    // Pagination variables
+    $production_total_pages = 0;
+    $trolley_total_pages = 0;
+    $transfer_total_pages = 0;
+    $raw_total_pages = 0;
+    $daily_total_pages = 0;
+    
+    if ($view_mode === 'production_report') {
+        // Initialize pagination variables
+        $production_total_records = 0;
+        $production_total_pages = 0;
+        $trolley_total_records = 0;
+        $trolley_total_pages = 0;
+        $transfers_total_records = 0;
+        $transfers_total_pages = 0;
+        $raw_consumption_total_records = 0;
+        $raw_consumption_total_pages = 0;
+        $daily_breakdown_total_records = 0;
+        $daily_breakdown_total_pages = 0;
+        
+        // Production quantity (finished goods produced) - excluding trolley movements
+        $production_types = "'" . implode("','", $PRODUCTION_TYPES) . "'";
+        
+        // Get total count for pagination
+        $stmt = $db->query("
+            SELECT COUNT(DISTINCT CONCAT(i.id, '_', DATE(sl.transaction_date))) as total_count
+            FROM stock_ledger sl
+            JOIN items i ON sl.item_id = i.id
+            WHERE sl.transaction_date BETWEEN '$start_date' AND '$end_date'
+                AND sl.transaction_type IN ($production_types)
+                AND i.type IN ('finished', 'semi_finished')
+                AND sl.quantity_in > 0
+                AND (sl.reference_no NOT LIKE 'TM%' OR sl.reference_no IS NULL)
+        ");
+        $production_total_count = $stmt->fetch()['total_count'];
+        $production_total_records = $production_total_count;
+        $production_total_pages = ceil($production_total_count / $limit);
+        
+        $stmt = $db->query("
+            SELECT 
+                i.code as item_code,
+                i.name as item_name,
+                i.type as item_type,
+                u.symbol as unit_symbol,
+                SUM(sl.quantity_in) as total_produced,
+                COUNT(*) as transaction_count,
+                DATE(sl.transaction_date) as production_date
+            FROM stock_ledger sl
+            JOIN items i ON sl.item_id = i.id
+            JOIN units u ON i.unit_id = u.id
+            WHERE sl.transaction_date BETWEEN '$start_date' AND '$end_date'
+                AND sl.transaction_type IN ($production_types)
+                AND i.type IN ('finished', 'semi_finished')
+                AND sl.quantity_in > 0
+                AND (sl.reference_no NOT LIKE 'TM%' OR sl.reference_no IS NULL)
+            GROUP BY i.id, i.code, i.name, i.type, u.symbol, DATE(sl.transaction_date)
+            ORDER BY total_produced DESC, production_date DESC
+            LIMIT $limit OFFSET $production_offset
+        ");
+        $production_data = $stmt->fetchAll();
+        
+        // Aggregate production by item
+        foreach ($production_data as $prod) {
+            $key = $prod['item_code'];
+            if (!isset($production_by_item[$key])) {
+                $production_by_item[$key] = [
+                    'item_code' => $prod['item_code'],
+                    'item_name' => $prod['item_name'],
+                    'item_type' => $prod['item_type'],
+                    'unit_symbol' => $prod['unit_symbol'],
+                    'total_quantity' => 0,
+                    'transaction_count' => 0
+                ];
+            }
+            $production_by_item[$key]['total_quantity'] += $prod['total_produced'];
+            $production_by_item[$key]['transaction_count'] += $prod['transaction_count'];
+            $production_summary['total_production'] += $prod['total_produced'];
+        }
+        
+        // Trolley movements (production_in with TM reference)
+        $stmt = $db->query("
+            SELECT COUNT(*) as total_count
+            FROM stock_ledger sl
+            JOIN items i ON sl.item_id = i.id
+            WHERE sl.transaction_date BETWEEN '$start_date' AND '$end_date'
+                AND sl.transaction_type = 'production_in'
+                AND sl.reference_no LIKE 'TM%'
+                AND sl.quantity_in > 0
+        ");
+        $trolley_total_count = $stmt->fetch()['total_count'];
+        $trolley_total_records = $trolley_total_count;
+        $trolley_total_pages = ceil($trolley_total_count / $limit);
+        
+        $stmt = $db->query("
+            SELECT 
+                i.code as item_code,
+                i.name as item_name,
+                l.name as location_name,
+                u.symbol as unit_symbol,
+                SUM(sl.quantity_in) as total_moved,
+                COUNT(*) as transaction_count,
+                sl.reference_no
+            FROM stock_ledger sl
+            JOIN items i ON sl.item_id = i.id
+            JOIN locations l ON sl.location_id = l.id
+            JOIN units u ON i.unit_id = u.id
+            WHERE sl.transaction_date BETWEEN '$start_date' AND '$end_date'
+                AND sl.transaction_type = 'production_in'
+                AND sl.reference_no LIKE 'TM%'
+                AND sl.quantity_in > 0
+            GROUP BY i.id, l.id, i.code, i.name, l.name, u.symbol, sl.reference_no
+            ORDER BY total_moved DESC
+            LIMIT $limit OFFSET $trolley_offset
+        ");
+        $trolley_data = $stmt->fetchAll();
+        
+        foreach ($trolley_data as $trolley) {
+            $trolley_movements_by_item[] = $trolley;
+            $production_summary['total_trolley_movements'] += $trolley['total_moved'];
+        }
+        
+        // Transfer quantity
+        $transfer_types = "'" . implode("','", $TRANSFER_TYPES) . "'";
+        
+        $stmt = $db->query("
+            SELECT COUNT(*) as total_count
+            FROM stock_ledger sl
+            JOIN items i ON sl.item_id = i.id
+            WHERE sl.transaction_date BETWEEN '$start_date' AND '$end_date'
+                AND sl.transaction_type IN ($transfer_types)
+        ");
+        $transfer_total_count = $stmt->fetch()['total_count'];
+        $transfers_total_records = $transfer_total_count;
+        $transfers_total_pages = ceil($transfer_total_count / $limit);
+        
+        $stmt = $db->query("
+            SELECT 
+                i.code as item_code,
+                i.name as item_name,
+                l.name as location_name,
+                u.symbol as unit_symbol,
+                SUM(COALESCE(sl.quantity_in, 0) + COALESCE(sl.quantity_out, 0)) as total_transferred,
+                COUNT(*) as transaction_count
+            FROM stock_ledger sl
+            JOIN items i ON sl.item_id = i.id
+            JOIN locations l ON sl.location_id = l.id
+            JOIN units u ON i.unit_id = u.id
+            WHERE sl.transaction_date BETWEEN '$start_date' AND '$end_date'
+                AND sl.transaction_type IN ($transfer_types)
+            GROUP BY i.id, l.id, i.code, i.name, l.name, u.symbol
+            ORDER BY total_transferred DESC
+            LIMIT $limit OFFSET $transfers_offset
+        ");
+        $transfer_data = $stmt->fetchAll();
+        
+        foreach ($transfer_data as $trans) {
+            $transfers_by_item[] = $trans;
+            $production_summary['total_transfers'] += $trans['total_transferred'];
+        }
+        
+        // Raw material consumption
+        $raw_types = "'" . implode("','", $RAW_CONSUMPTION_TYPES) . "'";
+        
+        $stmt = $db->query("
+            SELECT COUNT(*) as total_count
+            FROM stock_ledger sl
+            JOIN items i ON sl.item_id = i.id
+            WHERE sl.transaction_date BETWEEN '$start_date' AND '$end_date'
+                AND sl.transaction_type IN ($raw_types)
+                AND i.type = 'raw'
+                AND sl.quantity_out > 0
+        ");
+        $raw_total_count = $stmt->fetch()['total_count'];
+        $raw_consumption_total_records = $raw_total_count;
+        $raw_consumption_total_pages = ceil($raw_total_count / $limit);
+        
+        $stmt = $db->query("
+            SELECT 
+                i.code as item_code,
+                i.name as item_name,
+                l.name as location_name,
+                u.symbol as unit_symbol,
+                SUM(sl.quantity_out) as total_consumed,
+                COUNT(*) as transaction_count
+            FROM stock_ledger sl
+            JOIN items i ON sl.item_id = i.id
+            JOIN locations l ON sl.location_id = l.id
+            JOIN units u ON i.unit_id = u.id
+            WHERE sl.transaction_date BETWEEN '$start_date' AND '$end_date'
+                AND sl.transaction_type IN ($raw_types)
+                AND i.type = 'raw'
+                AND sl.quantity_out > 0
+            GROUP BY i.id, l.id, i.code, i.name, l.name, u.symbol
+            ORDER BY total_consumed DESC
+            LIMIT $limit OFFSET $raw_offset
+        ");
+        $raw_consumption_data = $stmt->fetchAll();
+        
+        foreach ($raw_consumption_data as $raw) {
+            $raw_consumed_by_item[] = $raw;
+            $production_summary['total_raw_consumed'] += $raw['total_consumed'];
+        }
+        
+        // Daily breakdown for the selected period
+        $stmt = $db->query("
+            SELECT COUNT(DISTINCT DATE(sl.transaction_date)) as total_count
+            FROM stock_ledger sl
+            WHERE sl.transaction_date BETWEEN '$start_date' AND '$end_date'
+        ");
+        $daily_total_count = $stmt->fetch()['total_count'];
+        $daily_breakdown_total_records = $daily_total_count;
+        $daily_breakdown_total_pages = ceil($daily_total_count / $limit);
+        
+        $stmt = $db->query("
+            SELECT 
+                DATE(sl.transaction_date) as report_date,
+                SUM(CASE WHEN sl.transaction_type IN ($production_types) AND i.type IN ('finished', 'semi_finished') AND sl.quantity_in > 0 AND (sl.reference_no NOT LIKE 'TM%' OR sl.reference_no IS NULL)
+                         THEN sl.quantity_in ELSE 0 END) as daily_production,
+                SUM(CASE WHEN sl.transaction_type = 'production_in' AND sl.reference_no LIKE 'TM%' AND sl.quantity_in > 0
+                         THEN sl.quantity_in ELSE 0 END) as daily_trolley_movements,
+                SUM(CASE WHEN sl.transaction_type IN ($transfer_types) 
+                         THEN COALESCE(sl.quantity_in, 0) + COALESCE(sl.quantity_out, 0) ELSE 0 END) as daily_transfers,
+                SUM(CASE WHEN sl.transaction_type IN ($raw_types) AND i.type = 'raw' AND sl.quantity_out > 0 
+                         THEN sl.quantity_out ELSE 0 END) as daily_raw_consumed
+            FROM stock_ledger sl
+            JOIN items i ON sl.item_id = i.id
+            WHERE sl.transaction_date BETWEEN '$start_date' AND '$end_date'
+            GROUP BY DATE(sl.transaction_date)
+            ORDER BY report_date DESC
+            LIMIT $limit OFFSET $daily_offset
+        ");
+        $daily_breakdown = $stmt->fetchAll();
+    }
 
     // Get location-wise summary using stock_ledger data
     $stmt = $db->query("
@@ -871,22 +1457,23 @@ try {
                 <option value="semi_finished" <?php echo $item_type_filter === 'semi_finished' ? 'selected' : ''; ?>>Semi-Finished</option>
                 <option value="finished" <?php echo $item_type_filter === 'finished' ? 'selected' : ''; ?>>Finished Goods</option>
             </select>
-            <select onchange="location.href='?view=' + this.value + '&location=<?php echo $location_filter; ?>&item_type=<?php echo $item_type_filter; ?>' + '<?php echo $low_stock_only ? '&low_stock=1' : ''; ?>'" class="px-3 py-2 border border-gray-300 rounded-md">
+            <select onchange="location.href='?view=' + this.value + '&location=<?php echo $location_filter; ?>&item_type=<?php echo $item_type_filter; ?>' + '<?php echo $low_stock_only ? '&low_stock=1' : ''; ?>' + '&start_date=<?php echo $start_date; ?>&end_date=<?php echo $end_date; ?>'" class="px-3 py-2 border border-gray-300 rounded-md">
                 <option value="summary" <?php echo $view_mode === 'summary' ? 'selected' : ''; ?>>Summary View</option>
                 <option value="detailed" <?php echo $view_mode === 'detailed' ? 'selected' : ''; ?>>Detailed View</option>
                 <option value="value_analysis" <?php echo $view_mode === 'value_analysis' ? 'selected' : ''; ?>>💰 Value Analysis</option>
                 <option value="movements" <?php echo $view_mode === 'movements' ? 'selected' : ''; ?>>Recent Movements</option>
+                <option value="production_report" <?php echo $view_mode === 'production_report' ? 'selected' : ''; ?>>📊 Production Report</option>
             </select>
 
             <!-- PDF Export buttons (preserves current filters) -->
             <button
-                onclick="location.href='?view=<?php echo urlencode($view_mode); ?><?php echo $location_filter!=='' ? '&location='.urlencode($location_filter) : ''; ?><?php echo $item_type_filter!=='' ? '&item_type='.urlencode($item_type_filter) : ''; ?><?php echo $low_stock_only ? '&low_stock=1' : ''; ?>&download=pdf'"
+                onclick="location.href='?view=<?php echo urlencode($view_mode); ?><?php echo $location_filter!=='' ? '&location='.urlencode($location_filter) : ''; ?><?php echo $item_type_filter!=='' ? '&item_type='.urlencode($item_type_filter) : ''; ?><?php echo $low_stock_only ? '&low_stock=1' : ''; ?>&start_date=<?php echo urlencode($start_date); ?>&end_date=<?php echo urlencode($end_date); ?>&download=pdf'"
                 class="bg-rose-600 text-white px-4 py-2 rounded-md hover:bg-rose-700 transition-colors">
                 ⬇️ Download PDF
             </button>
             
             <button
-                onclick="window.open('?view=<?php echo urlencode($view_mode); ?><?php echo $location_filter!=='' ? '&location='.urlencode($location_filter) : ''; ?><?php echo $item_type_filter!=='' ? '&item_type='.urlencode($item_type_filter) : ''; ?><?php echo $low_stock_only ? '&low_stock=1' : ''; ?>&print=pdf', '_blank')"
+                onclick="window.open('?view=<?php echo urlencode($view_mode); ?><?php echo $location_filter!=='' ? '&location='.urlencode($location_filter) : ''; ?><?php echo $item_type_filter!=='' ? '&item_type='.urlencode($item_type_filter) : ''; ?><?php echo $low_stock_only ? '&low_stock=1' : ''; ?>&start_date=<?php echo urlencode($start_date); ?>&end_date=<?php echo urlencode($end_date); ?>&print=pdf', '_blank')"
                 class="bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700 transition-colors">
                 🖨️ Print PDF
             </button>
@@ -896,6 +1483,35 @@ try {
             </button>
         </div>
     </div>
+
+    <!-- Date Filters (for Production Report) -->
+    <?php if ($view_mode === 'production_report'): ?>
+    <div class="bg-white rounded-lg shadow p-6">
+        <div class="flex flex-col md:flex-row gap-4 items-end">
+            <div class="flex-1">
+                <label for="start_date" class="block text-sm font-medium text-gray-700 mb-2">Start Date</label>
+                <input type="date" id="start_date" name="start_date" value="<?php echo htmlspecialchars($start_date); ?>" 
+                       class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary">
+            </div>
+            <div class="flex-1">
+                <label for="end_date" class="block text-sm font-medium text-gray-700 mb-2">End Date</label>
+                <input type="date" id="end_date" name="end_date" value="<?php echo htmlspecialchars($end_date); ?>" 
+                       class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary">
+            </div>
+            <div class="flex gap-2">
+                <button onclick="setDateRange('today')" class="bg-blue-100 text-blue-800 px-4 py-2 rounded-md hover:bg-blue-200 transition-colors text-sm">
+                    Today
+                </button>
+                <button onclick="setDateRange('month')" class="bg-green-100 text-green-800 px-4 py-2 rounded-md hover:bg-green-200 transition-colors text-sm">
+                    This Month
+                </button>
+                <button onclick="applyDateFilter()" class="bg-primary text-white px-6 py-2 rounded-md hover:bg-primary-dark transition-colors">
+                    Apply Filter
+                </button>
+            </div>
+        </div>
+    </div>
+    <?php endif; ?>
 
     <!-- Error Message -->
     <?php if (isset($error)): ?>
@@ -1466,6 +2082,475 @@ try {
     </div>
     <?php endif; ?>
 
+    <!-- PRODUCTION REPORT VIEW -->
+    <?php if ($view_mode === 'production_report'): ?>
+    
+    <!-- Production Summary Cards -->
+    <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-6">
+        <div class="bg-green-50 border border-green-200 rounded-lg p-6">
+            <div class="flex items-center">
+                <div class="p-3 rounded-full bg-green-100">
+                    <svg class="w-6 h-6 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                    </svg>
+                </div>
+                <div class="ml-4">
+                    <p class="text-sm font-medium text-green-600">Total Production</p>
+                    <p class="text-2xl font-bold text-green-900"><?php echo number_format($production_summary['total_production'], 2); ?></p>
+                    <p class="text-xs text-green-700">Finished goods produced</p>
+                </div>
+            </div>
+        </div>
+        
+        <div class="bg-yellow-50 border border-yellow-200 rounded-lg p-6">
+            <div class="flex items-center">
+                <div class="p-3 rounded-full bg-yellow-100">
+                    <svg class="w-6 h-6 text-yellow-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16V4m0 0L3 8m4-4l4 4m6 0v12m0 0l4-4m-4 4l-4-4"/>
+                    </svg>
+                </div>
+                <div class="ml-4">
+                    <p class="text-sm font-medium text-yellow-600">Trolley Movements</p>
+                    <p class="text-2xl font-bold text-yellow-900"><?php echo number_format($production_summary['total_trolley_movements'], 2); ?></p>
+                    <p class="text-xs text-yellow-700">Items moved via trolley</p>
+                </div>
+            </div>
+        </div>
+        
+        <div class="bg-blue-50 border border-blue-200 rounded-lg p-6">
+            <div class="flex items-center">
+                <div class="p-3 rounded-full bg-blue-100">
+                    <svg class="w-6 h-6 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4"/>
+                    </svg>
+                </div>
+                <div class="ml-4">
+                    <p class="text-sm font-medium text-blue-600">Total Transfers</p>
+                    <p class="text-2xl font-bold text-blue-900"><?php echo number_format($production_summary['total_transfers'], 2); ?></p>
+                    <p class="text-xs text-blue-700">Between locations</p>
+                </div>
+            </div>
+        </div>
+        
+        <div class="bg-orange-50 border border-orange-200 rounded-lg p-6">
+            <div class="flex items-center">
+                <div class="p-3 rounded-full bg-orange-100">
+                    <svg class="w-6 h-6 text-orange-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
+                    </svg>
+                </div>
+                <div class="ml-4">
+                    <p class="text-sm font-medium text-orange-600">Raw Material Used</p>
+                    <p class="text-2xl font-bold text-orange-900"><?php echo number_format($production_summary['total_raw_consumed'], 2); ?></p>
+                    <p class="text-xs text-orange-700">Raw materials consumed</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Production by Item -->
+    <?php if ($production_total_records > 0): ?>
+    <div class="bg-white rounded-lg shadow mb-6">
+        <div class="px-6 py-4 border-b border-gray-200">
+            <div class="flex justify-between items-center">
+                <div>
+                    <h3 class="text-lg font-medium text-gray-900">🏭 Production by Finished Item</h3>
+                    <p class="text-sm text-gray-600">Period: <?php echo date('M d, Y', strtotime($start_date)); ?> to <?php echo date('M d, Y', strtotime($end_date)); ?></p>
+                </div>
+                <button onclick="window.open('?view=production_report&table_type=production&start_date=<?php echo urlencode($start_date); ?>&end_date=<?php echo urlencode($end_date); ?>&download=pdf', '_blank')" class="bg-red-600 text-white px-4 py-2 rounded-md hover:bg-red-700 transition-colors text-sm">
+                    📄 Export PDF
+                </button>
+            </div>
+        </div>
+        <div class="overflow-x-auto">
+            <?php if (!empty($production_by_item)): ?>
+            <table class="min-w-full divide-y divide-gray-200">
+                <thead class="bg-gray-50">
+                    <tr>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Item</th>
+                        <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Type</th>
+                        <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Quantity Produced</th>
+                        <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Transactions</th>
+                    </tr>
+                </thead>
+                <tbody class="bg-white divide-y divide-gray-200">
+                    <?php foreach ($production_by_item as $item): ?>
+                    <tr class="hover:bg-gray-50">
+                        <td class="px-6 py-4 whitespace-nowrap">
+                            <div class="text-sm font-medium text-gray-900"><?php echo htmlspecialchars($item['item_name']); ?></div>
+                            <div class="text-sm text-gray-500"><?php echo htmlspecialchars($item['item_code']); ?></div>
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-center">
+                            <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full
+                                <?php echo $item['item_type'] === 'finished' ? 'bg-green-100 text-green-800' : 'bg-yellow-100 text-yellow-800'; ?>">
+                                <?php echo ucfirst(str_replace('_', ' ', $item['item_type'])); ?>
+                            </span>
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-right">
+                            <div class="text-lg font-bold text-green-600"><?php echo number_format($item['total_quantity'], 3); ?></div>
+                            <div class="text-xs text-gray-500"><?php echo htmlspecialchars($item['unit_symbol']); ?></div>
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-center text-sm text-gray-900">
+                            <?php echo $item['transaction_count']; ?>
+                        </td>
+                    </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+            <?php else: ?>
+            <div class="px-6 py-8 text-center text-gray-500">
+                <p>No production data found for page <?php echo $production_page; ?>.</p>
+            </div>
+            <?php endif; ?>
+        </div>
+        
+        <!-- Pagination for Production Items -->
+        <?php if ($production_total_records > 0): ?>
+        <div class="px-6 py-4 bg-gray-50 border-t border-gray-200 flex items-center justify-between">
+            <div class="text-sm text-gray-700">
+                Showing <?php echo (($production_page - 1) * $limit + 1); ?> to <?php echo min($production_page * $limit, $production_total_records); ?> of <?php echo $production_total_records; ?> production items (Page <?php echo $production_page; ?>)
+            </div>
+            <div class="flex space-x-1">
+                <?php if ($production_page > 1): ?>
+                <a href="stock_report.php?view=production_report&start_date=<?php echo urlencode($start_date); ?>&end_date=<?php echo urlencode($end_date); ?><?php echo $date_range ? '&range='.urlencode($date_range) : ''; ?>&production_page=<?php echo $production_page-1; ?><?php echo $trolley_page > 1 ? '&trolley_page='.$trolley_page : ''; ?><?php echo $raw_page > 1 ? '&raw_page='.$raw_page : ''; ?><?php echo $transfers_page > 1 ? '&transfers_page='.$transfers_page : ''; ?><?php echo $daily_page > 1 ? '&daily_page='.$daily_page : ''; ?>" 
+                   class="bg-white border border-gray-300 text-gray-700 hover:bg-gray-50 px-3 py-2 rounded-md text-sm">Previous</a>
+                <?php endif; ?>
+                
+                <?php for ($i = max(1, $production_page-2); $i <= min($production_total_pages, $production_page+2); $i++): ?>
+                <a href="stock_report.php?view=production_report&start_date=<?php echo urlencode($start_date); ?>&end_date=<?php echo urlencode($end_date); ?><?php echo $date_range ? '&range='.urlencode($date_range) : ''; ?>&production_page=<?php echo $i; ?><?php echo $trolley_page > 1 ? '&trolley_page='.$trolley_page : ''; ?><?php echo $raw_page > 1 ? '&raw_page='.$raw_page : ''; ?><?php echo $transfers_page > 1 ? '&transfers_page='.$transfers_page : ''; ?><?php echo $daily_page > 1 ? '&daily_page='.$daily_page : ''; ?>" 
+                   class="<?php echo $i == $production_page ? 'bg-blue-600 text-white' : 'bg-white border border-gray-300 text-gray-700 hover:bg-gray-50'; ?> px-3 py-2 rounded-md text-sm"><?php echo $i; ?></a>
+                <?php endfor; ?>
+                
+                <?php if ($production_page < $production_total_pages): ?>
+                <a href="stock_report.php?view=production_report&start_date=<?php echo urlencode($start_date); ?>&end_date=<?php echo urlencode($end_date); ?><?php echo $date_range ? '&range='.urlencode($date_range) : ''; ?>&production_page=<?php echo $production_page+1; ?><?php echo $trolley_page > 1 ? '&trolley_page='.$trolley_page : ''; ?><?php echo $raw_page > 1 ? '&raw_page='.$raw_page : ''; ?><?php echo $transfers_page > 1 ? '&transfers_page='.$transfers_page : ''; ?><?php echo $daily_page > 1 ? '&daily_page='.$daily_page : ''; ?>" 
+                   class="bg-white border border-gray-300 text-gray-700 hover:bg-gray-50 px-3 py-2 rounded-md text-sm">Next</a>
+                <?php endif; ?>
+            </div>
+        </div>
+        <?php endif; ?>
+    </div>
+    <?php endif; ?>
+
+    <!-- Trolley Movements -->
+    <?php if ($trolley_total_records > 0): ?>
+    <div class="bg-white rounded-lg shadow mb-6">
+        <div class="px-6 py-4 border-b border-gray-200">
+            <div class="flex justify-between items-center">
+                <div>
+                    <h3 class="text-lg font-medium text-gray-900">🚚 Trolley Movements</h3>
+                    <p class="text-sm text-gray-600">Period: <?php echo date('M d, Y', strtotime($start_date)); ?> to <?php echo date('M d, Y', strtotime($end_date)); ?></p>
+                </div>
+                <button onclick="window.open('?view=production_report&table_type=trolley&start_date=<?php echo urlencode($start_date); ?>&end_date=<?php echo urlencode($end_date); ?>&download=pdf', '_blank')" class="bg-red-600 text-white px-4 py-2 rounded-md hover:bg-red-700 transition-colors text-sm">
+                    📄 Export PDF
+                </button>
+            </div>
+        </div>
+        <div class="overflow-x-auto">
+            <table class="min-w-full divide-y divide-gray-200">
+                <thead class="bg-gray-50">
+                    <tr>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Item</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Location</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Reference</th>
+                        <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Quantity Moved</th>
+                        <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Transactions</th>
+                    </tr>
+                </thead>
+                <tbody class="bg-white divide-y divide-gray-200">
+                    <?php foreach ($trolley_movements_by_item as $item): ?>
+                    <tr class="hover:bg-gray-50">
+                        <td class="px-6 py-4 whitespace-nowrap">
+                            <div class="text-sm font-medium text-gray-900"><?php echo htmlspecialchars($item['item_name']); ?></div>
+                            <div class="text-sm text-gray-500"><?php echo htmlspecialchars($item['item_code']); ?></div>
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                            <?php echo htmlspecialchars($item['location_name']); ?>
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm font-mono text-blue-600">
+                            <?php echo htmlspecialchars($item['reference_no']); ?>
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-right">
+                            <div class="text-lg font-bold text-yellow-600"><?php echo number_format($item['total_moved'], 3); ?></div>
+                            <div class="text-xs text-gray-500"><?php echo htmlspecialchars($item['unit_symbol']); ?></div>
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-center text-sm text-gray-900">
+                            <?php echo $item['transaction_count']; ?>
+                        </td>
+                    </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+        </div>
+        
+        <!-- Pagination for Trolley Movements -->
+        <?php if ($trolley_total_records > 0): ?>
+        <div class="px-6 py-4 bg-gray-50 border-t border-gray-200 flex items-center justify-between">
+            <div class="text-sm text-gray-700">
+                Showing <?php echo (($trolley_page - 1) * $limit + 1); ?> to <?php echo min($trolley_page * $limit, $trolley_total_records); ?> of <?php echo $trolley_total_records; ?> trolley movements (Page <?php echo $trolley_page; ?>)
+            </div>
+            <div class="flex space-x-1">
+                <?php if ($trolley_page > 1): ?>
+                <a href="stock_report.php?view=production_report&start_date=<?php echo urlencode($start_date); ?>&end_date=<?php echo urlencode($end_date); ?><?php echo $date_range ? '&range='.urlencode($date_range) : ''; ?>&trolley_page=<?php echo $trolley_page-1; ?><?php echo $production_page > 1 ? '&production_page='.$production_page : ''; ?><?php echo $raw_page > 1 ? '&raw_page='.$raw_page : ''; ?><?php echo $transfers_page > 1 ? '&transfers_page='.$transfers_page : ''; ?><?php echo $daily_page > 1 ? '&daily_page='.$daily_page : ''; ?>" 
+                   class="bg-white border border-gray-300 text-gray-700 hover:bg-gray-50 px-3 py-2 rounded-md text-sm">Previous</a>
+                <?php endif; ?>
+                
+                <?php for ($i = max(1, $trolley_page-2); $i <= min($trolley_total_pages, $trolley_page+2); $i++): ?>
+                <a href="stock_report.php?view=production_report&start_date=<?php echo urlencode($start_date); ?>&end_date=<?php echo urlencode($end_date); ?><?php echo $date_range ? '&range='.urlencode($date_range) : ''; ?>&trolley_page=<?php echo $i; ?><?php echo $production_page > 1 ? '&production_page='.$production_page : ''; ?><?php echo $raw_page > 1 ? '&raw_page='.$raw_page : ''; ?><?php echo $transfers_page > 1 ? '&transfers_page='.$transfers_page : ''; ?><?php echo $daily_page > 1 ? '&daily_page='.$daily_page : ''; ?>" 
+                   class="<?php echo $i == $trolley_page ? 'bg-blue-600 text-white' : 'bg-white border border-gray-300 text-gray-700 hover:bg-gray-50'; ?> px-3 py-2 rounded-md text-sm"><?php echo $i; ?></a>
+                <?php endfor; ?>
+                
+                <?php if ($trolley_page < $trolley_total_pages): ?>
+                <a href="stock_report.php?view=production_report&start_date=<?php echo urlencode($start_date); ?>&end_date=<?php echo urlencode($end_date); ?><?php echo $date_range ? '&range='.urlencode($date_range) : ''; ?>&trolley_page=<?php echo $trolley_page+1; ?><?php echo $production_page > 1 ? '&production_page='.$production_page : ''; ?><?php echo $raw_page > 1 ? '&raw_page='.$raw_page : ''; ?><?php echo $transfers_page > 1 ? '&transfers_page='.$transfers_page : ''; ?><?php echo $daily_page > 1 ? '&daily_page='.$daily_page : ''; ?>" 
+                   class="bg-white border border-gray-300 text-gray-700 hover:bg-gray-50 px-3 py-2 rounded-md text-sm">Next</a>
+                <?php endif; ?>
+            </div>
+        </div>
+        <?php endif; ?>
+    </div>
+    <?php endif; ?>
+
+    <!-- Raw Material Consumption -->
+    <?php if ($raw_consumption_total_records > 0): ?>
+    <div class="bg-white rounded-lg shadow mb-6">
+        <div class="px-6 py-4 border-b border-gray-200">
+            <div class="flex justify-between items-center">
+                <div>
+                    <h3 class="text-lg font-medium text-gray-900">🔴 Raw Material Consumption</h3>
+                    <p class="text-sm text-gray-600">Period: <?php echo date('M d, Y', strtotime($start_date)); ?> to <?php echo date('M d, Y', strtotime($end_date)); ?></p>
+                </div>
+                <button onclick="window.open('?view=production_report&table_type=raw_consumption&start_date=<?php echo urlencode($start_date); ?>&end_date=<?php echo urlencode($end_date); ?>&download=pdf', '_blank')" class="bg-red-600 text-white px-4 py-2 rounded-md hover:bg-red-700 transition-colors text-sm">
+                    📄 Export PDF
+                </button>
+            </div>
+        </div>
+        <div class="overflow-x-auto">
+            <?php if (!empty($raw_consumed_by_item)): ?>
+            <table class="min-w-full divide-y divide-gray-200">
+                <thead class="bg-gray-50">
+                    <tr>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Raw Material</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Location</th>
+                        <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Quantity Used</th>
+                        <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Transactions</th>
+                    </tr>
+                </thead>
+                <tbody class="bg-white divide-y divide-gray-200">
+                    <?php foreach ($raw_consumed_by_item as $item): ?>
+                    <tr class="hover:bg-gray-50">
+                        <td class="px-6 py-4 whitespace-nowrap">
+                            <div class="text-sm font-medium text-gray-900"><?php echo htmlspecialchars($item['item_name']); ?></div>
+                            <div class="text-sm text-gray-500"><?php echo htmlspecialchars($item['item_code']); ?></div>
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                            <?php echo htmlspecialchars($item['location_name']); ?>
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-right">
+                            <div class="text-lg font-bold text-orange-600"><?php echo number_format($item['total_consumed'], 3); ?></div>
+                            <div class="text-xs text-gray-500"><?php echo htmlspecialchars($item['unit_symbol']); ?></div>
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-center text-sm text-gray-900">
+                            <?php echo $item['transaction_count']; ?>
+                        </td>
+                    </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+            <?php else: ?>
+            <div class="px-6 py-8 text-center text-gray-500">
+                <p>No raw material consumption data found for page <?php echo $raw_page; ?>.</p>
+            </div>
+            <?php endif; ?>
+        </div>
+        
+        <!-- Pagination for Raw Material Consumption -->
+        <?php if ($raw_consumption_total_records > 0): ?>
+        <div class="px-6 py-4 bg-gray-50 border-t border-gray-200 flex items-center justify-between">
+            <div class="text-sm text-gray-700">
+                Showing <?php echo (($raw_page - 1) * $limit + 1); ?> to <?php echo min($raw_page * $limit, $raw_consumption_total_records); ?> of <?php echo $raw_consumption_total_records; ?> raw materials (Page <?php echo $raw_page; ?>)
+            </div>
+            <div class="flex space-x-1">
+                <?php if ($raw_page > 1): ?>
+                <a href="stock_report.php?view=production_report&start_date=<?php echo urlencode($start_date); ?>&end_date=<?php echo urlencode($end_date); ?><?php echo $date_range ? '&range='.urlencode($date_range) : ''; ?>&raw_page=<?php echo $raw_page-1; ?><?php echo $production_page > 1 ? '&production_page='.$production_page : ''; ?><?php echo $trolley_page > 1 ? '&trolley_page='.$trolley_page : ''; ?><?php echo $transfers_page > 1 ? '&transfers_page='.$transfers_page : ''; ?><?php echo $daily_page > 1 ? '&daily_page='.$daily_page : ''; ?>" 
+                   class="bg-white border border-gray-300 text-gray-700 hover:bg-gray-50 px-3 py-2 rounded-md text-sm">Previous</a>
+                <?php endif; ?>
+                
+                <?php for ($i = max(1, $raw_page-2); $i <= min($raw_consumption_total_pages, $raw_page+2); $i++): ?>
+                <a href="stock_report.php?view=production_report&start_date=<?php echo urlencode($start_date); ?>&end_date=<?php echo urlencode($end_date); ?><?php echo $date_range ? '&range='.urlencode($date_range) : ''; ?>&raw_page=<?php echo $i; ?><?php echo $production_page > 1 ? '&production_page='.$production_page : ''; ?><?php echo $trolley_page > 1 ? '&trolley_page='.$trolley_page : ''; ?><?php echo $transfers_page > 1 ? '&transfers_page='.$transfers_page : ''; ?><?php echo $daily_page > 1 ? '&daily_page='.$daily_page : ''; ?>" 
+                   class="<?php echo $i == $raw_page ? 'bg-blue-600 text-white' : 'bg-white border border-gray-300 text-gray-700 hover:bg-gray-50'; ?> px-3 py-2 rounded-md text-sm"><?php echo $i; ?></a>
+                <?php endfor; ?>
+                
+                <?php if ($raw_page < $raw_consumption_total_pages): ?>
+                <a href="stock_report.php?view=production_report&start_date=<?php echo urlencode($start_date); ?>&end_date=<?php echo urlencode($end_date); ?><?php echo $date_range ? '&range='.urlencode($date_range) : ''; ?>&raw_page=<?php echo $raw_page+1; ?><?php echo $production_page > 1 ? '&production_page='.$production_page : ''; ?><?php echo $trolley_page > 1 ? '&trolley_page='.$trolley_page : ''; ?><?php echo $transfers_page > 1 ? '&transfers_page='.$transfers_page : ''; ?><?php echo $daily_page > 1 ? '&daily_page='.$daily_page : ''; ?>" 
+                   class="bg-white border border-gray-300 text-gray-700 hover:bg-gray-50 px-3 py-2 rounded-md text-sm">Next</a>
+                <?php endif; ?>
+            </div>
+        </div>
+        <?php endif; ?>
+    </div>
+    <?php endif; ?>
+
+    <!-- Transfers -->
+    <?php if ($transfers_total_records > 0): ?>
+    <div class="bg-white rounded-lg shadow mb-6">
+        <div class="px-6 py-4 border-b border-gray-200">
+            <div class="flex justify-between items-center">
+                <div>
+                    <h3 class="text-lg font-medium text-gray-900">🔄 Transfers Between Locations</h3>
+                    <p class="text-sm text-gray-600">Period: <?php echo date('M d, Y', strtotime($start_date)); ?> to <?php echo date('M d, Y', strtotime($end_date)); ?></p>
+                </div>
+                <button onclick="window.open('?view=production_report&table_type=transfers&start_date=<?php echo urlencode($start_date); ?>&end_date=<?php echo urlencode($end_date); ?>&download=pdf', '_blank')" class="bg-red-600 text-white px-4 py-2 rounded-md hover:bg-red-700 transition-colors text-sm">
+                    📄 Export PDF
+                </button>
+            </div>
+        </div>
+        <div class="overflow-x-auto">
+            <table class="min-w-full divide-y divide-gray-200">
+                <thead class="bg-gray-50">
+                    <tr>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Item</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Location</th>
+                        <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Quantity Transferred</th>
+                        <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Transactions</th>
+                    </tr>
+                </thead>
+                <tbody class="bg-white divide-y divide-gray-200">
+                    <?php foreach ($transfers_by_item as $item): ?>
+                    <tr class="hover:bg-gray-50">
+                        <td class="px-6 py-4 whitespace-nowrap">
+                            <div class="text-sm font-medium text-gray-900"><?php echo htmlspecialchars($item['item_name']); ?></div>
+                            <div class="text-sm text-gray-500"><?php echo htmlspecialchars($item['item_code']); ?></div>
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                            <?php echo htmlspecialchars($item['location_name']); ?>
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-right">
+                            <div class="text-lg font-bold text-blue-600"><?php echo number_format($item['total_transferred'], 3); ?></div>
+                            <div class="text-xs text-gray-500"><?php echo htmlspecialchars($item['unit_symbol']); ?></div>
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-center text-sm text-gray-900">
+                            <?php echo $item['transaction_count']; ?>
+                        </td>
+                    </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+        </div>
+        
+        <!-- Pagination for Transfers -->
+        <?php if ($transfers_total_records > 0): ?>
+        <div class="px-6 py-4 bg-gray-50 border-t border-gray-200 flex items-center justify-between">
+            <div class="text-sm text-gray-700">
+                Showing <?php echo (($transfers_page - 1) * $limit + 1); ?> to <?php echo min($transfers_page * $limit, $transfers_total_records); ?> of <?php echo $transfers_total_records; ?> transfers (Page <?php echo $transfers_page; ?>)
+            </div>
+            <div class="flex space-x-1">
+                <?php if ($transfers_page > 1): ?>
+                <a href="stock_report.php?view=production_report&start_date=<?php echo urlencode($start_date); ?>&end_date=<?php echo urlencode($end_date); ?><?php echo $date_range ? '&range='.urlencode($date_range) : ''; ?>&transfers_page=<?php echo $transfers_page-1; ?><?php echo $production_page > 1 ? '&production_page='.$production_page : ''; ?><?php echo $trolley_page > 1 ? '&trolley_page='.$trolley_page : ''; ?><?php echo $raw_page > 1 ? '&raw_page='.$raw_page : ''; ?><?php echo $daily_page > 1 ? '&daily_page='.$daily_page : ''; ?>" 
+                   class="bg-white border border-gray-300 text-gray-700 hover:bg-gray-50 px-3 py-2 rounded-md text-sm">Previous</a>
+                <?php endif; ?>
+                
+                <?php for ($i = max(1, $transfers_page-2); $i <= min($transfers_total_pages, $transfers_page+2); $i++): ?>
+                <a href="stock_report.php?view=production_report&start_date=<?php echo urlencode($start_date); ?>&end_date=<?php echo urlencode($end_date); ?><?php echo $date_range ? '&range='.urlencode($date_range) : ''; ?>&transfers_page=<?php echo $i; ?><?php echo $production_page > 1 ? '&production_page='.$production_page : ''; ?><?php echo $trolley_page > 1 ? '&trolley_page='.$trolley_page : ''; ?><?php echo $raw_page > 1 ? '&raw_page='.$raw_page : ''; ?><?php echo $daily_page > 1 ? '&daily_page='.$daily_page : ''; ?>" 
+                   class="<?php echo $i == $transfers_page ? 'bg-blue-600 text-white' : 'bg-white border border-gray-300 text-gray-700 hover:bg-gray-50'; ?> px-3 py-2 rounded-md text-sm"><?php echo $i; ?></a>
+                <?php endfor; ?>
+                
+                <?php if ($transfers_page < $transfers_total_pages): ?>
+                <a href="stock_report.php?view=production_report&start_date=<?php echo urlencode($start_date); ?>&end_date=<?php echo urlencode($end_date); ?><?php echo $date_range ? '&range='.urlencode($date_range) : ''; ?>&transfers_page=<?php echo $transfers_page+1; ?><?php echo $production_page > 1 ? '&production_page='.$production_page : ''; ?><?php echo $trolley_page > 1 ? '&trolley_page='.$trolley_page : ''; ?><?php echo $raw_page > 1 ? '&raw_page='.$raw_page : ''; ?><?php echo $daily_page > 1 ? '&daily_page='.$daily_page : ''; ?>" 
+                   class="bg-white border border-gray-300 text-gray-700 hover:bg-gray-50 px-3 py-2 rounded-md text-sm">Next</a>
+                <?php endif; ?>
+            </div>
+        </div>
+        <?php endif; ?>
+    </div>
+    <?php endif; ?>
+
+    <!-- Daily Breakdown -->
+    <?php if ($daily_breakdown_total_records > 1): ?>
+    <div class="bg-white rounded-lg shadow mb-6">
+        <div class="px-6 py-4 border-b border-gray-200">
+            <div class="flex justify-between items-center">
+                <div>
+                    <h3 class="text-lg font-medium text-gray-900">📅 Daily Breakdown</h3>
+                    <p class="text-sm text-gray-600">Period: <?php echo date('M d, Y', strtotime($start_date)); ?> to <?php echo date('M d, Y', strtotime($end_date)); ?></p>
+                </div>
+                <button onclick="window.open('?view=production_report&table_type=daily_breakdown&start_date=<?php echo urlencode($start_date); ?>&end_date=<?php echo urlencode($end_date); ?>&download=pdf', '_blank')" class="bg-red-600 text-white px-4 py-2 rounded-md hover:bg-red-700 transition-colors text-sm">
+                    📄 Export PDF
+                </button>
+            </div>
+        </div>
+        <div class="overflow-x-auto">
+            <table class="min-w-full divide-y divide-gray-200">
+                <thead class="bg-gray-50">
+                    <tr>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Date</th>
+                        <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Production</th>
+                        <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Trolley Movements</th>
+                        <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Transfers</th>
+                        <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Raw Material Used</th>
+                    </tr>
+                </thead>
+                <tbody class="bg-white divide-y divide-gray-200">
+                    <?php foreach ($daily_breakdown as $day): ?>
+                    <tr class="hover:bg-gray-50">
+                        <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
+                            <?php echo date('M d, Y', strtotime($day['report_date'])); ?>
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-right">
+                            <span class="text-green-600 font-medium"><?php echo number_format($day['daily_production'], 2); ?></span>
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-right">
+                            <span class="text-yellow-600 font-medium"><?php echo number_format($day['daily_trolley_movements'], 2); ?></span>
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-right">
+                            <span class="text-blue-600 font-medium"><?php echo number_format($day['daily_transfers'], 2); ?></span>
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-right">
+                            <span class="text-orange-600 font-medium"><?php echo number_format($day['daily_raw_consumed'], 2); ?></span>
+                        </td>
+                    </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+        </div>
+        
+        <!-- Pagination for Daily Breakdown -->
+        <?php if ($daily_breakdown_total_records > 0): ?>
+        <div class="px-6 py-4 bg-gray-50 border-t border-gray-200 flex items-center justify-between">
+            <div class="text-sm text-gray-700">
+                Showing <?php echo (($daily_page - 1) * $limit + 1); ?> to <?php echo min($daily_page * $limit, $daily_breakdown_total_records); ?> of <?php echo $daily_breakdown_total_records; ?> days (Page <?php echo $daily_page; ?>)
+            </div>
+            <div class="flex space-x-1">
+                <?php if ($daily_page > 1): ?>
+                <a href="stock_report.php?view=production_report&start_date=<?php echo urlencode($start_date); ?>&end_date=<?php echo urlencode($end_date); ?><?php echo $date_range ? '&range='.urlencode($date_range) : ''; ?>&daily_page=<?php echo $daily_page-1; ?><?php echo $production_page > 1 ? '&production_page='.$production_page : ''; ?><?php echo $trolley_page > 1 ? '&trolley_page='.$trolley_page : ''; ?><?php echo $raw_page > 1 ? '&raw_page='.$raw_page : ''; ?><?php echo $transfers_page > 1 ? '&transfers_page='.$transfers_page : ''; ?>" 
+                   class="bg-white border border-gray-300 text-gray-700 hover:bg-gray-50 px-3 py-2 rounded-md text-sm">Previous</a>
+                <?php endif; ?>
+                
+                <?php for ($i = max(1, $daily_page-2); $i <= min($daily_breakdown_total_pages, $daily_page+2); $i++): ?>
+                <a href="stock_report.php?view=production_report&start_date=<?php echo urlencode($start_date); ?>&end_date=<?php echo urlencode($end_date); ?><?php echo $date_range ? '&range='.urlencode($date_range) : ''; ?>&daily_page=<?php echo $i; ?><?php echo $production_page > 1 ? '&production_page='.$production_page : ''; ?><?php echo $trolley_page > 1 ? '&trolley_page='.$trolley_page : ''; ?><?php echo $raw_page > 1 ? '&raw_page='.$raw_page : ''; ?><?php echo $transfers_page > 1 ? '&transfers_page='.$transfers_page : ''; ?>" 
+                   class="<?php echo $i == $daily_page ? 'bg-blue-600 text-white' : 'bg-white border border-gray-300 text-gray-700 hover:bg-gray-50'; ?> px-3 py-2 rounded-md text-sm"><?php echo $i; ?></a>
+                <?php endfor; ?>
+                
+                <?php if ($daily_page < $daily_breakdown_total_pages): ?>
+                <a href="stock_report.php?view=production_report&start_date=<?php echo urlencode($start_date); ?>&end_date=<?php echo urlencode($end_date); ?><?php echo $date_range ? '&range='.urlencode($date_range) : ''; ?>&daily_page=<?php echo $daily_page+1; ?><?php echo $production_page > 1 ? '&production_page='.$production_page : ''; ?><?php echo $trolley_page > 1 ? '&trolley_page='.$trolley_page : ''; ?><?php echo $raw_page > 1 ? '&raw_page='.$raw_page : ''; ?><?php echo $transfers_page > 1 ? '&transfers_page='.$transfers_page : ''; ?>" 
+                   class="bg-white border border-gray-300 text-gray-700 hover:bg-gray-50 px-3 py-2 rounded-md text-sm">Next</a>
+                <?php endif; ?>
+            </div>
+        </div>
+        <?php endif; ?>
+    </div>
+    <?php endif; ?>
+
+    <!-- Empty state if no data -->
+    <?php if (empty($production_by_item) && empty($trolley_movements_by_item) && empty($raw_consumed_by_item) && empty($transfers_by_item)): ?>
+    <div class="bg-white rounded-lg shadow p-12 text-center">
+        <div class="text-gray-400 text-6xl mb-4">📊</div>
+        <h3 class="text-lg font-medium text-gray-900 mb-2">No Production Data Found</h3>
+        <p class="text-gray-500 mb-4">No production activities found for the selected date range.</p>
+        <p class="text-sm text-gray-400">Try selecting a different date range or check if there are production transactions in the system.</p>
+    </div>
+    <?php endif; ?>
+    
+    <?php endif; ?>
+
     <?php if ($view_mode === 'movements'): ?>
     <!-- Recent Movements -->
     <div class="bg-white rounded-lg shadow">
@@ -1604,6 +2689,47 @@ function exportToCSV() {
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+}
+
+// Date filter functions for Production Report
+function setDateRange(type) {
+    const startDate = document.getElementById('start_date');
+    const endDate = document.getElementById('end_date');
+    const today = new Date();
+    
+    if (type === 'today') {
+        const todayStr = today.toISOString().split('T')[0];
+        startDate.value = todayStr;
+        endDate.value = todayStr;
+    } else if (type === 'month') {
+        const firstDay = new Date(today.getFullYear(), today.getMonth(), 1);
+        const lastDay = new Date(today.getFullYear(), today.getMonth() + 1, 0);
+        startDate.value = firstDay.toISOString().split('T')[0];
+        endDate.value = lastDay.toISOString().split('T')[0];
+    }
+}
+
+function applyDateFilter() {
+    const startDate = document.getElementById('start_date').value;
+    const endDate = document.getElementById('end_date').value;
+    
+    if (!startDate || !endDate) {
+        alert('Please select both start and end dates.');
+        return;
+    }
+    
+    if (startDate > endDate) {
+        alert('Start date must be before or equal to end date.');
+        return;
+    }
+    
+    // Build URL with current filters and new dates
+    const currentUrl = new URL(window.location);
+    currentUrl.searchParams.set('start_date', startDate);
+    currentUrl.searchParams.set('end_date', endDate);
+    
+    // Redirect to updated URL
+    window.location.href = currentUrl.toString();
 }
 
 // Print styles
