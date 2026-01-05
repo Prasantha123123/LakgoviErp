@@ -1,6 +1,7 @@
 <?php
-// cashier.php - Complete Billing/Sales System (Simplified - No Location)
+// cashier.php - Complete Billing/Sales System with Split Payment Support
 include 'header.php';
+require_once 'payment_functions.php';
 
 $success = '';
 $error = '';
@@ -248,47 +249,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                 $stmt->execute([$quantity, $item_id]);
             }
             
-            // Create payment record if payment received
-            if ($paid_amount > 0) {
-                // Get next payment number
-                $stmt = $db->query("SELECT payment_no FROM sales_payments ORDER BY id DESC LIMIT 1");
-                $last_payment = $stmt->fetch();
-                if ($last_payment) {
-                    $last_num = intval(substr($last_payment['payment_no'], 3));
-                    $payment_no = 'PAY' . str_pad($last_num + 1, 5, '0', STR_PAD_LEFT);
-                } else {
-                    $payment_no = 'PAY00001';
-                }
+            // Create payment records for each payment line (SPLIT PAYMENT SUPPORT)
+            if (!empty($_POST['payments']) && is_array($_POST['payments'])) {
+                // Insert each payment line into sales_payments
+                insertPaymentLines($db, $invoice_id, $_POST['payments'], 'initial', $_SESSION['user_id']);
                 
-                // Prepare cheque fields - use NULL if empty
-                $cheque_number = !empty($_POST['cheque_number']) ? $_POST['cheque_number'] : null;
-                $cheque_date = !empty($_POST['cheque_date']) ? $_POST['cheque_date'] : null;
-                $bank_name = !empty($_POST['bank_name']) ? $_POST['bank_name'] : null;
-                $cheque_status = ($_POST['payment_method'] === 'cheque') ? 'pending' : null;
-                
-                $stmt = $db->prepare("
-                    INSERT INTO sales_payments (
-                        payment_no, invoice_id, payment_date, amount, 
-                        payment_method, payment_type, reference_no, 
-                        cheque_number, cheque_date, bank_name, cheque_status,
-                        notes, created_by
-                    ) VALUES (?, ?, ?, ?, ?, 'initial', ?, ?, ?, ?, ?, ?, ?)
-                ");
-                
-                $stmt->execute([
-                    $payment_no,
-                    $invoice_id,
-                    $_POST['invoice_date'],
-                    $paid_amount,
-                    $_POST['payment_method'] ?? 'cash',
-                    $_POST['payment_reference'] ?? null,
-                    $cheque_number,
-                    $cheque_date,
-                    $bank_name,
-                    $cheque_status,
-                    $_POST['payment_notes'] ?? null,
-                    $_SESSION['user_id']
-                ]);
+                // Recompute invoice totals based on actual payments
+                recomputeInvoiceTotals($db, $invoice_id);
             }
             
             $db->commit();
@@ -458,56 +425,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                     </div>
                     
                     <div class="mt-6 pt-6 border-t">
-                        <h3 class="font-semibold text-gray-900 mb-3">Payment</h3>
+                        <div class="flex justify-between items-center mb-3">
+                            <h3 class="font-semibold text-gray-900">Payment Lines</h3>
+                            <button type="button" onclick="addPaymentLine()" 
+                                    class="bg-green-600 text-white px-3 py-1 rounded text-sm hover:bg-green-700">
+                                + Add Payment
+                            </button>
+                        </div>
                         
-                        <div class="space-y-3">
-                            <div>
-                                <label class="block text-sm font-medium text-gray-700 mb-1">Payment Method</label>
-                                <select name="payment_method" id="payment_method" onchange="toggleChequeFields()" class="w-full px-3 py-2 border border-gray-300 rounded-md text-sm">
-                                    <option value="cash">Cash</option>
-                                    <option value="card">Card</option>
-                                    <option value="bank_transfer">Bank Transfer</option>
-                                    <option value="cheque">Cheque</option>
-                                    <option value="other">Other</option>
-                                </select>
+                        <div id="paymentLinesContainer" class="space-y-3">
+                            <!-- Payment lines will be added here dynamically -->
+                        </div>
+                        
+                        <div class="mt-4 space-y-2 pt-3 border-t">
+                            <div class="flex justify-between text-sm">
+                                <span class="text-gray-600">Total Payments:</span>
+                                <span id="total_payments_display" class="font-medium text-green-600">0.00</span>
                             </div>
-                            
-                            <!-- Cheque Fields (hidden by default) -->
-                            <div id="cheque_details" class="hidden bg-blue-50 p-3 rounded border border-blue-200">
-                                <p class="text-xs font-semibold text-blue-900 mb-2">Cheque Details</p>
-                                <div class="space-y-2">
-                                    <div>
-                                        <label class="block text-xs font-medium text-gray-700 mb-1">Cheque No</label>
-                                        <input type="text" name="cheque_number" id="cheque_number" class="w-full px-2 py-1 border border-gray-300 rounded text-sm">
-                                    </div>
-                                    <div>
-                                        <label class="block text-xs font-medium text-gray-700 mb-1">Cheque Date</label>
-                                        <input type="date" name="cheque_date" id="cheque_date" class="w-full px-2 py-1 border border-gray-300 rounded text-sm">
-                                    </div>
-                                    <div>
-                                        <label class="block text-xs font-medium text-gray-700 mb-1">Bank Name</label>
-                                        <input type="text" name="bank_name" id="bank_name" placeholder="e.g. Commercial Bank" class="w-full px-2 py-1 border border-gray-300 rounded text-sm">
-                                    </div>
-                                </div>
-                                <p class="text-xs text-blue-700 mt-2">⏳ Will be marked as "Pending"</p>
-                            </div>
-                            
-                            <div>
-                                <label class="block text-sm font-medium text-gray-700 mb-1">Amount Paid</label>
-                                <input type="number" name="paid_amount" id="paid_amount" step="0.01" min="0" value="0"
-                                       onchange="calculateBalance()"
-                                       class="w-full px-3 py-2 border border-gray-300 rounded-md text-sm">
-                            </div>
-                            
-                            <div>
-                                <label class="block text-sm font-medium text-gray-700 mb-1">Payment Reference</label>
-                                <input type="text" name="payment_reference" placeholder="Optional"
-                                       class="w-full px-3 py-2 border border-gray-300 rounded-md text-sm">
-                            </div>
-                            
-                            <div class="flex justify-between text-sm pt-2 border-t">
-                                <span class="text-gray-600">Balance:</span>
-                                <span id="balance_display" class="font-semibold">0.00</span>
+                            <div class="flex justify-between text-sm">
+                                <span class="text-gray-600">Balance Due:</span>
+                                <span id="balance_display" class="font-semibold text-red-600">0.00</span>
                             </div>
                         </div>
                     </div>
@@ -730,26 +667,150 @@ function calculateTotals() {
     calculateBalance();
 }
 
-// Calculate balance
+// Calculate balance based on payment lines
 function calculateBalance() {
     const total = parseFloat(document.getElementById('total_display').textContent) || 0;
-    const paid = parseFloat(document.getElementById('paid_amount').value) || 0;
-    const balance = total - paid;
+    let totalPayments = 0;
+    
+    // Sum all payment line amounts
+    document.querySelectorAll('.payment-line-amount').forEach(input => {
+        totalPayments += parseFloat(input.value) || 0;
+    });
+    
+    const balance = total - totalPayments;
     
     const balanceDisplay = document.getElementById('balance_display');
+    const totalPaymentsDisplay = document.getElementById('total_payments_display');
+    
+    totalPaymentsDisplay.textContent = totalPayments.toFixed(2);
     
     if (balance > 0) {
-        // Customer owes money
         balanceDisplay.textContent = balance.toFixed(2);
         balanceDisplay.className = 'font-semibold text-red-600';
     } else if (balance < 0) {
-        // Customer overpaid - show as change to give back
         balanceDisplay.textContent = 'Change: ' + Math.abs(balance).toFixed(2);
         balanceDisplay.className = 'font-semibold text-green-600';
     } else {
-        // Exact payment
         balanceDisplay.textContent = '0.00';
         balanceDisplay.className = 'font-semibold text-gray-600';
+    }
+}
+
+// Payment line counter
+let paymentLineCounter = 0;
+
+// Add new payment line
+function addPaymentLine() {
+    paymentLineCounter++;
+    const container = document.getElementById('paymentLinesContainer');
+    const total = parseFloat(document.getElementById('total_display').textContent) || 0;
+    
+    // Calculate remaining balance
+    let currentPayments = 0;
+    document.querySelectorAll('.payment-line-amount').forEach(input => {
+        currentPayments += parseFloat(input.value) || 0;
+    });
+    const remainingBalance = Math.max(0, total - currentPayments);
+    
+    const lineDiv = document.createElement('div');
+    lineDiv.id = `payment_line_${paymentLineCounter}`;
+    lineDiv.className = 'payment-line bg-gray-50 p-3 rounded border';
+    
+    lineDiv.innerHTML = `
+        <div class="flex justify-between items-center mb-2">
+            <span class="text-xs font-semibold text-gray-600">Payment #${paymentLineCounter}</span>
+            <button type="button" onclick="removePaymentLine(${paymentLineCounter})" 
+                    class="text-red-500 hover:text-red-700 text-sm">✕ Remove</button>
+        </div>
+        <div class="grid grid-cols-2 gap-2">
+            <div>
+                <label class="block text-xs font-medium text-gray-600">Method</label>
+                <select name="payments[${paymentLineCounter}][method]" 
+                        onchange="togglePaymentChequeFields(${paymentLineCounter})"
+                        class="w-full px-2 py-1 border border-gray-300 rounded text-sm">
+                    <option value="cash">Cash</option>
+                    <option value="card">Card</option>
+                    <option value="bank_transfer">Bank Transfer</option>
+                    <option value="cheque">Cheque</option>
+                    <option value="other">Other</option>
+                </select>
+            </div>
+            <div>
+                <label class="block text-xs font-medium text-gray-600">Amount</label>
+                <input type="number" name="payments[${paymentLineCounter}][amount]" 
+                       step="0.01" min="0" value="${remainingBalance.toFixed(2)}"
+                       onchange="calculateBalance()"
+                       class="w-full px-2 py-1 border border-gray-300 rounded text-sm text-right payment-line-amount">
+            </div>
+        </div>
+        <div class="mt-2">
+            <label class="block text-xs font-medium text-gray-600">Reference No</label>
+            <input type="text" name="payments[${paymentLineCounter}][reference_no]" 
+                   placeholder="Card TXN / Receipt No"
+                   class="w-full px-2 py-1 border border-gray-300 rounded text-sm">
+        </div>
+        <div id="bank_fields_${paymentLineCounter}" class="hidden mt-2 bg-green-50 p-2 rounded border border-green-200">
+            <p class="text-xs font-semibold text-green-800 mb-2">Bank Transfer Details</p>
+            <div>
+                <label class="block text-xs text-gray-600">Bank Name</label>
+                <input type="text" name="payments[${paymentLineCounter}][bank_name]" 
+                       placeholder="e.g. Commercial Bank"
+                       class="w-full px-2 py-1 border border-gray-300 rounded text-sm">
+            </div>
+        </div>
+        <div id="cheque_fields_${paymentLineCounter}" class="hidden mt-2 bg-blue-50 p-2 rounded border border-blue-200">
+            <p class="text-xs font-semibold text-blue-800 mb-2">Cheque Details</p>
+            <div class="grid grid-cols-1 gap-2">
+                <div>
+                    <label class="block text-xs text-gray-600">Cheque Number</label>
+                    <input type="text" name="payments[${paymentLineCounter}][cheque_number]" 
+                           class="w-full px-2 py-1 border border-gray-300 rounded text-sm">
+                </div>
+                <div>
+                    <label class="block text-xs text-gray-600">Cheque Date</label>
+                    <input type="date" name="payments[${paymentLineCounter}][cheque_date]" 
+                           class="w-full px-2 py-1 border border-gray-300 rounded text-sm">
+                </div>
+                <div>
+                    <label class="block text-xs text-gray-600">Bank Name</label>
+                    <input type="text" name="payments[${paymentLineCounter}][cheque_bank_name]" 
+                           placeholder="e.g. Commercial Bank"
+                           class="w-full px-2 py-1 border border-gray-300 rounded text-sm">
+                </div>
+            </div>
+            <p class="text-xs text-blue-600 mt-1">⏳ Status: Pending</p>
+            <input type="hidden" name="payments[${paymentLineCounter}][cheque_status]" value="pending">
+        </div>
+    `;
+    
+    container.appendChild(lineDiv);
+    calculateBalance();
+}
+
+// Toggle cheque fields for a payment line
+function togglePaymentChequeFields(lineId) {
+    const select = document.querySelector(`#payment_line_${lineId} select`);
+    const chequeFields = document.getElementById(`cheque_fields_${lineId}`);
+    const bankFields = document.getElementById(`bank_fields_${lineId}`);
+    
+    // Hide all extra fields first
+    chequeFields.classList.add('hidden');
+    bankFields.classList.add('hidden');
+    
+    // Show relevant fields based on selection
+    if (select.value === 'cheque') {
+        chequeFields.classList.remove('hidden');
+    } else if (select.value === 'bank_transfer') {
+        bankFields.classList.remove('hidden');
+    }
+}
+
+// Remove payment line
+function removePaymentLine(lineId) {
+    const line = document.getElementById(`payment_line_${lineId}`);
+    if (line) {
+        line.remove();
+        calculateBalance();
     }
 }
 
@@ -767,12 +828,20 @@ function resetForm() {
     if (confirm('Are you sure you want to reset the form?')) {
         document.getElementById('billingForm').reset();
         document.getElementById('itemsBody').innerHTML = '';
+        document.getElementById('paymentLinesContainer').innerHTML = '';
         currentPriceListId = null;
         priceListItems = {};
         itemRowCounter = 0;
+        paymentLineCounter = 0;
         calculateTotals();
     }
 }
+
+// Auto-add first payment line when form loads with items
+document.addEventListener('DOMContentLoaded', function() {
+    // Initialize with empty state
+    calculateBalance();
+});
 </script>
 
 <?php include 'footer.php'; ?>

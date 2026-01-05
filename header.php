@@ -236,7 +236,7 @@ $current_page = basename($_SERVER['PHP_SELF'], '.php');
                     
                     <!-- Billing Dropdown -->
                     <div class="relative dropdown" onmouseenter="showDropdown(this)" onmouseleave="hideDropdown(this)">
-                        <button class="<?php echo in_array($current_page, ['customers', 'price_lists', 'price_list_items', 'cashier']) ? 'bg-primary text-white' : 'text-gray-700 hover:bg-gray-100'; ?> px-3 py-2 rounded-md text-sm font-medium transition-colors flex items-center dropdown-button">
+                        <button class="<?php echo in_array($current_page, ['customers', 'price_lists', 'price_list_items', 'cashier', 'sales_payments', 'sales_list', 'payment_management', 'customer_pending_bills', 'add_invoice_payment', 'invoice_payment_history']) ? 'bg-primary text-white' : 'text-gray-700 hover:bg-gray-100'; ?> px-3 py-2 rounded-md text-sm font-medium transition-colors flex items-center dropdown-button">
                             <svg class="w-4 h-4 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 9V7a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2m2 4h10a2 2 0 002-2v-6a2 2 0 00-2-2H9a2 2 0 00-2 2v6a2 2 0 002 2zm7-5a2 2 0 11-4 0 2 2 0 014 0z"/>
                             </svg>
@@ -259,11 +259,18 @@ $current_page = basename($_SERVER['PHP_SELF'], '.php');
                                     </svg>
                                     Price Lists
                                 </a>
+                                <div class="border-t border-gray-100 my-1"></div>
                                 <a href="cashier.php" class="<?php echo $current_page == 'cashier' ? 'bg-primary text-white' : 'text-gray-700 hover:bg-gray-100'; ?> block px-4 py-2 text-sm transition-colors">
                                     <svg class="w-4 h-4 inline mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 9V7a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2m2 4h10a2 2 0 002-2v-6a2 2 0 00-2-2H9a2 2 0 00-2 2v6a2 2 0 002 2zm7-5a2 2 0 11-4 0 2 2 0 014 0z"/>
                                     </svg>
-                                    Cashier
+                                    💰 Cashier (POS)
+                                </a>
+                                <a href="sales_payments.php" class="<?php echo in_array($current_page, ['sales_payments', 'sales_list', 'payment_management', 'customer_pending_bills', 'add_invoice_payment']) ? 'bg-primary text-white' : 'text-gray-700 hover:bg-gray-100'; ?> block px-4 py-2 text-sm transition-colors">
+                                    <svg class="w-4 h-4 inline mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/>
+                                    </svg>
+                                    📊 Sales & Payments
                                 </a>
                             </div>
                         </div>
@@ -271,7 +278,7 @@ $current_page = basename($_SERVER['PHP_SELF'], '.php');
                     
                     <!-- Reports Dropdown -->
                     <div class="relative dropdown" onmouseenter="showDropdown(this)" onmouseleave="hideDropdown(this)">
-                        <button class="text-gray-700 hover:bg-gray-100 px-3 py-2 rounded-md text-sm font-medium transition-colors flex items-center dropdown-button">
+                        <button class="<?php echo in_array($current_page, ['stock_ledger', 'stock_report', 'sales_reports']) ? 'bg-primary text-white' : 'text-gray-700 hover:bg-gray-100'; ?> px-3 py-2 rounded-md text-sm font-medium transition-colors flex items-center dropdown-button">
                             <svg class="w-4 h-4 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
                             </svg>
@@ -282,6 +289,13 @@ $current_page = basename($_SERVER['PHP_SELF'], '.php');
                         </button>
                         <div class="dropdown-menu bg-white rounded-md shadow-lg ring-1 ring-black ring-opacity-5">
                             <div class="py-1">
+                                <a href="sales_reports.php" class="<?php echo $current_page == 'sales_reports' ? 'bg-primary text-white' : 'text-gray-700 hover:bg-gray-100'; ?> block px-4 py-2 text-sm transition-colors">
+                                    <svg class="w-4 h-4 inline mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                                    </svg>
+                                    📊 Sales Reports
+                                </a>
+                                <div class="border-t border-gray-100 my-1"></div>
                                 <a href="stock_ledger.php" class="<?php echo $current_page == 'stock_ledger' ? 'bg-primary text-white' : 'text-gray-700 hover:bg-gray-100'; ?> block px-4 py-2 text-sm transition-colors">
                                     <svg class="w-4 h-4 inline mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
