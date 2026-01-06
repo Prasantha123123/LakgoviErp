@@ -5,7 +5,17 @@ include 'header.php';
 /* =========================== Helpers =========================== */
 function safe_arr($v) { return is_array($v) ? $v : []; }
 function as_int_or_zero($v){ return is_numeric($v) ? (int)$v : 0; }
-function as_float_or_zero($v){ return is_numeric($v) ? (float)$v : 0.0; }
+function as_float_or_zero($v){ 
+    if (!is_numeric($v)) {
+        // Try to normalize decimal separator (in case comma is used instead of dot)
+        $normalized = str_replace(',', '.', (string)$v);
+        if (is_numeric($normalized)) {
+            return (float)$normalized;
+        }
+        return 0.0;
+    }
+    return (float)$v; 
+}
 
 /* ===================== Handle form submissions ===================== */
 if ($_SERVER['REQUEST_METHOD'] == 'POST') {
@@ -996,7 +1006,7 @@ $grouped_bomprod_paginated = array_slice($grouped_bomprod, $bom_product_offset, 
                                     <?php 
                                         // Get unit quantity from first material (they should all have the same finished_unit_qty)
                                         $unit_qty = isset($item_bom['materials'][0]['finished_unit_qty']) ? (float)$item_bom['materials'][0]['finished_unit_qty'] : 1.0;
-                                        echo number_format($unit_qty, 0) . 'kg → 1pc'; 
+                                        echo number_format($unit_qty, 3) . 'kg → 1pc'; 
                                     ?> (Direct)
                                 </span>
                             </div>
@@ -2014,6 +2024,16 @@ function onFinishedItemChange() {
         display.textContent = `(${unit})`;
     } else {
         display.textContent = '';
+    }
+    
+    // Optional: prefill weight from item data if available and field is empty
+    const itemId = parseInt(select.value || '0');
+    const weightInput = document.getElementById('direct_finished_unit_qty');
+    if (itemId > 0 && weightInput && !weightInput.value.trim()) {
+        const item = (FINISHED_ITEMS || []).find(it => parseInt(it.id) === itemId);
+        if (item && item.unit_weight_kg && parseFloat(item.unit_weight_kg) > 0) {
+            weightInput.value = parseFloat(item.unit_weight_kg).toFixed(3);
+        }
     }
 }
 
