@@ -157,25 +157,15 @@ $customer_address = implode(', ', $address_parts);
         }
         
         .logo-container {
-            width: 80px;
+            width: 120px;
             text-align: right;
         }
         
-        .logo-placeholder {
-            width: 70px;
-            height: 70px;
-            border: 2px solid #d4a017;
-            border-radius: 50%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            background: linear-gradient(135deg, #f5f5dc, #e8e4c9);
-        }
-        
-        .logo-text {
-            font-weight: bold;
-            font-size: 20px;
-            color: #8b4513;
+        .logo-img {
+            width: 120px;
+            height: auto;
+            max-height: 120px;
+            object-fit: contain;
         }
         
         .office-address {
@@ -454,9 +444,7 @@ $customer_address = implode(', ', $address_parts);
                 </div>
                 <div style="text-align: right;">
                     <div class="logo-container" style="display: inline-block;">
-                        <div class="logo-placeholder">
-                            <span class="logo-text">LG</span>
-                        </div>
+                        <img src="public/lakgovilogo.jpeg" alt="Lakgovi Logo" class="logo-img">
                     </div>
                     <div class="office-address">
                         Office: No-391,<br>
