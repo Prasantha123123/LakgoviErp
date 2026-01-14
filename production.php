@@ -281,11 +281,22 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                 }
 
                 // Get the item type + unit for logic
-                $stmt = $db->prepare("SELECT id, type FROM items WHERE id=?");
+                $stmt = $db->prepare("SELECT i.id, i.type, u.symbol AS unit_symbol FROM items i JOIN units u ON i.unit_id = u.id WHERE i.id=?");
                 $stmt->execute([$item_id]);
                 $itm = $stmt->fetch(PDO::FETCH_ASSOC);
                 if (!$itm) throw new Exception("Selected item not found.");
                 $item_type = $itm['type'];
+                $unit_symbol = $itm['unit_symbol'];
+
+                // Determine unit_type based on unit symbol
+                $unit_type = 'pcs'; // default
+                if (in_array(strtolower($unit_symbol), ['kg', 'g', 't'])) {
+                    $unit_type = 'weight';
+                } elseif (in_array(strtolower($unit_symbol), ['bndl'])) {
+                    $unit_type = 'bundles';
+                } elseif (in_array(strtolower($unit_symbol), ['pcs', 'pkt', 'box', 'bag'])) {
+                    $unit_type = 'pcs';
+                }
 
                 $planned_qty = 0.0;
                 $peetu_item_id = null;
@@ -335,10 +346,10 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                 $transaction_started = true;
 
                 $stmt = $db->prepare("
-                    INSERT INTO production (batch_no, item_id, location_id, planned_qty, production_date, status, peetu_item_id, peetu_qty)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO production (batch_no, item_id, location_id, planned_qty, production_date, status, peetu_item_id, peetu_qty, unit_type)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ");
-                $stmt->execute([$batch_no, $item_id, $location_id, $planned_qty, $production_date, $status, $peetu_item_id, $peetu_qty]);
+                $stmt->execute([$batch_no, $item_id, $location_id, $planned_qty, $production_date, $status, $peetu_item_id, $peetu_qty, $unit_type]);
 
                 $db->commit();
                 $transaction_started = false;
@@ -647,11 +658,11 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                 
                 // Initialize wastage tracking record
                 $stmt = $db->prepare("
-                    INSERT INTO production_wastage (production_id, theoretical_units, total_actual_raw_units, total_actual_rounded_units, total_wastage_units, wastage_percentage)
-                    VALUES (?, ?, 0, 0, 0, 0)
-                    ON DUPLICATE KEY UPDATE theoretical_units = ?
+                    INSERT INTO production_wastage (production_id, theoretical_units, total_actual_raw_units, total_actual_rounded_units, total_wastage_units, wastage_percentage, unit_type)
+                    VALUES (?, ?, 0, 0, 0, 0, ?)
+                    ON DUPLICATE KEY UPDATE theoretical_units = ?, unit_type = ?
                 ");
-                $stmt->execute([$pid, $planned_qty, $planned_qty]);
+                $stmt->execute([$pid, $planned_qty, $prod['unit_type'], $planned_qty, $prod['unit_type']]);
 
                 $db->commit();
                 $transaction_started = false;
@@ -972,15 +983,27 @@ try {
                         <?php 
                         $planned_qty = (float)$p['planned_qty'];
                         $unit_weight = (float)$p['unit_weight_kg'];
+                        $unit_type = $p['unit_type'] ?? 'pcs';
                         
-                        if ($unit_weight > 0) {
-                            // Show pieces and total weight
-                            $total_weight = $planned_qty * $unit_weight;
-                            echo number_format($planned_qty, 0) . ' ' . htmlspecialchars($p['unit_symbol']) . '<br>';
-                            echo '<span class="text-xs text-gray-600">(' . number_format($total_weight, 3) . ' kg total)</span>';
+                        if ($unit_type === 'weight') {
+                            // Weight-based: show total weight
+                            $total_weight = $planned_qty;
+                            echo number_format($total_weight, 3) . ' kg<br>';
+                            echo '<span class="text-xs text-gray-600">(weight-based)</span>';
+                        } elseif ($unit_type === 'bundles') {
+                            // Bundle-based: show bundles
+                            echo number_format($planned_qty, 0) . ' bundles';
+                            if ($unit_weight > 0) {
+                                $total_weight = $planned_qty * $unit_weight;
+                                echo '<br><span class="text-xs text-gray-600">(' . number_format($total_weight, 3) . ' kg total)</span>';
+                            }
                         } else {
-                            // No weight info, show quantity only
-                            echo number_format($planned_qty, 3) . ' ' . htmlspecialchars($p['unit_symbol']);
+                            // Piece-based (default): show pieces and total weight
+                            echo number_format($planned_qty, 0) . ' ' . htmlspecialchars($p['unit_symbol']);
+                            if ($unit_weight > 0) {
+                                $total_weight = $planned_qty * $unit_weight;
+                                echo '<br><span class="text-xs text-gray-600">(' . number_format($total_weight, 3) . ' kg total)</span>';
+                            }
                         }
                         ?>
                     </td>
@@ -992,27 +1015,39 @@ try {
                             $remaining_weight_kg = isset($p['remaining_weight_kg']) ? (float)$p['remaining_weight_kg'] : 0;
                             $transferred_qty = isset($p['total_transferred_qty']) ? (float)$p['total_transferred_qty'] : 0;
                             $wastage = isset($p['total_wastage_units']) ? (float)$p['total_wastage_units'] : 0;
-                            $is_bom_direct = !empty($p['is_bom_direct']);
+                            $unit_type = $p['unit_type'] ?? 'pcs';
                             
                             echo '<div class="space-y-1">';
-                            echo '<div>' . number_format($planned_qty, 0) . ' ' . htmlspecialchars($p['unit_symbol']) . ' <span class="text-xs text-gray-500">(planned)</span></div>';
+                            
+                            // Display planned quantity based on unit_type
+                            if ($unit_type === 'weight') {
+                                echo '<div>' . number_format($planned_qty, 3) . ' kg <span class="text-xs text-gray-500">(planned)</span></div>';
+                            } elseif ($unit_type === 'bundles') {
+                                echo '<div>' . number_format($planned_qty, 0) . ' bundles <span class="text-xs text-gray-500">(planned)</span></div>';
+                            } else {
+                                echo '<div>' . number_format($planned_qty, 0) . ' ' . htmlspecialchars($p['unit_symbol']) . ' <span class="text-xs text-gray-500">(planned)</span></div>';
+                            }
                             
                             if ($transferred_qty > 0) {
-                                // For bom_direct, show transferred in kg; for others, show in pcs
-                                if ($is_bom_direct) {
-                                    echo '<div class="text-green-600">' . number_format($transferred_qty, 2) . ' kg <span class="text-xs">(transferred)</span></div>';
+                                // Display transferred quantity based on unit_type
+                                if ($unit_type === 'weight') {
+                                    echo '<div class="text-green-600">' . number_format($transferred_qty, 3) . ' kg <span class="text-xs">(transferred)</span></div>';
+                                } elseif ($unit_type === 'bundles') {
+                                    echo '<div class="text-green-600">' . number_format($transferred_qty, 0) . ' bundles <span class="text-xs">(transferred)</span></div>';
                                 } else {
                                     echo '<div class="text-green-600">' . number_format($transferred_qty, 0) . ' ' . htmlspecialchars($p['unit_symbol']) . ' <span class="text-xs">(transferred)</span></div>';
                                 }
                             }
                             
-                            // For bom_direct, check remaining_weight_kg; for others, check remaining_qty
-                            $has_remaining = $is_bom_direct ? ($remaining_weight_kg > 0) : ($remaining_qty > 0);
+                            // Check remaining based on unit_type
+                            $has_remaining = ($unit_type === 'weight') ? ($remaining_weight_kg > 0) : ($remaining_qty > 0);
                             if ($has_remaining && $p['status'] !== 'completed') {
                                 $color = $p['status'] === 'partially_transferred' ? 'text-orange-600' : 'text-gray-600';
-                                // For bom_direct, show remaining_weight_kg in kg; for others, show remaining_qty in pcs
-                                if ($is_bom_direct) {
-                                    echo '<div class="' . $color . '">' . number_format($remaining_weight_kg, 2) . ' kg <span class="text-xs">(remaining)</span></div>';
+                                // Display remaining based on unit_type
+                                if ($unit_type === 'weight') {
+                                    echo '<div class="' . $color . '">' . number_format($remaining_weight_kg, 3) . ' kg <span class="text-xs">(remaining)</span></div>';
+                                } elseif ($unit_type === 'bundles') {
+                                    echo '<div class="' . $color . '">' . number_format($remaining_qty, 0) . ' bundles <span class="text-xs">(remaining)</span></div>';
                                 } else {
                                     echo '<div class="' . $color . '">' . number_format($remaining_qty, 0) . ' ' . htmlspecialchars($p['unit_symbol']) . ' <span class="text-xs">(remaining)</span></div>';
                                 }

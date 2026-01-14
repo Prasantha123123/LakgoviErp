@@ -487,7 +487,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                                ti.expected_quantity, ti.expected_weight_kg, ti.unit_weight_kg, ti.item_id,
                                i.weight_tolerance_percent, i.name as item_name,
                                p.id as production_id, p.remaining_qty, p.remaining_weight_kg, p.planned_qty,
-                               p.total_transferred_qty, p.total_wastage_units,
+                               p.total_transferred_qty, p.total_wastage_units, p.unit_type,
                                CASE WHEN bd.id IS NOT NULL THEN 1 ELSE 0 END as is_bom_direct
                         FROM trolley_movements tm
                         JOIN trolley_items ti ON tm.id = ti.movement_id
@@ -505,6 +505,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                     
                     // Check if this is a bom_direct item (should use weight, not pieces)
                     $is_bom_direct = (bool)$movement['is_bom_direct'];
+                    $unit_type = $movement['unit_type'] ?? 'pcs';
                     
                     // ========================================================================
                     // STEP 1: Calculate units from weight with rounding
@@ -518,15 +519,18 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                     // Calculate raw units (before rounding)
                     $actual_units_raw = $actual_weight / $unit_weight_kg;
                     
-                    // For bom_direct items, units = weight (kg), no need to divide by unit_weight
-                    // For bom_product items, units = pieces (divide weight by unit_weight and floor)
-                    if ($is_bom_direct) {
+                    // Apply rounding based on unit_type
+                    if ($unit_type === 'weight') {
                         // Weight-based: store actual weight, calculate wastage from expected vs actual
                         $actual_units_rounded = floor($actual_weight * 1000) / 1000; // Round to 3 decimals
                         $expected_weight = (float)$movement['expected_weight_kg'];
                         $wastage_units = max(0, $expected_weight - $actual_units_rounded); // Weight difference as wastage
+                    } elseif ($unit_type === 'bundles') {
+                        // Bundle-based: floor rounding for whole bundles
+                        $actual_units_rounded = floor($actual_units_raw);
+                        $wastage_units = $actual_units_raw - $actual_units_rounded;
                     } else {
-                        // Piece-based: floor rounding for whole pieces
+                        // Piece-based (default): floor rounding for whole pieces
                         $actual_units_rounded = floor($actual_units_raw);
                         $wastage_units = $actual_units_raw - $actual_units_rounded;
                     }
@@ -695,7 +699,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                                 $batch_placeholders = str_repeat('?,', count($batch_nos) - 1) . '?';
                                 $stmt = $db->prepare("
                                     SELECT p.id, p.batch_no, p.remaining_qty, p.remaining_weight_kg,
-                                           p.total_transferred_qty, p.total_wastage_units, p.planned_qty,
+                                           p.total_transferred_qty, p.total_wastage_units, p.planned_qty, p.unit_type,
                                            prc.actual_weight_measured as verified_weight
                                     FROM production p
                                     JOIN production_remaining_completion prc ON prc.production_id = p.id
@@ -719,11 +723,17 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                                     $batch_actual_weight = $actual_weight * $proportion;
                                     
                                     // For bom_direct, use weight directly; for others, use floor() rounding
-                                    if ($is_bom_direct) {
+                                    $batch_unit_type = $batch['unit_type'] ?? 'pcs';
+                                    if ($batch_unit_type === 'weight') {
                                         $batch_actual_units_raw = $batch_actual_weight;
                                         $batch_actual_units_rounded = $batch_actual_weight; // Weight = Quantity for transfer tracking
                                         $batch_wastage = max(0, $batch_verified_weight - $batch_actual_weight); // Expected - actual weight
+                                    } elseif ($batch_unit_type === 'bundles') {
+                                        $batch_actual_units_raw = $batch_actual_weight / $unit_weight_kg;
+                                        $batch_actual_units_rounded = floor($batch_actual_units_raw);
+                                        $batch_wastage = $batch_actual_units_raw - $batch_actual_units_rounded;
                                     } else {
+                                        // pcs (default)
                                         $batch_actual_units_raw = $batch_actual_weight / $unit_weight_kg;
                                         $batch_actual_units_rounded = floor($batch_actual_units_raw);
                                         $batch_wastage = $batch_actual_units_raw - $batch_actual_units_rounded;
@@ -731,9 +741,9 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                                     
                                     // Update production batch
                                     $new_remaining_weight = max(0, (float)$batch['remaining_weight_kg'] - $batch_actual_weight);
-                                    // For bom_direct, calculate remaining_qty in pieces from remaining weight
-                                    if ($is_bom_direct) {
-                                        $new_remaining_qty = $unit_weight_kg > 0 ? $new_remaining_weight / $unit_weight_kg : 0;
+                                    // Calculate remaining_qty based on unit_type
+                                    if ($batch_unit_type === 'weight') {
+                                        $new_remaining_qty = $new_remaining_weight; // Weight-based remaining
                                     } else {
                                         $new_remaining_qty = max(0, (float)$batch['remaining_qty'] - $batch_actual_units_rounded);
                                     }
