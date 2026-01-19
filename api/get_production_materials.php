@@ -62,14 +62,10 @@ try {
         $bom_lines = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
         foreach ($bom_lines as $bom_line) {
-            // Calculate required quantity: Use BOM quantity directly (per unit requirement)
-            // Previously: $unit_qty = floatval($bom_line['finished_unit_qty'] ?: 1.0);
-            // $material_per_unit = floatval($bom_line['quantity']);
-            // $pieces_to_produce = floatval($planned_qty) / $unit_qty;
-            // $required_quantity = $material_per_unit * $pieces_to_produce;
-            
-            // Now use the BOM quantity directly as the required quantity
-            $required_quantity = floatval($bom_line['quantity']);
+            // Calculate required quantity: BOM quantity is per 1 unit, multiply by planned_qty
+            // e.g., if BOM says 2kg flour for 1 unit, and planned_qty is 2, we need 4kg
+            $bom_qty = floatval($bom_line['quantity']);
+            $required_quantity = $bom_qty * floatval($planned_qty);
             
             // Format with appropriate precision (3 decimal places) but avoid unnecessary rounding
             $display_quantity = round($required_quantity, 3); // Display precision
@@ -156,7 +152,10 @@ try {
         $bom_lines = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
         foreach ($bom_lines as $bom_line) {
-            $required_quantity = round($bom_line['quantity'], 3);
+            // Calculate required quantity: BOM quantity is per 1 peetu, multiply by peetu_qty
+            // e.g., if BOM says 2kg flour for 1 peetu, and peetu_qty is 2, we need 4kg
+            $bom_qty = floatval($bom_line['quantity']);
+            $required_quantity = round($bom_qty * floatval($peetu_qty), 3);
 
             if ($bom_line['raw_material_id']) {
                 // Normal BOM line with specific raw material
