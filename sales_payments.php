@@ -60,6 +60,127 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             $success = "Payment added successfully! New balance: Rs. " . number_format($updated['balance_amount'], 2);
         }
         
+        // ===== OVERALL CUSTOMER PAYMENT - FIFO DISTRIBUTION =====
+        if ($_POST['action'] === 'add_customer_payment') {
+            $customer_id = intval($_POST['customer_id']);
+            $payment_amount = floatval($_POST['payment_amount']);
+            $payment_method = $_POST['payment_method'] ?? 'cash';
+            $payment_date = !empty($_POST['payment_date']) ? $_POST['payment_date'] : date('Y-m-d');
+            $reference_no = !empty($_POST['reference_no']) ? $_POST['reference_no'] : null;
+            
+            // Cheque fields
+            $cheque_number = null;
+            $cheque_date = null;
+            $bank_name = null;
+            $cheque_status = null;
+            
+            if ($payment_method === 'cheque') {
+                $cheque_number = !empty($_POST['cheque_number']) ? $_POST['cheque_number'] : null;
+                $cheque_date = !empty($_POST['cheque_date']) ? $_POST['cheque_date'] : null;
+                $bank_name = !empty($_POST['cheque_bank_name']) ? $_POST['cheque_bank_name'] : null;
+                $cheque_status = 'pending';
+            } elseif ($payment_method === 'bank_transfer') {
+                $bank_name = !empty($_POST['bank_name']) ? $_POST['bank_name'] : null;
+            }
+            
+            if ($payment_amount <= 0) {
+                throw new Exception("Payment amount must be greater than 0");
+            }
+            
+            // Get all pending invoices for this customer (FIFO = oldest first by invoice_date)
+            $stmt = $db->prepare("
+                SELECT id, invoice_no, balance_amount, invoice_date 
+                FROM sales_invoices 
+                WHERE customer_id = ? AND status = 'confirmed' AND balance_amount > 0
+                ORDER BY invoice_date ASC, id ASC
+            ");
+            $stmt->execute([$customer_id]);
+            $pending_invoices = $stmt->fetchAll();
+            
+            if (empty($pending_invoices)) {
+                throw new Exception("No pending invoices found for this customer");
+            }
+            
+            // Calculate total outstanding
+            $total_outstanding = 0;
+            foreach ($pending_invoices as $inv) {
+                $total_outstanding += floatval($inv['balance_amount']);
+            }
+            
+            // Validate payment doesn't exceed total outstanding
+            if ($payment_amount > $total_outstanding) {
+                throw new Exception("Payment amount (Rs. " . number_format($payment_amount, 2) . 
+                    ") exceeds total outstanding (Rs. " . number_format($total_outstanding, 2) . ")");
+            }
+            
+            // Distribute payment using FIFO (oldest invoices first)
+            $remaining_payment = $payment_amount;
+            $allocation_details = [];
+            
+            foreach ($pending_invoices as $inv) {
+                if ($remaining_payment <= 0) {
+                    break; // No more payment to allocate
+                }
+                
+                $invoice_balance = floatval($inv['balance_amount']);
+                
+                // Allocate payment to this invoice (min of remaining payment and invoice balance)
+                $payment_for_this_invoice = min($remaining_payment, $invoice_balance);
+                
+                // Create payment record for this invoice
+                $payment_no = getNextPaymentNo($db);
+                
+                $stmt = $db->prepare("
+                    INSERT INTO sales_payments (
+                        payment_no, invoice_id, payment_date, amount, 
+                        payment_method, payment_type, reference_no, 
+                        cheque_number, cheque_date, bank_name, cheque_status,
+                        created_by
+                    ) VALUES (?, ?, ?, ?, ?, 'customer_overall', ?, ?, ?, ?, ?, ?)
+                ");
+                
+                $stmt->execute([
+                    $payment_no,
+                    $inv['id'],
+                    $payment_date,
+                    $payment_for_this_invoice,
+                    $payment_method,
+                    $reference_no,
+                    $cheque_number,
+                    $cheque_date,
+                    $bank_name,
+                    $cheque_status,
+                    $_SESSION['user_id']
+                ]);
+                
+                // Recompute invoice totals
+                $updated_invoice = recomputeInvoiceTotals($db, $inv['id']);
+                
+                // Track allocation for success message
+                $allocation_details[] = [
+                    'invoice_no' => $inv['invoice_no'],
+                    'amount' => $payment_for_this_invoice,
+                    'status' => $updated_invoice['payment_status']
+                ];
+                
+                // Reduce remaining payment
+                $remaining_payment -= $payment_for_this_invoice;
+            }
+            
+            $db->commit();
+            
+            // Build success message with breakdown
+            $success = "Overall payment of Rs. " . number_format($payment_amount, 2) . " distributed successfully!<br><br>";
+            $success .= "<strong>Allocation Breakdown:</strong><br>";
+            foreach ($allocation_details as $detail) {
+                $status_badge = $detail['status'] === 'paid' ? '✅ Paid' : ($detail['status'] === 'partial' ? '⏳ Partial' : '⚪ Unpaid');
+                $success .= "• {$detail['invoice_no']}: Rs. " . number_format($detail['amount'], 2) . " ({$status_badge})<br>";
+            }
+            
+            // Set active tab to pending to show results
+            $active_tab = 'pending';
+        }
+        
     } catch(Exception $e) {
         if ($db->inTransaction()) {
             $db->rollback();
@@ -670,7 +791,7 @@ try {
                         </div>
                         <div class="text-right">
                             <p class="text-sm text-gray-500">Total Outstanding</p>
-                            <p class="text-2xl font-bold text-red-600">
+                            <p class="text-2xl font-bold text-red-600 mb-2">
                                 Rs. <?php 
                                 $customer_total = 0;
                                 foreach ($pending_invoices as $pinv) {
@@ -679,6 +800,12 @@ try {
                                 echo number_format($customer_total, 2); 
                                 ?>
                             </p>
+                            <?php if ($customer_total > 0): ?>
+                            <button onclick="openOverallPaymentModal(<?php echo $selected_customer['id']; ?>, '<?php echo htmlspecialchars($selected_customer['customer_name']); ?>', <?php echo $customer_total; ?>)"
+                                    class="bg-purple-600 text-white px-4 py-2 rounded-md text-sm hover:bg-purple-700 font-medium">
+                                💰 Overall Payment
+                            </button>
+                            <?php endif; ?>
                         </div>
                     </div>
                 </div>
@@ -798,6 +925,94 @@ try {
     </div>
 </div>
 
+<!-- Overall Customer Payment Modal -->
+<div id="overallPaymentModal" class="fixed inset-0 bg-black bg-opacity-50 hidden z-50 flex items-center justify-center">
+    <div class="bg-white rounded-lg shadow-xl w-full max-w-lg mx-4">
+        <div class="p-4 border-b flex justify-between items-center bg-purple-50">
+            <h3 class="text-lg font-semibold text-purple-900">💰 Overall Customer Payment</h3>
+            <button onclick="closeModal('overallPaymentModal')" class="text-gray-500 hover:text-gray-700 text-2xl">&times;</button>
+        </div>
+        <form method="POST">
+            <input type="hidden" name="action" value="add_customer_payment">
+            <input type="hidden" name="customer_id" id="overall_customer_id">
+            
+            <div class="p-4 space-y-4">
+                <div class="bg-purple-50 p-4 rounded-md">
+                    <p class="text-sm text-gray-600">Customer: <span id="overall_customer_name" class="font-semibold text-purple-800"></span></p>
+                    <p class="text-sm text-gray-600 mt-1">Total Outstanding: <span id="overall_total_outstanding" class="font-semibold text-red-600"></span></p>
+                </div>
+                
+                <div class="bg-blue-50 p-3 rounded-md text-sm text-blue-800">
+                    <strong>💡 FIFO Allocation:</strong> Payment will be applied to oldest invoices first
+                </div>
+                
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Payment Amount <span class="text-red-500">*</span></label>
+                    <input type="number" name="payment_amount" id="overall_payment_amount" 
+                           step="0.01" min="0.01" required
+                           class="w-full px-3 py-2 border rounded-md text-right text-lg font-semibold">
+                </div>
+                
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Payment Date</label>
+                    <input type="date" name="payment_date" value="<?php echo date('Y-m-d'); ?>"
+                           class="w-full px-3 py-2 border rounded-md">
+                </div>
+                
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Payment Method</label>
+                    <select name="payment_method" id="overall_payment_method" onchange="toggleOverallChequeFields()"
+                            class="w-full px-3 py-2 border rounded-md">
+                        <option value="cash">Cash</option>
+                        <option value="card">Card</option>
+                        <option value="bank_transfer">Bank Transfer</option>
+                        <option value="cheque">Cheque</option>
+                    </select>
+                </div>
+                
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Reference No.</label>
+                    <input type="text" name="reference_no" placeholder="Optional"
+                           class="w-full px-3 py-2 border rounded-md">
+                </div>
+                
+                <div id="overall_bank_fields" class="hidden bg-green-50 p-3 rounded-md">
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Bank Name</label>
+                    <input type="text" name="bank_name" placeholder="Enter bank name"
+                           class="w-full px-3 py-2 border rounded-md">
+                </div>
+                
+                <div id="overall_cheque_fields" class="hidden bg-blue-50 p-3 rounded-md space-y-2">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Cheque Number</label>
+                        <input type="text" name="cheque_number" placeholder="Cheque number"
+                               class="w-full px-3 py-2 border rounded-md">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Cheque Date</label>
+                        <input type="date" name="cheque_date"
+                               class="w-full px-3 py-2 border rounded-md">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Bank Name</label>
+                        <input type="text" name="cheque_bank_name" placeholder="Bank name"
+                               class="w-full px-3 py-2 border rounded-md">
+                    </div>
+                </div>
+            </div>
+            
+            <div class="p-4 border-t flex justify-end space-x-2">
+                <button type="button" onclick="closeModal('overallPaymentModal')" class="px-4 py-2 border rounded-md hover:bg-gray-50">
+                    Cancel
+                </button>
+                <button type="submit" class="px-4 py-2 bg-purple-600 text-white rounded-md hover:bg-purple-700">
+                    💰 Apply Payment
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+
 <script>
 let paymentLineCounter = 0;
 let currentBalance = 0;
@@ -912,6 +1127,44 @@ function openPaymentHistory(invoiceId) {
             console.error('Error:', error);
             document.getElementById('historyContent').innerHTML = '<p class="text-center text-red-500">Error loading payment history: ' + error.message + '</p>';
         });
+}
+
+// ===== OVERALL CUSTOMER PAYMENT FUNCTIONS =====
+let overallTotalOutstanding = 0;
+
+function openOverallPaymentModal(customerId, customerName, totalOutstanding) {
+    document.getElementById('overall_customer_id').value = customerId;
+    document.getElementById('overall_customer_name').textContent = customerName;
+    document.getElementById('overall_total_outstanding').textContent = 'Rs. ' + parseFloat(totalOutstanding).toFixed(2);
+    overallTotalOutstanding = parseFloat(totalOutstanding);
+    
+    // Set max amount to total outstanding
+    const amountInput = document.getElementById('overall_payment_amount');
+    amountInput.value = totalOutstanding.toFixed(2);
+    amountInput.max = totalOutstanding;
+    
+    // Reset payment method
+    document.getElementById('overall_payment_method').value = 'cash';
+    toggleOverallChequeFields();
+    
+    document.getElementById('overallPaymentModal').classList.remove('hidden');
+}
+
+function toggleOverallChequeFields() {
+    const method = document.getElementById('overall_payment_method').value;
+    const chequeFields = document.getElementById('overall_cheque_fields');
+    const bankFields = document.getElementById('overall_bank_fields');
+    
+    // Hide all first
+    chequeFields.classList.add('hidden');
+    bankFields.classList.add('hidden');
+    
+    // Show relevant fields
+    if (method === 'cheque') {
+        chequeFields.classList.remove('hidden');
+    } else if (method === 'bank_transfer') {
+        bankFields.classList.remove('hidden');
+    }
 }
 
 function closeModal(modalId) {

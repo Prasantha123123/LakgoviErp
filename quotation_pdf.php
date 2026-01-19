@@ -439,7 +439,7 @@ $customer_address = implode(', ', $address_parts);
                         Email: <a href="mailto:lakgovimarketing@gmail.com">lakgovimarketing@gmail.com</a>
                     </div>
                     <div class="reg-number">
-                        Reg. No: WG 10395
+                        Reg. No: Wයු 10395
                     </div>
                 </div>
                 <div style="text-align: right;">
