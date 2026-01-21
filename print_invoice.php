@@ -116,13 +116,17 @@ try {
             box-shadow: 0 0 10px rgba(0,0,0,0.1);
         }
         
-        .header {
+        /* Letterhead styles (matching quotation header) */
+        .letterhead {
+            border: 2px solid #333;
+            padding: 15px;
+            margin-bottom: 20px;
+        }
+        
+        .letterhead-inner {
             display: flex;
             justify-content: space-between;
-            align-items: start;
-            border-bottom: 3px solid #2563eb;
-            padding-bottom: 20px;
-            margin-bottom: 30px;
+            align-items: flex-start;
         }
         
         .company-info {
@@ -130,26 +134,60 @@ try {
         }
         
         .company-name {
-            font-size: 28px;
+            font-size: 24px;
             font-weight: bold;
-            color: #2563eb;
-            margin-bottom: 5px;
+            color: #c41e3a;
+            font-style: italic;
+            margin-bottom: 8px;
         }
         
-        .company-details {
-            color: #666;
-            font-size: 14px;
+        .company-contacts {
+            font-size: 11px;
+            color: #333;
             line-height: 1.6;
         }
         
-        .invoice-title {
+        .company-contacts a {
+            color: #0066cc;
+            text-decoration: underline;
+        }
+        
+        .reg-number {
+            margin-top: 10px;
+            font-size: 11px;
+            border-top: 1px solid #333;
+            padding-top: 8px;
+        }
+        
+        .logo-container {
+            width: 120px;
             text-align: right;
         }
         
-        .invoice-title h1 {
-            font-size: 32px;
-            color: #2563eb;
-            margin-bottom: 10px;
+        .logo-img {
+            width: 120px;
+            height: auto;
+            max-height: 120px;
+            object-fit: contain;
+        }
+        
+        .office-address {
+            text-align: right;
+            font-size: 11px;
+            color: #333;
+            line-height: 1.6;
+        }
+        
+        /* Document Title bar */
+        .document-title {
+            text-align: center;
+            font-size: 18px;
+            font-weight: bold;
+            color: #333;
+            padding: 10px 0;
+            margin: 15px 0;
+            border-top: 2px solid #333;
+            border-bottom: 2px solid #333;
         }
         
         .invoice-meta {
@@ -358,25 +396,35 @@ try {
     </div>
 
     <div class="invoice-container">
-        <!-- Header -->
-        <div class="header">
-            <div class="company-info">
-                <div class="company-name">LAKGOVI FOODS</div>
-                <div class="company-details">
-                    Your Company Address Line 1<br>
-                    Your Company Address Line 2<br>
-                    City, Postal Code<br>
-                    Phone: +94 XX XXX XXXX<br>
-                    Email: info@lakgovifoods.com
+        <!-- Letterhead (from quotation) -->
+        <div class="letterhead">
+            <div class="letterhead-inner">
+                <div class="company-info">
+                    <div class="company-name">LAKGOVI MARKETING SERVICES</div>
+                    <div class="company-contacts">
+                        Tel: 011-2233387 &nbsp;&nbsp;&nbsp; Fax: 011-2233487<br>
+                        Email: <a href="mailto:lakgovimarketing@gmail.com">lakgovimarketing@gmail.com</a>
+                    </div>
+                    <div class="reg-number">
+                        Reg. No: Wයු 10395
+                    </div>
                 </div>
-            </div>
-            <div class="invoice-title">
-                <h1>INVOICE</h1>
-                <div style="color: #666; font-size: 18px; font-weight: bold;">
-                    #<?php echo htmlspecialchars($invoice['invoice_no']); ?>
+                <div style="text-align: right;">
+                    <div class="logo-container" style="display: inline-block;">
+                        <img src="public/lakgovilogo.jpeg" alt="Lakgovi Logo" class="logo-img">
+                    </div>
+                    <div class="office-address">
+                        Office: No-391,<br>
+                        Awariyawaththa Road,<br>
+                        Batagama North,<br>
+                        Ja-Ela.
+                    </div>
                 </div>
             </div>
         </div>
+
+        <!-- Document Title -->
+        <div class="document-title">INVOICE</div>
 
         <!-- Invoice Meta Info -->
         <div class="invoice-meta">
@@ -416,36 +464,12 @@ try {
             <div class="invoice-info">
                 <div class="section-title">Invoice Details</div>
                 <div class="info-line">
+                    <strong>Invoice No:</strong> 
+                    <?php echo htmlspecialchars($invoice['invoice_no']); ?>
+                </div>
+                <div class="info-line">
                     <strong>Invoice Date:</strong> 
                     <?php echo date('d M Y', strtotime($invoice['invoice_date'])); ?>
-                </div>
-                <?php if ($invoice['due_date']): ?>
-                    <div class="info-line">
-                        <strong>Due Date:</strong> 
-                        <?php echo date('d M Y', strtotime($invoice['due_date'])); ?>
-                    </div>
-                <?php endif; ?>
-                <div class="info-line">
-                    <strong>Price List:</strong> 
-                    <?php echo htmlspecialchars($invoice['price_list_name']); ?>
-                </div>
-                <div class="info-line">
-                    <strong>Currency:</strong> 
-                    <?php echo htmlspecialchars($invoice['currency']); ?>
-                </div>
-                <div class="info-line">
-                    <strong>Status:</strong>
-                    <?php
-                    $badgeClass = 'badge-unpaid';
-                    if ($invoice['payment_status'] === 'paid') {
-                        $badgeClass = 'badge-paid';
-                    } elseif ($invoice['payment_status'] === 'partial') {
-                        $badgeClass = 'badge-partial';
-                    }
-                    ?>
-                    <span class="payment-badge <?php echo $badgeClass; ?>">
-                        <?php echo strtoupper($invoice['payment_status']); ?>
-                    </span>
                 </div>
             </div>
         </div>
@@ -585,7 +609,7 @@ try {
         <?php endif; ?>
 
         <!-- Footer -->
-        <div class="footer">
+        <!-- <div class="footer">
             <p><strong>Thank you for your business!</strong></p>
             <p style="margin-top: 10px;">
                 This is a computer-generated invoice and does not require a signature.<br>
@@ -596,7 +620,7 @@ try {
                 Invoice ID: <?php echo $invoice['id']; ?> | 
                 For queries, please contact us at info@lakgovifoods.com
             </p>
-        </div>
+        </div> -->
     </div>
 
     <div class="actions">

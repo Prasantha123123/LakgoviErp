@@ -50,14 +50,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                     ") exceeds invoice balance (Rs. " . number_format($invoice['balance_amount'], 2) . ")");
             }
             
-            // Insert each payment line
-            insertPaymentLines($db, $invoice_id, $_POST['payments'], 'additional', $_SESSION['user_id']);
+            // Insert each payment line and capture inserted IDs for receipts
+            $inserted_ids = insertPaymentLines($db, $invoice_id, $_POST['payments'], 'additional', $_SESSION['user_id']);
             
             // Recompute invoice totals
             $updated = recomputeInvoiceTotals($db, $invoice_id);
             
             $db->commit();
             $success = "Payment added successfully! New balance: Rs. " . number_format($updated['balance_amount'], 2);
+            if (!empty($inserted_ids)) {
+                $success .= " <a class='underline text-blue-700' target='_blank' href='print_payment_receipt.php?id=" . intval($inserted_ids[0]) . "'>🖨️ Print Receipt</a>";
+            }
         }
         
         // ===== OVERALL CUSTOMER PAYMENT - FIFO DISTRIBUTION =====
@@ -114,6 +117,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             }
             
             // Distribute payment using FIFO (oldest invoices first)
+            $first_payment_id = null;
             $remaining_payment = $payment_amount;
             $allocation_details = [];
             
@@ -153,6 +157,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                     $_SESSION['user_id']
                 ]);
                 
+                // Track receipt link for the first created payment
+                if (!$first_payment_id) {
+                    $first_payment_id = $db->lastInsertId();
+                }
+
                 // Recompute invoice totals
                 $updated_invoice = recomputeInvoiceTotals($db, $inv['id']);
                 
@@ -168,13 +177,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             }
             
             $db->commit();
-            
+
             // Build success message with breakdown
             $success = "Overall payment of Rs. " . number_format($payment_amount, 2) . " distributed successfully!<br><br>";
             $success .= "<strong>Allocation Breakdown:</strong><br>";
             foreach ($allocation_details as $detail) {
                 $status_badge = $detail['status'] === 'paid' ? '✅ Paid' : ($detail['status'] === 'partial' ? '⏳ Partial' : '⚪ Unpaid');
                 $success .= "• {$detail['invoice_no']}: Rs. " . number_format($detail['amount'], 2) . " ({$status_badge})<br>";
+            }
+            if ($first_payment_id) {
+                $success .= "<br><a class='underline text-blue-700' target='_blank' href='print_payment_receipt.php?id=" . intval($first_payment_id) . "'>🖨️ Print Receipt</a>";
             }
             
             // Set active tab to pending to show results

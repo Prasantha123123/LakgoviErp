@@ -73,14 +73,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                     ") exceeds invoice balance (Rs. " . number_format($invoice['balance_amount'], 2) . ")");
             }
             
-            // Insert each payment line
-            insertPaymentLines($db, $invoice_id, $_POST['payments'], 'additional', $_SESSION['user_id']);
+            // Insert each payment line and capture inserted IDs for receipts
+            $inserted_ids = insertPaymentLines($db, $invoice_id, $_POST['payments'], 'additional', $_SESSION['user_id']);
             
             // Recompute invoice totals
             $updated = recomputeInvoiceTotals($db, $invoice_id);
             
             $db->commit();
             $success = "Payment added successfully! New balance: Rs. " . number_format($updated['balance_amount'], 2);
+            if (!empty($inserted_ids)) {
+                $success .= " <a class='underline text-blue-700' target='_blank' href='print_payment_receipt.php?id=" . intval($inserted_ids[0]) . "'>🖨️ Print Receipt</a>";
+            }
             
             // Refresh invoice data
             $stmt = $db->prepare("

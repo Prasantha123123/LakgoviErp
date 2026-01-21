@@ -43,11 +43,12 @@ function recomputeInvoiceTotals($db, $invoice_id) {
         $amount = floatval($payment['amount']);
         
         if ($payment['payment_method'] === 'cheque') {
-            // Only count cleared cheques as paid
-            if ($payment['cheque_status'] === 'cleared') {
-                $paid_amount += $amount;
-            } elseif ($payment['cheque_status'] === 'pending') {
+            // Count pending and cleared cheques as paid; still track pending separately
+            if ($payment['cheque_status'] === 'pending') {
                 $pending_cheque_amount += $amount;
+                $paid_amount += $amount;
+            } elseif ($payment['cheque_status'] === 'cleared') {
+                $paid_amount += $amount;
             }
             // bounced/cancelled cheques are not counted
         } else {
