@@ -349,12 +349,14 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                     $actual_expected_rounded = round($actual_expected_weight, 3);
                     $planned_rounded = round($planned_weight, 3);
                     
+                    // Log warning if exceeding planned weight but allow it to proceed
                     if ($total_assigned_rounded + $actual_expected_rounded > $planned_rounded + 0.01) {
-                        throw new Exception(
-                            "Cannot assign this batch to a new trolley. Total weight already assigned to movements (" .
-                            number_format($total_assigned_weight, 3) . " kg) plus new movement weight (" .
-                            number_format($actual_expected_weight, 3) . " kg) would exceed planned batch weight (" .
-                            number_format($planned_weight, 3) . " kg)."
+                        // Just log a warning, don't throw exception
+                        error_log(
+                            "WARNING: Trolley movement exceeds planned batch weight. " .
+                            "Total assigned: " . number_format($total_assigned_weight, 3) . " kg, " .
+                            "New movement: " . number_format($actual_expected_weight, 3) . " kg, " .
+                            "Planned: " . number_format($planned_weight, 3) . " kg"
                         );
                     }
                     
@@ -397,12 +399,12 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         // Accumulate total weight
                         $total_movement_weight += $current_weight;
                         
-                        // Validate: Cannot exceed available weight
+                        // Log warning if exceeding available weight but allow it to proceed
                         if ($total_movement_weight > $available_weight + 0.001) { // Small epsilon for float comparison
-                            throw new Exception(
-                                "Total weight for this movement (" . number_format($total_movement_weight, 3) . " kg) "
+                            error_log(
+                                "WARNING: Total weight for this movement (" . number_format($total_movement_weight, 3) . " kg) "
                                 . "exceeds available batch weight (" . number_format($available_weight, 3) . " kg). "
-                                . "Please reduce the weight allocation."
+                                . "User confirmed to proceed."
                             );
                         }
                         
@@ -558,23 +560,23 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                             $current_remaining = (float)$movement['remaining_qty'];
                             $current_remaining_weight = (float)$movement['remaining_weight_kg'];
                             
-                            // Check if actual weight would exceed remaining weight
+                            // Log warning if actual weight exceeds remaining weight but allow it to proceed
                             if ($actual_weight > $current_remaining_weight + 0.001) {
-                                throw new Exception(
-                                    "Actual weight (" . number_format($actual_weight, 3) . " kg) "
+                                error_log(
+                                    "WARNING: Actual weight (" . number_format($actual_weight, 3) . " kg) "
                                     . "exceeds remaining batch weight (" . number_format($current_remaining_weight, 3) . " kg). "
                                     . ($is_bom_direct ? "This batch has " . number_format($current_remaining_weight, 3) . " kg remaining. " : "This batch only has " . number_format($current_remaining, 0) . " pcs remaining. ")
-                                    . "Please verify the weight or check if you selected the correct batch."
+                                    . "User confirmed to proceed with verification."
                                 );
                             }
                             
-                            // For piece-based items (not bom_direct), check if rounded units exceed remaining quantity
+                            // For piece-based items (not bom_direct), log warning if rounded units exceed remaining quantity
                             if (!$is_bom_direct && $actual_units_rounded > $current_remaining + 0.001) {
-                                throw new Exception(
-                                    "Calculated units (" . number_format($actual_units_rounded, 0) . " pcs) "
+                                error_log(
+                                    "WARNING: Calculated units (" . number_format($actual_units_rounded, 0) . " pcs) "
                                     . "exceeds remaining batch quantity (" . number_format($current_remaining, 0) . " pcs). "
                                     . "Weight entered: " . number_format($actual_weight, 3) . " kg. "
-                                    . "Please verify the weight is correct."
+                                    . "User confirmed to proceed with verification."
                                 );
                             }
                         }
@@ -946,12 +948,12 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         $original_remaining = $current_remaining + $old_actual_units;
                         $original_remaining_weight = $current_remaining_weight + $old_actual_weight;
                         
-                        // Check new weight against original remaining
+                        // Log warning if new weight exceeds original remaining but allow it to proceed
                         if ($new_actual_weight > $original_remaining_weight + 0.001) {
-                            throw new Exception(
-                                "New weight (" . number_format($new_actual_weight, 3) . " kg) "
+                            error_log(
+                                "WARNING: New weight (" . number_format($new_actual_weight, 3) . " kg) "
                                 . "exceeds available batch weight (" . number_format($original_remaining_weight, 3) . " kg). "
-                                . "Maximum allowed: " . number_format($original_remaining_weight, 3) . " kg"
+                                . "User confirmed to proceed."
                             );
                         }
                         
@@ -2268,6 +2270,7 @@ try {
                 <div class="text-sm text-blue-700">
                     <div><strong>Batch Number:</strong> <span id="verify_batch_no">-</span></div>
                     <div><strong>Item:</strong> <span id="verify_item_name">-</span> (<span id="verify_item_code">-</span>)</div>
+                    <div><strong>Remaining Weight:</strong> <span id="verify_remaining_weight">-</span> kg</div>
                 </div>
             </div>
             
@@ -2483,6 +2486,64 @@ try {
             
             <div class="flex justify-end space-x-3 pt-4">
                 <button type="button" onclick="closeModal('viewTrolleyModal')" class="px-4 py-2 border border-gray-300 rounded-md text-gray-700 hover:bg-gray-50">Close</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Weight Exceed Confirmation Modal -->
+<div id="weightExceedConfirmModal" class="fixed inset-0 bg-gray-900 bg-opacity-75 overflow-y-auto h-full w-full modal-backdrop hidden z-50">
+    <div class="relative top-20 mx-auto p-5 border w-full max-w-md shadow-lg rounded-md bg-white">
+        <div class="flex justify-between items-center mb-4">
+            <h3 class="text-lg font-bold text-red-600 flex items-center">
+                <svg class="w-6 h-6 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
+                </svg>
+                Weight Exceeds Planned Batch!
+            </h3>
+            <button onclick="closeWeightExceedModal()" class="text-gray-400 hover:text-gray-600">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                </svg>
+            </button>
+        </div>
+        
+        <div class="space-y-4">
+            <div class="bg-red-50 border border-red-200 p-4 rounded-lg">
+                <p class="text-sm text-red-800 mb-3">
+                    <strong>⚠️ Warning:</strong> The expected weight will exceed the planned batch weight.
+                </p>
+                
+                <div class="space-y-2 text-sm">
+                    <div class="flex justify-between">
+                        <span class="text-gray-600">Planned Weight:</span>
+                        <span class="font-semibold text-gray-900" id="confirm_planned_weight">-</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span class="text-gray-600">Expected Weight:</span>
+                        <span class="font-semibold text-red-600" id="confirm_expected_weight">-</span>
+                    </div>
+                    <hr class="border-red-200">
+                    <div class="flex justify-between">
+                        <span class="text-gray-600">Excess:</span>
+                        <span class="font-bold text-red-700" id="confirm_excess_weight">-</span>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="bg-yellow-50 border border-yellow-200 p-3 rounded-lg">
+                <p class="text-sm text-yellow-800">
+                    <strong>Note:</strong> This trolley movement will exceed the planned batch weight. Please ensure this is intentional before proceeding.
+                </p>
+            </div>
+            
+            <div class="flex justify-end space-x-3 pt-4">
+                <button type="button" onclick="closeWeightExceedModal()" class="px-4 py-2 border border-gray-300 rounded-md text-gray-700 hover:bg-gray-50">
+                    Cancel
+                </button>
+                <button type="button" id="confirmWeightExceedBtn" onclick="confirmWeightExceed()" class="px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700">
+                    Yes, Proceed Anyway
+                </button>
             </div>
         </div>
     </div>
@@ -2736,6 +2797,9 @@ function openVerificationModal(movement) {
     expectedUnits = parseFloat(movement.expected_quantity);
     weightTolerance = 5; // Default, you might want to get this from the item data
     
+    // Store remaining batch weight for validation
+    window.remainingBatchWeight = parseFloat(movement.remaining_weight_kg || movement.expected_weight_kg);
+    
     document.getElementById('verify_movement_id').value = movement.id;
     document.getElementById('verify_expected_units').textContent = expectedUnits.toFixed(3) + ' units';
     document.getElementById('verify_expected_weight').textContent = expectedWeight.toFixed(3) + ' kg';
@@ -2745,6 +2809,7 @@ function openVerificationModal(movement) {
     document.getElementById('verify_batch_no').textContent = movement.batch_no || 'N/A';
     document.getElementById('verify_item_name').textContent = movement.item_name || '';
     document.getElementById('verify_item_code').textContent = movement.item_code || '';
+    document.getElementById('verify_remaining_weight').textContent = window.remainingBatchWeight.toFixed(3);
     
     // Reset form - only weight field now
     const weightInput = document.querySelector('input[name="actual_weight_kg"]');
@@ -2789,17 +2854,67 @@ function calculateWeightVariance() {
     }
 }
 
+let verifyWeightExceedConfirmed = false; // Flag for weight verification exceed
+
 function confirmWeightVerification() {
-    const actualWeight = parseFloat(document.querySelector('input[name="actual_weight_kg"]').value);
+    const actualWeightInput = document.querySelector('input[name="actual_weight_kg"]');
+    if (!actualWeightInput || !actualWeightInput.value) {
+        alert('Please enter the actual weight');
+        return false;
+    }
+    
+    const actualWeight = parseFloat(actualWeightInput.value);
     const weightVariance = actualWeight - expectedWeight;
     const weightToleranceAmount = (weightTolerance / 100) * expectedWeight;
     const weightWithinTolerance = Math.abs(weightVariance) <= weightToleranceAmount;
     
+    // Check if actual weight exceeds remaining batch weight
+    if (window.remainingBatchWeight && actualWeight > window.remainingBatchWeight + 0.01) {
+        if (!verifyWeightExceedConfirmed) {
+            const difference = (actualWeight - window.remainingBatchWeight).toFixed(3);
+            
+            weightExceedContext = 'verify'; // Set context to verify
+            
+            // Populate confirmation modal
+            document.getElementById('confirm_planned_weight').textContent = window.remainingBatchWeight.toFixed(3) + ' kg';
+            document.getElementById('confirm_expected_weight').textContent = actualWeight.toFixed(3) + ' kg';
+            document.getElementById('confirm_excess_weight').textContent = difference + ' kg';
+            
+            // Update modal text for verification context
+            const modal = document.getElementById('weightExceedConfirmModal');
+            const modalTitle = modal.querySelector('h3');
+            const warningText = modal.querySelector('.bg-red-50 p');
+            
+            modalTitle.innerHTML = `
+                <svg class="w-6 h-6 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
+                </svg>
+                Weight Exceeds Remaining Batch!
+            `;
+            warningText.innerHTML = '<strong>⚠️ Warning:</strong> The actual weight exceeds the remaining batch weight.';
+            
+            openModal('weightExceedConfirmModal');
+            return false;
+        }
+        // Reset confirmation flag after proceeding
+        verifyWeightExceedConfirmed = false;
+    }
+    
     if (!weightWithinTolerance) {
-        alert('⚠️ Weight is outside tolerance (' + weightToleranceAmount.toFixed(3) + ' kg). This requires investigation. Do you want to proceed anyway?');
+        const confirmed = confirm('⚠️ Weight is outside tolerance (' + weightToleranceAmount.toFixed(3) + ' kg). This requires investigation. Do you want to proceed anyway?');
+        if (!confirmed) {
+            return false;
+        }
     }
     
     return true;
+}
+
+function confirmVerifyWeightExceed() {
+    verifyWeightExceedConfirmed = true;
+    closeModal('weightExceedConfirmModal');
+    // Trigger form submission for verification
+    document.querySelector('form[onsubmit*="confirmWeightVerification"]').submit();
 }
 
 // Modal helper functions
@@ -2876,6 +2991,9 @@ function deleteTrolley(trolleyId) {
     form.submit();
 }
 
+let weightExceedConfirmed = false; // Flag to track if user confirmed weight exceed
+let weightExceedContext = 'create'; // Track context: 'create' or 'verify'
+
 function validateWeightInputs() {
     // Check if any trolleys are checked
     const trolleyCheckboxes = document.querySelectorAll('input.trolley-checkbox:checked');
@@ -2891,8 +3009,75 @@ function validateWeightInputs() {
         return false;
     }
     
+    // Calculate the ACTUAL total weight being assigned to trolleys
+    let actualTotalWeight = 0;
+    let hasIndividualWeights = false;
+    
+    trolleyCheckboxes.forEach((checkbox) => {
+        const trolleyId = checkbox.value;
+        const weightInput = document.querySelector(`input[name="trolley_weight_${trolleyId}"]`);
+        
+        if (weightInput && weightInput.value) {
+            hasIndividualWeights = true;
+            actualTotalWeight += parseFloat(weightInput.value) || 0;
+        }
+    });
+    
+    // If no individual weights entered, use expected weight
+    if (!hasIndividualWeights) {
+        const expectedWeightText = document.getElementById('expectedWeight').textContent;
+        if (expectedWeightText && expectedWeightText !== '-') {
+            actualTotalWeight = parseFloat(expectedWeightText.replace(/[^\d.-]/g, ''));
+        }
+    }
+    
+    // Get planned weight from batch
+    const plannedWeightText = document.getElementById('plannedWeight').textContent;
+    
+    if (plannedWeightText && plannedWeightText !== '-' && actualTotalWeight > 0) {
+        const plannedWeight = parseFloat(plannedWeightText.replace(/[^\d.-]/g, ''));
+        
+        // Check if actual total weight exceeds planned weight by more than 0.01 kg tolerance
+        if (actualTotalWeight > plannedWeight + 0.01) {
+            // If not already confirmed, show the modal
+            if (!weightExceedConfirmed) {
+                const difference = (actualTotalWeight - plannedWeight).toFixed(3);
+                
+                weightExceedContext = 'create'; // Set context
+                
+                // Populate modal with weight details
+                document.getElementById('confirm_planned_weight').textContent = plannedWeight.toFixed(3) + ' kg';
+                document.getElementById('confirm_expected_weight').textContent = actualTotalWeight.toFixed(3) + ' kg';
+                document.getElementById('confirm_excess_weight').textContent = difference + ' kg';
+                
+                // Show the modal
+                openModal('weightExceedConfirmModal');
+                return false; // Prevent form submission until confirmed
+            }
+            // If already confirmed, allow submission and reset flag
+            weightExceedConfirmed = false;
+        }
+    }
+    
     // Individual weights are optional - if not entered, system will use default distribution
     return true;
+}
+
+function closeWeightExceedModal() {
+    closeModal('weightExceedConfirmModal');
+    weightExceedConfirmed = false;
+    verifyWeightExceedConfirmed = false;
+}
+
+function confirmWeightExceed() {
+    if (weightExceedContext === 'verify') {
+        confirmVerifyWeightExceed();
+    } else {
+        weightExceedConfirmed = true;
+        closeModal('weightExceedConfirmModal');
+        // Trigger form submission
+        document.querySelector('form[onsubmit*="validateWeightInputs"]').submit();
+    }
 }
 
 // ========================================================================

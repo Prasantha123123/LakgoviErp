@@ -259,6 +259,35 @@ try {
     $error = "Error loading locations: ".$e->getMessage();
 }
 
+// Function to generate next batch number
+function getNextBatchNumber($db) {
+    try {
+        // Get the last batch number
+        $stmt = $db->query("SELECT batch_no FROM production ORDER BY id DESC LIMIT 1");
+        $last_batch = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        if ($last_batch && !empty($last_batch['batch_no'])) {
+            $batch_no = $last_batch['batch_no'];
+            // Extract numeric part from batch number (e.g., BATCH030 -> 030)
+            if (preg_match('/(\d+)$/', $batch_no, $matches)) {
+                $last_number = (int)$matches[1];
+                $next_number = $last_number + 1;
+                // Keep the prefix (e.g., BATCH) and format the number with leading zeros
+                $prefix = preg_replace('/\d+$/', '', $batch_no);
+                $number_length = strlen($matches[1]); // Preserve the original length
+                return $prefix . str_pad($next_number, $number_length, '0', STR_PAD_LEFT);
+            }
+        }
+        // Default if no previous batch exists
+        return 'BATCH001';
+    } catch(PDOException $e) {
+        return 'BATCH001';
+    }
+}
+
+// Get next batch number for the form
+$next_batch_no = getNextBatchNumber($db);
+
 /* ---------- Handle POST actions ---------- */
 if ($_SERVER['REQUEST_METHOD']==='POST') {
     try {
@@ -1149,9 +1178,9 @@ try {
       <input type="hidden" name="action" value="create">
       <div>
         <label class="block text-sm font-medium text-gray-700 mb-1">Batch Number</label>
-        <input type="text" name="batch_no" id="cp_batch_no" required
-               class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary"
-               value="BATCH<?php echo str_pad(count($productions)+1,3,'0',STR_PAD_LEFT); ?>">
+        <input type="text" name="batch_no" id="cp_batch_no" required readonly
+               class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary bg-gray-100"
+               value="<?php echo htmlspecialchars($next_batch_no); ?>">
       </div>
 
       <div>
