@@ -53,7 +53,15 @@ if ((isset($_GET['download']) && $_GET['download'] === 'pdf') || (isset($_GET['p
         foreach ($locations as $loc) { $location_map[(int)$loc['id']] = $loc['name']; }
         
         // Get summary statistics
-        $stmt = $db->query("
+        $summary_where = [];
+        $summary_params = [];
+        if ($item_type_filter) {
+            $summary_where[] = "i.type = ?";
+            $summary_params[] = $item_type_filter;
+        }
+        $summary_where_sql = $summary_where ? 'WHERE ' . implode(' AND ', $summary_where) : '';
+        
+        $stmt = $db->prepare("
             SELECT 
                 COUNT(DISTINCT CASE WHEN stock_qty > 0 THEN i.id END) as total_items,
                 COUNT(DISTINCT l.id) as total_locations,
@@ -70,7 +78,9 @@ if ((isset($_GET['download']) && $_GET['download'] === 'pdf') || (isset($_GET['p
                 FROM stock_ledger 
                 GROUP BY item_id, location_id
             ) sl ON i.id = sl.item_id AND l.id = sl.location_id
+            $summary_where_sql
         ");
+        $stmt->execute($summary_params);
         $summary_stats = $stmt->fetch() ?: [
             'total_items' => 0, 'total_locations' => 0, 'low_stock_items' => 0,
             'total_stock_value' => 0, 'total_quantity' => 0
@@ -930,7 +940,15 @@ try {
     $detailed_location_names[$PRODUCTION_ID] = $location_map[$PRODUCTION_ID] ?? 'Production Floor';
 
     // Calculate total stock value and other summary statistics using stock_ledger data
-    $stmt = $db->query("
+    $summary_where = [];
+    $summary_params = [];
+    if ($item_type_filter) {
+        $summary_where[] = "i.type = ?";
+        $summary_params[] = $item_type_filter;
+    }
+    $summary_where_sql = $summary_where ? 'WHERE ' . implode(' AND ', $summary_where) : '';
+    
+    $stmt = $db->prepare("
         SELECT 
             COUNT(DISTINCT CASE WHEN stock_qty > 0 THEN i.id END) as total_items,
             COUNT(DISTINCT l.id) as total_locations,
@@ -947,7 +965,9 @@ try {
             FROM stock_ledger 
             GROUP BY item_id, location_id
         ) sl ON i.id = sl.item_id AND l.id = sl.location_id
+        $summary_where_sql
     ");
+    $stmt->execute($summary_params);
     $result = $stmt->fetch();
     if ($result) {
         $summary_stats = [

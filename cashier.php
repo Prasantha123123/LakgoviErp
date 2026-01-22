@@ -127,11 +127,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             
             $payment_status = $paid_amount >= $total_amount ? 'paid' : ($paid_amount > 0 ? 'partial' : 'unpaid');
             
+            // Handle due_date - allow NULL if empty
+            $due_date = !empty($_POST['due_date']) ? $_POST['due_date'] : null;
+            
             $stmt->execute([
                 $_POST['invoice_no'],
                 $_POST['customer_id'],
                 $_POST['invoice_date'],
-                $_POST['due_date'] ?? null,
+                $due_date,
                 $customer_data['price_list_id'],
                 $subtotal,
                 $total_discount,
