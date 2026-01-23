@@ -64,46 +64,51 @@ $method_label = $method_labels[$payment['payment_method']] ?? ucfirst($payment['
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Payment Receipt <?php echo htmlspecialchars($payment['payment_no']); ?></title>
     <style>
+        @page { size: 9.5in 5.4in; margin: 0; }
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f5f5f5; padding: 20px; color: #333; }
-        .receipt-container { max-width: 800px; margin: 0 auto; background: white; padding: 24px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
-        .letterhead { border: 2px solid #333; padding: 15px; margin-bottom: 20px; }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f5f5f5; color: #333; }
+        .receipt-container { width: 9.5in; height: 5.4in; margin: 0 auto; background: white; padding: 0.3in; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+        .letterhead { border: 1.5px solid #333; padding: 8px; margin-bottom: 10px; }
         .letterhead-inner { display: flex; justify-content: space-between; align-items: flex-start; }
         .company-info { flex: 1; }
-        .company-name { font-size: 24px; font-weight: bold; color: #c41e3a; font-style: italic; margin-bottom: 8px; }
-        .company-contacts { font-size: 11px; color: #333; line-height: 1.6; }
+        .company-name { font-size: 16px; font-weight: bold; color: #c41e3a; font-style: italic; margin-bottom: 4px; }
+        .company-contacts { font-size: 8px; color: #333; line-height: 1.4; }
         .company-contacts a { color: #0066cc; text-decoration: underline; }
-        .reg-number { margin-top: 10px; font-size: 11px; border-top: 1px solid #333; padding-top: 8px; }
-        .logo-container { width: 120px; text-align: right; }
-        .logo-img { width: 120px; height: auto; max-height: 120px; object-fit: contain; }
-        .office-address { text-align: right; font-size: 11px; color: #333; line-height: 1.6; }
-        .document-title { text-align: center; font-size: 18px; font-weight: bold; color: #333; padding: 10px 0; margin: 15px 0; border-top: 2px solid #333; border-bottom: 2px solid #333; }
-        .meta-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 18px; }
-        .meta-card { padding: 12px; border: 1px solid #ddd; border-radius: 6px; background: #fafafa; }
-        .meta-label { font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.5px; }
-        .meta-value { font-size: 14px; font-weight: 600; margin-top: 4px; }
-        .section { margin-top: 18px; }
-        .section h3 { font-size: 14px; margin-bottom: 8px; color: #555; text-transform: uppercase; letter-spacing: 0.5px; }
+        .reg-number { margin-top: 5px; font-size: 8px; border-top: 1px solid #333; padding-top: 4px; }
+        .logo-container { width: 70px; text-align: right; }
+        .logo-img { width: 70px; height: auto; max-height: 70px; object-fit: contain; }
+        .office-address { text-align: right; font-size: 8px; color: #333; line-height: 1.4; }
+        .document-title { text-align: center; font-size: 13px; font-weight: bold; color: #333; padding: 6px 0; margin: 8px 0; border-top: 1.5px solid #333; border-bottom: 1.5px solid #333; }
+        .meta-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-bottom: 10px; }
+        .meta-card { padding: 6px; border: 1px solid #ddd; border-radius: 3px; background: #fafafa; }
+        .meta-label { font-size: 7px; color: #666; text-transform: uppercase; letter-spacing: 0.3px; }
+        .meta-value { font-size: 10px; font-weight: 600; margin-top: 2px; }
+        .section { margin-top: 10px; }
+        .section h3 { font-size: 10px; margin-bottom: 5px; color: #555; text-transform: uppercase; letter-spacing: 0.3px; }
+        .section h4 { font-size: 9px; margin: 8px 0 5px 0; color: #555; }
         table { width: 100%; border-collapse: collapse; }
-        th, td { padding: 10px; border: 1px solid #ddd; font-size: 13px; }
-        th { background: #f0f0f0; text-align: left; text-transform: uppercase; font-size: 11px; letter-spacing: 0.4px; }
+        th, td { padding: 5px; border: 1px solid #ddd; font-size: 9px; }
+        th { background: #f0f0f0; text-align: left; text-transform: uppercase; font-size: 8px; letter-spacing: 0.3px; }
         .text-right { text-align: right; }
-        .badge { display: inline-block; padding: 4px 8px; font-size: 11px; border-radius: 4px; font-weight: 600; }
+        .badge { display: inline-block; padding: 2px 5px; font-size: 8px; border-radius: 3px; font-weight: 600; }
         .badge-green { background: #d1fae5; color: #065f46; }
         .badge-yellow { background: #fef3c7; color: #92400e; }
         .badge-red { background: #fee2e2; color: #991b1b; }
-        .totals { max-width: 320px; margin-left: auto; }
-        .totals td { border: none; padding: 6px 0; }
+        .totals { max-width: 220px; margin-left: auto; }
+        .totals td { border: none; padding: 4px 0; font-size: 9px; }
         .totals .label { color: #666; }
         .totals .value { text-align: right; font-weight: 600; }
-        .totals .grand { border-top: 2px solid #333; padding-top: 10px; font-size: 15px; }
-        .print-actions { text-align: center; margin-top: 18px; }
-        .btn { background: #2563eb; color: white; border: none; padding: 10px 24px; font-size: 14px; border-radius: 4px; cursor: pointer; }
+        .totals .grand { border-top: 1.5px solid #333; padding-top: 6px; font-size: 10px; }
+        .print-actions { text-align: center; margin-top: 12px; }
+        .btn { background: #2563eb; color: white; border: none; padding: 8px 16px; font-size: 11px; border-radius: 4px; cursor: pointer; }
         .btn:hover { background: #1d4ed8; }
         @media print {
             body { background: white; padding: 0; }
-            .receipt-container { box-shadow: none; margin: 0; }
+            .receipt-container { box-shadow: none; margin: 0; width: 9.5in; height: 5.4in; }
             .print-actions { display: none; }
+        }
+        @media screen {
+            body { padding: 20px; }
         }
     </style>
 </head>

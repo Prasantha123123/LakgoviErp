@@ -96,6 +96,8 @@ try {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Invoice <?php echo htmlspecialchars($invoice['invoice_no']); ?></title>
     <style>
+        @page { size: 9.5in 5.4in; margin: 0.3in; }
+        
         * {
             margin: 0;
             padding: 0;
@@ -104,23 +106,24 @@ try {
         
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            padding: 20px;
             background: #f5f5f5;
         }
         
         .invoice-container {
-            max-width: 800px;
+            width: 9.5in;
+            min-height: 5.4in;
             margin: 0 auto;
             background: white;
-            padding: 40px;
+            padding: 0.3in;
             box-shadow: 0 0 10px rgba(0,0,0,0.1);
         }
         
         /* Letterhead styles (matching quotation header) */
         .letterhead {
-            border: 2px solid #333;
-            padding: 15px;
-            margin-bottom: 20px;
+            border: 1.5px solid #333;
+            padding: 8px;
+            margin-bottom: 10px;
+            page-break-inside: avoid;
         }
         
         .letterhead-inner {
@@ -134,17 +137,17 @@ try {
         }
         
         .company-name {
-            font-size: 24px;
+            font-size: 16px;
             font-weight: bold;
             color: #c41e3a;
             font-style: italic;
-            margin-bottom: 8px;
+            margin-bottom: 4px;
         }
         
         .company-contacts {
-            font-size: 11px;
+            font-size: 8px;
             color: #333;
-            line-height: 1.6;
+            line-height: 1.4;
         }
         
         .company-contacts a {
@@ -153,47 +156,48 @@ try {
         }
         
         .reg-number {
-            margin-top: 10px;
-            font-size: 11px;
+            margin-top: 5px;
+            font-size: 8px;
             border-top: 1px solid #333;
-            padding-top: 8px;
+            padding-top: 4px;
         }
         
         .logo-container {
-            width: 120px;
+            width: 70px;
             text-align: right;
         }
         
         .logo-img {
-            width: 120px;
+            width: 70px;
             height: auto;
-            max-height: 120px;
+            max-height: 70px;
             object-fit: contain;
         }
         
         .office-address {
             text-align: right;
-            font-size: 11px;
+            font-size: 8px;
             color: #333;
-            line-height: 1.6;
+            line-height: 1.4;
         }
         
         /* Document Title bar */
         .document-title {
             text-align: center;
-            font-size: 18px;
+            font-size: 13px;
             font-weight: bold;
             color: #333;
-            padding: 10px 0;
-            margin: 15px 0;
-            border-top: 2px solid #333;
-            border-bottom: 2px solid #333;
+            padding: 6px 0;
+            margin: 8px 0;
+            border-top: 1.5px solid #333;
+            border-bottom: 1.5px solid #333;
         }
         
         .invoice-meta {
             display: flex;
             justify-content: space-between;
-            margin-bottom: 30px;
+            margin-bottom: 12px;
+            page-break-inside: avoid;
         }
         
         .customer-info, .invoice-info {
@@ -203,48 +207,50 @@ try {
         .section-title {
             font-weight: bold;
             color: #2563eb;
-            margin-bottom: 10px;
-            font-size: 14px;
+            margin-bottom: 5px;
+            font-size: 9px;
             text-transform: uppercase;
         }
         
         .info-line {
-            margin-bottom: 5px;
-            font-size: 14px;
+            margin-bottom: 3px;
+            font-size: 8px;
             color: #333;
         }
         
         .info-line strong {
             display: inline-block;
-            width: 120px;
+            width: 70px;
             color: #666;
         }
         
         table {
             width: 100%;
             border-collapse: collapse;
-            margin: 20px 0;
+            margin: 10px 0;
         }
         
         thead {
             background: #2563eb;
             color: white;
+            page-break-inside: avoid;
+            page-break-after: avoid;
         }
         
         th, td {
-            padding: 12px;
+            padding: 5px;
             text-align: left;
             border-bottom: 1px solid #ddd;
         }
         
         th {
             font-weight: 600;
-            font-size: 13px;
+            font-size: 8px;
             text-transform: uppercase;
         }
         
         td {
-            font-size: 14px;
+            font-size: 8px;
         }
         
         .text-right {
@@ -255,18 +261,23 @@ try {
             text-align: center;
         }
         
+        tbody tr {
+            page-break-inside: avoid;
+        }
+        
         tbody tr:hover {
             background: #f8f9fa;
         }
         
         .totals-section {
-            margin-top: 20px;
+            margin-top: 10px;
             display: flex;
             justify-content: flex-end;
+            page-break-inside: avoid;
         }
         
         .totals-table {
-            width: 350px;
+            width: 220px;
         }
         
         .totals-table tr {
@@ -274,27 +285,29 @@ try {
         }
         
         .totals-table td {
-            padding: 8px 15px;
+            padding: 4px 8px;
+            font-size: 8px;
         }
         
         .totals-table .total-row {
             background: #2563eb;
             color: white;
-            font-size: 18px;
+            font-size: 10px;
             font-weight: bold;
         }
         
         .payment-section {
-            margin-top: 30px;
-            padding-top: 20px;
-            border-top: 2px solid #eee;
+            margin-top: 10px;
+            padding-top: 8px;
+            border-top: 1.5px solid #eee;
+            page-break-inside: avoid;
         }
         
         .payment-badge {
             display: inline-block;
-            padding: 5px 15px;
-            border-radius: 20px;
-            font-size: 12px;
+            padding: 3px 8px;
+            border-radius: 10px;
+            font-size: 7px;
             font-weight: bold;
             text-transform: uppercase;
         }
@@ -315,40 +328,40 @@ try {
         }
         
         .footer {
-            margin-top: 40px;
-            padding-top: 20px;
-            border-top: 2px solid #eee;
+            margin-top: 15px;
+            padding-top: 8px;
+            border-top: 1.5px solid #eee;
             text-align: center;
             color: #666;
-            font-size: 12px;
+            font-size: 7px;
         }
         
         .notes-section {
-            margin-top: 20px;
-            padding: 15px;
+            margin-top: 10px;
+            padding: 8px;
             background: #f8f9fa;
-            border-left: 4px solid #2563eb;
+            border-left: 2px solid #2563eb;
         }
         
         .notes-section h3 {
             color: #2563eb;
-            margin-bottom: 10px;
-            font-size: 14px;
+            margin-bottom: 5px;
+            font-size: 9px;
         }
         
         .actions {
             text-align: center;
-            margin: 20px 0;
+            margin: 12px 0;
         }
         
         .btn {
             display: inline-block;
-            padding: 10px 20px;
+            padding: 8px 16px;
             margin: 0 5px;
             border: none;
-            border-radius: 5px;
+            border-radius: 4px;
             cursor: pointer;
-            font-size: 14px;
+            font-size: 11px;
             text-decoration: none;
             transition: all 0.3s;
         }
@@ -379,12 +392,31 @@ try {
             
             .invoice-container {
                 box-shadow: none;
-                padding: 20px;
+                width: 9.5in;
+                min-height: 5.4in;
+                padding: 0;
             }
             
             .actions {
                 display: none;
             }
+            
+            table {
+                page-break-inside: auto;
+            }
+            
+            tr {
+                page-break-inside: avoid;
+                page-break-after: auto;
+            }
+            
+            thead {
+                display: table-header-group;
+            }
+        }
+        
+        @media screen {
+            body { padding: 20px; }
         }
     </style>
 </head>

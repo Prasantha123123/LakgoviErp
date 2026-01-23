@@ -882,17 +882,17 @@ try {
 </div>
 
 <!-- Payment Modal -->
-<div id="paymentModal" class="fixed inset-0 bg-black bg-opacity-50 hidden z-50 flex items-center justify-center">
-    <div class="bg-white rounded-lg shadow-xl w-full max-w-lg mx-4">
-        <div class="p-4 border-b flex justify-between items-center">
+<div id="paymentModal" class="fixed inset-0 bg-black bg-opacity-50 hidden z-50 flex items-center justify-center p-4" style="overflow-y: auto;">
+    <div class="bg-white rounded-lg shadow-xl w-full max-w-lg my-auto" style="max-height: 90vh; display: flex; flex-direction: column;">
+        <div class="p-4 border-b flex justify-between items-center" style="flex-shrink: 0;">
             <h3 class="text-lg font-semibold text-gray-900">💳 Add Payment</h3>
-            <button onclick="closeModal('paymentModal')" class="text-gray-500 hover:text-gray-700">&times;</button>
+            <button onclick="closeModal('paymentModal')" class="text-gray-500 hover:text-gray-700 text-2xl leading-none">&times;</button>
         </div>
-        <form method="POST">
+        <form method="POST" style="display: flex; flex-direction: column; flex: 1; overflow: hidden;">
             <input type="hidden" name="action" value="add_payment">
             <input type="hidden" name="invoice_id" id="modal_invoice_id">
             
-            <div class="p-4 space-y-4">
+            <div class="p-4 space-y-4" style="overflow-y: auto; flex: 1;">
                 <div class="bg-blue-50 p-3 rounded-md">
                     <p class="text-sm text-gray-600">Invoice: <span id="modal_invoice_no" class="font-semibold"></span></p>
                     <p class="text-sm text-gray-600">Balance: <span id="modal_balance" class="font-semibold text-red-600"></span></p>
@@ -907,7 +907,7 @@ try {
                 </button>
             </div>
             
-            <div class="p-4 border-t flex justify-end space-x-2">
+            <div class="p-4 border-t flex justify-end space-x-2 bg-white" style="flex-shrink: 0;">
                 <button type="button" onclick="closeModal('paymentModal')" class="px-4 py-2 border rounded-md hover:bg-gray-50">
                     Cancel
                 </button>
@@ -938,17 +938,17 @@ try {
 </div>
 
 <!-- Overall Customer Payment Modal -->
-<div id="overallPaymentModal" class="fixed inset-0 bg-black bg-opacity-50 hidden z-50 flex items-center justify-center">
-    <div class="bg-white rounded-lg shadow-xl w-full max-w-lg mx-4">
-        <div class="p-4 border-b flex justify-between items-center bg-purple-50">
+<div id="overallPaymentModal" class="fixed inset-0 bg-black bg-opacity-50 hidden z-50 flex items-center justify-center overflow-y-auto py-4">
+    <div class="bg-white rounded-lg shadow-xl w-full max-w-lg mx-4 my-auto max-h-[95vh] flex flex-col">
+        <div class="p-4 border-b flex justify-between items-center bg-purple-50 flex-shrink-0">
             <h3 class="text-lg font-semibold text-purple-900">💰 Overall Customer Payment</h3>
             <button onclick="closeModal('overallPaymentModal')" class="text-gray-500 hover:text-gray-700 text-2xl">&times;</button>
         </div>
-        <form method="POST">
+        <form method="POST" class="flex flex-col flex-1 overflow-hidden">
             <input type="hidden" name="action" value="add_customer_payment">
             <input type="hidden" name="customer_id" id="overall_customer_id">
             
-            <div class="p-4 space-y-4">
+            <div class="p-4 space-y-4 overflow-y-auto flex-1">
                 <div class="bg-purple-50 p-4 rounded-md">
                     <p class="text-sm text-gray-600">Customer: <span id="overall_customer_name" class="font-semibold text-purple-800"></span></p>
                     <p class="text-sm text-gray-600 mt-1">Total Outstanding: <span id="overall_total_outstanding" class="font-semibold text-red-600"></span></p>
@@ -1013,7 +1013,7 @@ try {
                 </div>
             </div>
             
-            <div class="p-4 border-t flex justify-end space-x-2">
+            <div class="p-4 border-t flex justify-end space-x-2 flex-shrink-0">
                 <button type="button" onclick="closeModal('overallPaymentModal')" class="px-4 py-2 border rounded-md hover:bg-gray-50">
                     Cancel
                 </button>
