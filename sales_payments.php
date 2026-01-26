@@ -1040,7 +1040,14 @@ function openPaymentModal(invoiceId, invoiceNo, balance) {
 
 function addPaymentLine() {
     const container = document.getElementById('paymentLinesContainer');
-    const remaining = currentBalance;
+    
+    // Calculate remaining balance by subtracting existing payment amounts
+    let totalEntered = 0;
+    const existingAmounts = container.querySelectorAll('input[name*="[amount]"]');
+    existingAmounts.forEach(input => {
+        totalEntered += parseFloat(input.value) || 0;
+    });
+    const remaining = Math.max(0, currentBalance - totalEntered);
     
     const div = document.createElement('div');
     div.className = 'payment-line bg-gray-50 p-3 rounded-md mb-2';
