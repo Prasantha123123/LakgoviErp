@@ -40,7 +40,7 @@ $current_page = basename($_SERVER['PHP_SELF'], '.php');
         }
     </script>
     <style>
-        /* Dropdown styling with proper hover behavior */
+        /* Dropdown styling with click behavior */
         .dropdown {
             position: relative;
         }
@@ -49,37 +49,24 @@ $current_page = basename($_SERVER['PHP_SELF'], '.php');
             position: absolute;
             left: 0;
             top: 100%;
-            margin-top: 0;
+            margin-top: 0.25rem;
             z-index: 1000;
             display: none;
             min-width: 12rem;
         }
         
-        /* Show dropdown on hover with proper timing */
-        .dropdown:hover .dropdown-menu {
-            display: block;
-        }
-        
-        /* Keep dropdown visible when hovering over the menu itself */
-        .dropdown-menu:hover {
-            display: block;
-        }
-        
-        /* Add a small bridge to prevent gaps */
-        .dropdown::before {
-            content: '';
-            position: absolute;
-            top: 100%;
-            left: 0;
-            width: 100%;
-            height: 4px;
-            background: transparent;
-            z-index: 999;
-        }
-        
-        /* Active dropdown styling */
+        /* Show dropdown when active class is added (via click) */
         .dropdown.active .dropdown-menu {
             display: block;
+        }
+        
+        /* Rotate arrow when dropdown is active */
+        .dropdown.active .dropdown-button svg:last-child {
+            transform: rotate(180deg);
+        }
+        
+        .dropdown-button svg {
+            transition: transform 0.2s ease;
         }
         
         /* Mobile responsive */
@@ -91,7 +78,7 @@ $current_page = basename($_SERVER['PHP_SELF'], '.php');
                 margin-top: 0;
             }
             
-            .dropdown.mobile-open .dropdown-menu {
+            .dropdown.active .dropdown-menu {
                 display: block;
             }
         }
@@ -124,8 +111,8 @@ $current_page = basename($_SERVER['PHP_SELF'], '.php');
                     </a>
                     
                     <!-- Master Data Dropdown -->
-                    <div class="relative dropdown" onmouseenter="showDropdown(this)" onmouseleave="hideDropdown(this)">
-                        <button class="text-gray-700 hover:bg-gray-100 px-3 py-2 rounded-md text-sm font-medium transition-colors flex items-center dropdown-button">
+                    <div class="relative dropdown">
+                        <button onclick="toggleDropdown(event, this.parentElement)" class="text-gray-700 hover:bg-gray-100 px-3 py-2 rounded-md text-sm font-medium transition-colors flex items-center dropdown-button">
                             <svg class="w-4 h-4 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4"/>
                             </svg>
@@ -165,8 +152,8 @@ $current_page = basename($_SERVER['PHP_SELF'], '.php');
                     </div>
                     
                     <!-- Transactions Dropdown -->
-                    <div class="relative dropdown" onmouseenter="showDropdown(this)" onmouseleave="hideDropdown(this)">
-                        <button class="text-gray-700 hover:bg-gray-100 px-3 py-2 rounded-md text-sm font-medium transition-colors flex items-center dropdown-button">
+                    <div class="relative dropdown">
+                        <button onclick="toggleDropdown(event, this.parentElement)" class="text-gray-700 hover:bg-gray-100 px-3 py-2 rounded-md text-sm font-medium transition-colors flex items-center dropdown-button">
                             <svg class="w-4 h-4 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4"/>
                             </svg>
@@ -235,8 +222,8 @@ $current_page = basename($_SERVER['PHP_SELF'], '.php');
                     </a>
                     
                     <!-- Billing Dropdown -->
-                    <div class="relative dropdown" onmouseenter="showDropdown(this)" onmouseleave="hideDropdown(this)">
-                        <button class="<?php echo in_array($current_page, ['customers', 'price_lists', 'price_list_items', 'quotation_list', 'quotation_create', 'quotation_view', 'cashier', 'sales_payments', 'sales_list', 'payment_management', 'customer_pending_bills', 'add_invoice_payment', 'invoice_payment_history']) ? 'bg-primary text-white' : 'text-gray-700 hover:bg-gray-100'; ?> px-3 py-2 rounded-md text-sm font-medium transition-colors flex items-center dropdown-button">
+                    <div class="relative dropdown">
+                        <button onclick="toggleDropdown(event, this.parentElement)" class="<?php echo in_array($current_page, ['customers', 'price_lists', 'price_list_items', 'quotation_list', 'quotation_create', 'quotation_view', 'cashier', 'sales_payments', 'sales_list', 'payment_management', 'customer_pending_bills', 'add_invoice_payment', 'invoice_payment_history']) ? 'bg-primary text-white' : 'text-gray-700 hover:bg-gray-100'; ?> px-3 py-2 rounded-md text-sm font-medium transition-colors flex items-center dropdown-button">
                             <svg class="w-4 h-4 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 9V7a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2m2 4h10a2 2 0 002-2v-6a2 2 0 00-2-2H9a2 2 0 00-2 2v6a2 2 0 002 2zm7-5a2 2 0 11-4 0 2 2 0 014 0z"/>
                             </svg>
@@ -283,8 +270,8 @@ $current_page = basename($_SERVER['PHP_SELF'], '.php');
                     </div>
                     
                     <!-- Reports Dropdown -->
-                    <div class="relative dropdown" onmouseenter="showDropdown(this)" onmouseleave="hideDropdown(this)">
-                        <button class="<?php echo in_array($current_page, ['stock_ledger', 'stock_report', 'sales_reports']) ? 'bg-primary text-white' : 'text-gray-700 hover:bg-gray-100'; ?> px-3 py-2 rounded-md text-sm font-medium transition-colors flex items-center dropdown-button">
+                    <div class="relative dropdown">
+                        <button onclick="toggleDropdown(event, this.parentElement)" class="<?php echo in_array($current_page, ['stock_report', 'stock_ledger', 'sales_reports', 'export_sales_report']) ? 'bg-primary text-white' : 'text-gray-700 hover:bg-gray-100'; ?> px-3 py-2 rounded-md text-sm font-medium transition-colors flex items-center dropdown-button">
                             <svg class="w-4 h-4 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
                             </svg>
@@ -323,8 +310,8 @@ $current_page = basename($_SERVER['PHP_SELF'], '.php');
             <!-- User Menu -->
             <div class="flex items-center space-x-4">
                 <!-- User Dropdown -->
-                <div class="relative dropdown" onmouseenter="showDropdown(this)" onmouseleave="hideDropdown(this)">
-                    <button class="flex items-center space-x-2 text-gray-700 hover:bg-gray-100 px-3 py-2 rounded-md transition-colors dropdown-button">
+                <div class="relative dropdown">
+                    <button onclick="toggleDropdown(event, this.parentElement)" class="flex items-center space-x-2 text-gray-700 hover:bg-gray-100 px-3 py-2 rounded-md transition-colors dropdown-button">
                         <div class="w-8 h-8 bg-primary rounded-full flex items-center justify-center text-white text-sm font-medium">
                             <?php echo strtoupper(substr($current_user['full_name'] ?? 'U', 0, 1)); ?>
                         </div>
@@ -490,56 +477,35 @@ $current_page = basename($_SERVER['PHP_SELF'], '.php');
     <div class="max-w-7xl mx-auto px-4 py-6">
     
     <script>
-        let dropdownTimeout;
-        
-        // Show dropdown with slight delay
-        function showDropdown(element) {
-            clearTimeout(dropdownTimeout);
-            const dropdown = element.querySelector('.dropdown-menu');
-            const arrow = element.querySelector('svg');
+        // Toggle dropdown on click
+        function toggleDropdown(event, dropdownElement) {
+            event.stopPropagation();
             
-            if (dropdown) {
-                dropdown.style.display = 'block';
-                element.classList.add('active');
-            }
+            // Close all other dropdowns
+            document.querySelectorAll('.dropdown.active').forEach(dropdown => {
+                if (dropdown !== dropdownElement) {
+                    dropdown.classList.remove('active');
+                }
+            });
             
-            if (arrow) {
-                arrow.style.transform = 'rotate(180deg)';
-            }
+            // Toggle current dropdown
+            dropdownElement.classList.toggle('active');
         }
         
-        // Hide dropdown with delay to allow mouse movement
-        function hideDropdown(element) {
-            dropdownTimeout = setTimeout(() => {
-                const dropdown = element.querySelector('.dropdown-menu');
-                const arrow = element.querySelector('svg');
-                
-                if (dropdown) {
-                    dropdown.style.display = 'none';
-                    element.classList.remove('active');
-                }
-                
-                if (arrow) {
-                    arrow.style.transform = 'rotate(0deg)';
-                }
-            }, 150); // 150ms delay to allow smooth mouse movement
-        }
+        // Close dropdowns when clicking outside
+        document.addEventListener('click', function(event) {
+            if (!event.target.closest('.dropdown')) {
+                document.querySelectorAll('.dropdown.active').forEach(dropdown => {
+                    dropdown.classList.remove('active');
+                });
+            }
+        });
         
         // Mobile menu toggle
         function toggleMobileMenu() {
             const mobileMenu = document.getElementById('mobileMenu');
             mobileMenu.classList.toggle('hidden');
         }
-        
-        // Close dropdowns when clicking outside
-        document.addEventListener('click', function(event) {
-            const dropdowns = document.querySelectorAll('.dropdown');
-            dropdowns.forEach(dropdown => {
-                if (!dropdown.contains(event.target)) {
-                    hideDropdown(dropdown);
-                }
-            });
-        });
         
         // Handle mobile dropdown toggles
         function toggleMobileDropdown(element) {
