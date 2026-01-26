@@ -5,6 +5,7 @@ require_once 'payment_functions.php';
 
 $success = '';
 $error = '';
+$receipt_id = null; // For receipt modal popup
 
 // Get active tab
 $active_tab = isset($_GET['tab']) ? $_GET['tab'] : 'invoices';
@@ -57,9 +58,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             $updated = recomputeInvoiceTotals($db, $invoice_id);
             
             $db->commit();
-            $success = "Payment added successfully! New balance: Rs. " . number_format($updated['balance_amount'], 2);
+            // Set receipt_id to show modal popup
             if (!empty($inserted_ids)) {
-                $success .= " <a class='underline text-blue-700' target='_blank' href='print_payment_receipt.php?id=" . intval($inserted_ids[0]) . "'>🖨️ Print Receipt</a>";
+                $receipt_id = intval($inserted_ids[0]);
             }
         }
         
@@ -178,15 +179,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             
             $db->commit();
 
-            // Build success message with breakdown
-            $success = "Overall payment of Rs. " . number_format($payment_amount, 2) . " distributed successfully!<br><br>";
-            $success .= "<strong>Allocation Breakdown:</strong><br>";
-            foreach ($allocation_details as $detail) {
-                $status_badge = $detail['status'] === 'paid' ? '✅ Paid' : ($detail['status'] === 'partial' ? '⏳ Partial' : '⚪ Unpaid');
-                $success .= "• {$detail['invoice_no']}: Rs. " . number_format($detail['amount'], 2) . " ({$status_badge})<br>";
-            }
+            // Set receipt_id to show modal popup
             if ($first_payment_id) {
-                $success .= "<br><a class='underline text-blue-700' target='_blank' href='print_payment_receipt.php?id=" . intval($first_payment_id) . "'>🖨️ Print Receipt</a>";
+                $receipt_id = intval($first_payment_id);
             }
             
             // Set active tab to pending to show results
@@ -1203,6 +1198,59 @@ window.onclick = function(event) {
         event.target.classList.add('hidden');
     }
 }
+
+// ===== RECEIPT MODAL FUNCTIONS =====
+function openReceiptModal(receiptId) {
+    document.getElementById('receiptIframe').src = 'print_payment_receipt.php?id=' + receiptId;
+    document.getElementById('receiptModal').classList.remove('hidden');
+}
+
+function closeReceiptModal() {
+    document.getElementById('receiptModal').classList.add('hidden');
+    document.getElementById('receiptIframe').src = '';
+}
+
+function printReceipt() {
+    document.getElementById('receiptIframe').contentWindow.print();
+}
+
+function downloadReceipt() {
+    document.getElementById('receiptIframe').contentWindow.print();
+}
+
+// Auto-open receipt modal after successful payment
+<?php if ($receipt_id): ?>
+document.addEventListener('DOMContentLoaded', function() {
+    openReceiptModal(<?php echo $receipt_id; ?>);
+});
+<?php endif; ?>
 </script>
+
+<!-- Receipt Modal -->
+<div id="receiptModal" class="fixed inset-0 bg-black bg-opacity-50 hidden z-50 flex items-center justify-center p-4">
+    <div class="bg-white rounded-lg shadow-xl w-full max-w-6xl" style="height: 85vh; display: flex; flex-direction: column;">
+        <div class="p-4 border-b flex justify-between items-center bg-green-50 flex-shrink-0">
+            <h3 class="text-lg font-semibold text-green-800">✅ Payment Successful - Receipt</h3>
+            <button onclick="closeReceiptModal()" class="text-gray-500 hover:text-gray-700 text-2xl leading-none">&times;</button>
+        </div>
+        <div class="flex-1 overflow-hidden">
+            <iframe id="receiptIframe" src="" class="w-full h-full border-0"></iframe>
+        </div>
+        <div class="p-4 border-t flex justify-between items-center bg-gray-50 flex-shrink-0">
+            <span class="text-sm text-gray-600">💡 Use the buttons below to print or download the receipt</span>
+            <div class="flex space-x-2">
+                <button onclick="printReceipt()" class="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700">
+                    🖨️ Print
+                </button>
+                <button onclick="downloadReceipt()" class="px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700">
+                    ⬇️ Download PDF
+                </button>
+                <button onclick="closeReceiptModal()" class="px-4 py-2 bg-gray-500 text-white rounded-md hover:bg-gray-600">
+                    Close
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
 
 <?php include 'footer.php'; ?>

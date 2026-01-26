@@ -109,6 +109,11 @@ $method_label = $method_labels[$payment['payment_method']] ?? ucfirst($payment['
         }
         @media screen {
             body { padding: 20px; }
+            .page-break { 
+                 
+                margin-top: 100px; 
+                padding-top: 30px; 
+            }
         }
     </style>
 </head>
@@ -223,6 +228,36 @@ $method_label = $method_labels[$payment['payment_method']] ?? ucfirst($payment['
             </table>
         </div>
 
+        <div class="print-actions">
+            <button class="btn" onclick="window.print()">🖨️ Print Receipt</button>
+            <a href="sales_payments.php" class="btn" style="background:#6b7280; margin-left:6px; text-decoration:none;">← Back</a>
+        </div>
+    </div>
+
+    <!-- Second Page - Invoice Summary -->
+    <div class="receipt-container" style="page-break-before: always;">
+       
+
+       
+        <div class="meta-grid">
+            <div class="meta-card">
+                <div class="meta-label">Receipt No</div>
+                <div class="meta-value"><?php echo htmlspecialchars($payment['payment_no']); ?></div>
+            </div>
+            <div class="meta-card">
+                <div class="meta-label">Date</div>
+                <div class="meta-value"><?php echo date('d M Y', strtotime($payment['payment_date'])); ?></div>
+            </div>
+            <div class="meta-card">
+                <div class="meta-label">Invoice</div>
+                <div class="meta-value">#<?php echo htmlspecialchars($payment['invoice_no']); ?> (<?php echo date('d M Y', strtotime($payment['invoice_date'])); ?>)</div>
+            </div>
+            <div class="meta-card">
+                <div class="meta-label">Amount</div>
+                <div class="meta-value"><?php echo htmlspecialchars($currency); ?> <?php echo format_currency($payment['amount']); ?></div>
+            </div>
+        </div>
+
         <div class="section">
             <h3>Invoice Summary</h3>
             <table class="totals">
@@ -246,25 +281,18 @@ $method_label = $method_labels[$payment['payment_method']] ?? ucfirst($payment['
         </div>
 
         <div class="section" style="margin-top: 28px;">
-            <table>
-                <tr>
-                    <th style="width: 50%; text-align: center;">Customer Signature</th>
-                    <th style="width: 50%; text-align: center;">Authorized Signature</th>
-                </tr>
-                <tr>
-                    <td style="height: 70px;"></td>
-                    <td></td>
-                </tr>
-            </table>
+            <div style="display: flex; justify-content: space-between; margin-top: 20px;">
+                <div style="width: 45%; text-align: center;">
+                    <div style="border-top: 1.5px dotted #333; padding-top: 8px; font-size: 9px; text-transform: uppercase;">Customer Signature</div>
+                </div>
+                <div style="width: 45%; text-align: center;">
+                    <div style="border-top: 1.5px dotted #333; padding-top: 8px; font-size: 9px; text-transform: uppercase;">Authorized Signature</div>
+                </div>
+            </div>
         </div>
 
         <div class="section" style="text-align: center; font-size: 11px; color: #777; margin-top: 20px;">
             Generated on <?php echo date('d M Y H:i'); ?> by <?php echo htmlspecialchars($payment['created_by_full_name'] ?? $payment['created_by_name'] ?? 'System'); ?>
-        </div>
-
-        <div class="print-actions">
-            <button class="btn" onclick="window.print()">🖨️ Print Receipt</button>
-            <a href="sales_payments.php" class="btn" style="background:#6b7280; margin-left:6px; text-decoration:none;">← Back</a>
         </div>
     </div>
 </body>
