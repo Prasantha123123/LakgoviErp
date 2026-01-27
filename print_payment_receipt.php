@@ -43,6 +43,43 @@ if (!$payment) {
     die('Payment not found');
 }
 
+// Check if multiple payment IDs are passed (from same session)
+$payment_ids = [];
+if (!empty($_GET['ids'])) {
+    $ids_string = $_GET['ids'];
+    $payment_ids = array_map('intval', explode(',', $ids_string));
+    $payment_ids = array_filter($payment_ids, function($id) { return $id > 0; });
+}
+
+// If no IDs passed, just use the single payment
+if (empty($payment_ids)) {
+    $payment_ids = [$payment_id];
+}
+
+// Fetch all session payments using the passed IDs
+$placeholders = implode(',', array_fill(0, count($payment_ids), '?'));
+$session_payments_stmt = $db->prepare("
+    SELECT sp.*, 
+           sp.payment_method, sp.amount, sp.reference_no, 
+           sp.cheque_number, sp.cheque_date, sp.bank_name, sp.cheque_status
+    FROM sales_payments sp
+    WHERE sp.id IN ($placeholders)
+    ORDER BY sp.id ASC
+");
+$session_payments_stmt->execute($payment_ids);
+$session_payments = $session_payments_stmt->fetchAll(PDO::FETCH_ASSOC);
+
+// If no payments found, just use the single payment
+if (empty($session_payments)) {
+    $session_payments = [$payment];
+}
+
+// Calculate total for this session
+$session_total = 0;
+foreach ($session_payments as $sp) {
+    $session_total += floatval($sp['amount']);
+}
+
 // Helpers
 function format_currency($amount) {
     return number_format($amount, 2);
@@ -161,8 +198,8 @@ $method_label = $method_labels[$payment['payment_method']] ?? ucfirst($payment['
                 <div class="meta-value">#<?php echo htmlspecialchars($payment['invoice_no']); ?> (<?php echo date('d M Y', strtotime($payment['invoice_date'])); ?>)</div>
             </div>
             <div class="meta-card">
-                <div class="meta-label">Amount</div>
-                <div class="meta-value"><?php echo htmlspecialchars($currency); ?> <?php echo format_currency($payment['amount']); ?></div>
+                <div class="meta-label">Balance</div>
+                <div class="meta-value"><?php echo htmlspecialchars($currency); ?> <?php echo format_currency($payment['balance_amount']); ?></div>
             </div>
         </div>
 
@@ -192,38 +229,40 @@ $method_label = $method_labels[$payment['payment_method']] ?? ucfirst($payment['
         <div class="section">
             <h3>Payment Details</h3>
             <table>
-                <tr>
-                    <th style="width: 150px;">Method</th>
-                    <td><?php echo htmlspecialchars($method_label); ?></td>
-                </tr>
-                <tr>
-                    <th>Reference</th>
-                    <td>
-                        <?php if ($payment['payment_method'] === 'cheque'): ?>
-                            Cheque #: <?php echo htmlspecialchars($payment['cheque_number'] ?? '-'); ?>
-                            <?php if ($payment['cheque_date']): ?> | Date: <?php echo date('d M Y', strtotime($payment['cheque_date'])); ?><?php endif; ?>
-                            <?php if ($payment['bank_name']): ?> | Bank: <?php echo htmlspecialchars($payment['bank_name']); ?><?php endif; ?>
-                        <?php else: ?>
-                            <?php echo htmlspecialchars($payment['reference_no'] ?: '-'); ?>
-                        <?php endif; ?>
-                    </td>
-                </tr>
-                <?php if ($payment['payment_method'] === 'cheque'): ?>
-                <tr>
-                    <th>Status</th>
-                    <td>
-                        <?php 
-                        $status = $payment['cheque_status'] ?: 'pending';
-                        $badgeClass = $status === 'cleared' ? 'badge-green' : ($status === 'pending' ? 'badge-yellow' : 'badge-red');
-                        ?>
-                        <span class="badge <?php echo $badgeClass; ?>"><?php echo ucfirst($status); ?></span>
-                        <?php if ($status === 'cleared' && $payment['clearance_date']): ?>
-                            (Cleared: <?php echo date('d M Y', strtotime($payment['clearance_date'])); ?>)
-                        <?php elseif ($status === 'bounced' && $payment['bounce_reason']): ?>
-                            (Reason: <?php echo htmlspecialchars($payment['bounce_reason']); ?>)
-                        <?php endif; ?>
-                    </td>
-                </tr>
+                <thead>
+                    <tr>
+                        <th style="width: 120px;">Method</th>
+                        <th>Reference</th>
+                        <th style="width: 130px; text-align: right;">Amount</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach ($session_payments as $sp): ?>
+                    <tr>
+                        <td><?php echo htmlspecialchars($method_labels[$sp['payment_method']] ?? ucfirst($sp['payment_method'])); ?></td>
+                        <td>
+                            <?php if ($sp['payment_method'] === 'cheque'): ?>
+                                Cheque #: <?php echo htmlspecialchars($sp['cheque_number'] ?? '-'); ?>
+                                <?php if (!empty($sp['cheque_date'])): ?> | Date: <?php echo date('d M Y', strtotime($sp['cheque_date'])); ?><?php endif; ?>
+                                <?php if (!empty($sp['bank_name'])): ?> | Bank: <?php echo htmlspecialchars($sp['bank_name']); ?><?php endif; ?>
+                            <?php elseif ($sp['payment_method'] === 'bank_transfer' && !empty($sp['bank_name'])): ?>
+                                Bank: <?php echo htmlspecialchars($sp['bank_name']); ?>
+                                <?php if (!empty($sp['reference_no'])): ?> | Ref: <?php echo htmlspecialchars($sp['reference_no']); ?><?php endif; ?>
+                            <?php else: ?>
+                                <?php echo htmlspecialchars($sp['reference_no'] ?: '-'); ?>
+                            <?php endif; ?>
+                        </td>
+                        <td style="text-align: right; font-weight: 600;"><?php echo htmlspecialchars($currency); ?> <?php echo format_currency($sp['amount']); ?></td>
+                    </tr>
+                    <?php endforeach; ?>
+                </tbody>
+                <?php if (count($session_payments) > 1): ?>
+                <tfoot>
+                    <tr style="border-top: 2px solid #333;">
+                        <td colspan="2" style="text-align: right; font-weight: bold; padding-top: 8px;">Total Payment:</td>
+                        <td style="text-align: right; font-weight: bold; padding-top: 8px; font-size: 11px;"><?php echo htmlspecialchars($currency); ?> <?php echo format_currency($session_total); ?></td>
+                    </tr>
+                </tfoot>
                 <?php endif; ?>
             </table>
         </div>
@@ -237,26 +276,7 @@ $method_label = $method_labels[$payment['payment_method']] ?? ucfirst($payment['
     <!-- Second Page - Invoice Summary -->
     <div class="receipt-container" style="page-break-before: always;">
        
-
-       
-        <div class="meta-grid">
-            <div class="meta-card">
-                <div class="meta-label">Receipt No</div>
-                <div class="meta-value"><?php echo htmlspecialchars($payment['payment_no']); ?></div>
-            </div>
-            <div class="meta-card">
-                <div class="meta-label">Date</div>
-                <div class="meta-value"><?php echo date('d M Y', strtotime($payment['payment_date'])); ?></div>
-            </div>
-            <div class="meta-card">
-                <div class="meta-label">Invoice</div>
-                <div class="meta-value">#<?php echo htmlspecialchars($payment['invoice_no']); ?> (<?php echo date('d M Y', strtotime($payment['invoice_date'])); ?>)</div>
-            </div>
-            <div class="meta-card">
-                <div class="meta-label">Amount</div>
-                <div class="meta-value"><?php echo htmlspecialchars($currency); ?> <?php echo format_currency($payment['amount']); ?></div>
-            </div>
-        </div>
+ 
 
         <div class="section">
             <h3>Invoice Summary</h3>
@@ -265,17 +285,19 @@ $method_label = $method_labels[$payment['payment_method']] ?? ucfirst($payment['
                     <td class="label">Invoice Total:</td>
                     <td class="value"><?php echo htmlspecialchars($currency); ?> <?php echo format_currency($payment['total_amount']); ?></td>
                 </tr>
-                <tr>
+                <!-- <tr>
                     <td class="label">Paid To Date:</td>
                     <td class="value"><?php echo htmlspecialchars($currency); ?> <?php echo format_currency($payment['paid_amount']); ?></td>
-                </tr>
+                </tr> -->
                 <tr>
                     <td class="label">Balance:</td>
                     <td class="value"><?php echo htmlspecialchars($currency); ?> <?php echo format_currency($payment['balance_amount']); ?></td>
                 </tr>
                 <tr class="grand">
                     <td class="label">This Payment:</td>
-                    <td class="value"><?php echo htmlspecialchars($currency); ?> <?php echo format_currency($payment['amount']); ?></td>
+                    <td class="value">
+                      <?php echo htmlspecialchars($currency); ?> <?php echo format_currency($session_total); ?>
+                    </td>
                 </tr>
             </table>
         </div>

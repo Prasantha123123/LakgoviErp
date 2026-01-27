@@ -58,9 +58,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             $updated = recomputeInvoiceTotals($db, $invoice_id);
             
             $db->commit();
-            // Set receipt_id to show modal popup
+            // Set receipt_ids to show modal popup (all payment IDs from this session)
             if (!empty($inserted_ids)) {
                 $receipt_id = intval($inserted_ids[0]);
+                $receipt_ids = $inserted_ids;
             }
         }
         
@@ -883,7 +884,7 @@ try {
             <h3 class="text-lg font-semibold text-gray-900">💳 Add Payment</h3>
             <button onclick="closeModal('paymentModal')" class="text-gray-500 hover:text-gray-700 text-2xl leading-none">&times;</button>
         </div>
-        <form method="POST" style="display: flex; flex-direction: column; flex: 1; overflow: hidden;">
+        <form method="POST" id="paymentForm" onsubmit="return validatePaymentForm()" style="display: flex; flex-direction: column; flex: 1; overflow: hidden;">
             <input type="hidden" name="action" value="add_payment">
             <input type="hidden" name="invoice_id" id="modal_invoice_id">
             
@@ -891,7 +892,9 @@ try {
                 <div class="bg-blue-50 p-3 rounded-md">
                     <p class="text-sm text-gray-600">Invoice: <span id="modal_invoice_no" class="font-semibold"></span></p>
                     <p class="text-sm text-gray-600">Balance: <span id="modal_balance" class="font-semibold text-red-600"></span></p>
+                    <p class="text-sm text-gray-600 mt-1">Total Entered: <span id="modal_total_entered" class="font-semibold text-green-600">Rs. 0.00</span></p>
                 </div>
+                <div id="payment_error_msg" class="hidden bg-red-100 border border-red-400 text-red-700 px-3 py-2 rounded text-sm"></div>
                 
                 <div id="paymentLinesContainer">
                     <!-- Payment lines will be added here -->
@@ -1049,6 +1052,13 @@ function addPaymentLine() {
     });
     const remaining = Math.max(0, currentBalance - totalEntered);
     
+    // Get already used payment methods
+    const usedMethods = getUsedPaymentMethods();
+    
+    // Find first available method
+    const allMethods = ['cash', 'card', 'bank_transfer', 'cheque'];
+    let defaultMethod = allMethods.find(m => !usedMethods.includes(m)) || 'cash';
+    
     const div = document.createElement('div');
     div.className = 'payment-line bg-gray-50 p-3 rounded-md mb-2';
     div.id = `payment_line_${paymentLineCounter}`;
@@ -1061,19 +1071,20 @@ function addPaymentLine() {
             <div>
                 <label class="block text-xs text-gray-600">Method</label>
                 <select name="payments[${paymentLineCounter}][method]" 
-                        onchange="toggleChequeFields(this, ${paymentLineCounter})"
-                        class="w-full px-2 py-1 border rounded text-sm">
-                    <option value="cash">Cash</option>
-                    <option value="card">Card</option>
-                    <option value="bank_transfer">Bank Transfer</option>
-                    <option value="cheque">Cheque</option>
+                        onchange="toggleChequeFields(this, ${paymentLineCounter}); updateMethodDropdowns();"
+                        class="payment-method-select w-full px-2 py-1 border rounded text-sm">
+                    <option value="cash" ${usedMethods.includes('cash') ? 'disabled' : ''} ${defaultMethod === 'cash' ? 'selected' : ''}>Cash</option>
+                    <option value="card" ${usedMethods.includes('card') ? 'disabled' : ''} ${defaultMethod === 'card' ? 'selected' : ''}>Card</option>
+                    <option value="bank_transfer" ${usedMethods.includes('bank_transfer') ? 'disabled' : ''} ${defaultMethod === 'bank_transfer' ? 'selected' : ''}>Bank Transfer</option>
+                    <option value="cheque" ${usedMethods.includes('cheque') ? 'disabled' : ''} ${defaultMethod === 'cheque' ? 'selected' : ''}>Cheque</option>
                 </select>
             </div>
             <div>
                 <label class="block text-xs text-gray-600">Amount</label>
                 <input type="number" name="payments[${paymentLineCounter}][amount]" 
                        value="${remaining.toFixed(2)}" step="0.01" min="0"
-                       class="w-full px-2 py-1 border rounded text-sm text-right">
+                       oninput="validatePaymentAmounts()"
+                       class="payment-amount-input w-full px-2 py-1 border rounded text-sm text-right">
             </div>
         </div>
         <div class="mt-2">
@@ -1096,14 +1107,110 @@ function addPaymentLine() {
         </div>
     `;
     container.appendChild(div);
+    
+    // Show cheque/bank fields if needed
+    if (defaultMethod === 'cheque') {
+        document.getElementById(`cheque_fields_${paymentLineCounter}`).classList.remove('hidden');
+    } else if (defaultMethod === 'bank_transfer') {
+        document.getElementById(`bank_fields_${paymentLineCounter}`).classList.remove('hidden');
+    }
+    
     paymentLineCounter++;
+    updateMethodDropdowns();
+    validatePaymentAmounts(); // Validate and update display
+}
+
+// Get list of payment methods already selected
+function getUsedPaymentMethods() {
+    const selects = document.querySelectorAll('.payment-method-select');
+    const usedMethods = [];
+    selects.forEach(select => {
+        if (select.value) {
+            usedMethods.push(select.value);
+        }
+    });
+    return usedMethods;
+}
+
+// Update all dropdowns to disable already used methods
+function updateMethodDropdowns() {
+    const selects = document.querySelectorAll('.payment-method-select');
+    const usedMethods = [];
+    
+    // First, collect all currently selected methods
+    selects.forEach(select => {
+        if (select.value) {
+            usedMethods.push(select.value);
+        }
+    });
+    
+    // Then, update each dropdown
+    selects.forEach(select => {
+        const currentValue = select.value;
+        const options = select.querySelectorAll('option');
+        
+        options.forEach(option => {
+            // Disable if used by another dropdown, but not if it's the current selection
+            if (usedMethods.includes(option.value) && option.value !== currentValue) {
+                option.disabled = true;
+            } else {
+                option.disabled = false;
+            }
+        });
+    });
 }
 
 function removePaymentLine(lineId) {
     const element = document.getElementById(`payment_line_${lineId}`);
     if (element) {
         element.remove();
+        updateMethodDropdowns(); // Re-enable methods when a line is removed
+        validatePaymentAmounts(); // Re-validate after removing
     }
+}
+
+// Validate payment amounts don't exceed balance
+function validatePaymentAmounts() {
+    const container = document.getElementById('paymentLinesContainer');
+    const amountInputs = container.querySelectorAll('.payment-amount-input');
+    const errorDiv = document.getElementById('payment_error_msg');
+    const totalEnteredSpan = document.getElementById('modal_total_entered');
+    
+    let totalEntered = 0;
+    amountInputs.forEach(input => {
+        totalEntered += parseFloat(input.value) || 0;
+    });
+    
+    // Update total entered display
+    totalEnteredSpan.textContent = 'Rs. ' + totalEntered.toFixed(2);
+    
+    // Check if exceeds balance
+    if (totalEntered > currentBalance) {
+        errorDiv.textContent = '⚠️ Total payment (Rs. ' + totalEntered.toFixed(2) + ') exceeds balance (Rs. ' + currentBalance.toFixed(2) + ')';
+        errorDiv.classList.remove('hidden');
+        totalEnteredSpan.classList.remove('text-green-600');
+        totalEnteredSpan.classList.add('text-red-600');
+        return false;
+    } else if (totalEntered <= 0) {
+        errorDiv.textContent = '⚠️ Please enter a payment amount greater than 0';
+        errorDiv.classList.remove('hidden');
+        totalEnteredSpan.classList.remove('text-green-600');
+        totalEnteredSpan.classList.add('text-red-600');
+        return false;
+    } else {
+        errorDiv.classList.add('hidden');
+        totalEnteredSpan.classList.remove('text-red-600');
+        totalEnteredSpan.classList.add('text-green-600');
+        return true;
+    }
+}
+
+// Form submission validation
+function validatePaymentForm() {
+    if (!validatePaymentAmounts()) {
+        return false;
+    }
+    return true;
 }
 
 function toggleChequeFields(select, lineId) {
@@ -1207,8 +1314,12 @@ window.onclick = function(event) {
 }
 
 // ===== RECEIPT MODAL FUNCTIONS =====
-function openReceiptModal(receiptId) {
-    document.getElementById('receiptIframe').src = 'print_payment_receipt.php?id=' + receiptId;
+function openReceiptModal(receiptId, allIds = null) {
+    let url = 'print_payment_receipt.php?id=' + receiptId;
+    if (allIds && allIds.length > 0) {
+        url += '&ids=' + allIds.join(',');
+    }
+    document.getElementById('receiptIframe').src = url;
     document.getElementById('receiptModal').classList.remove('hidden');
 }
 
@@ -1228,7 +1339,11 @@ function downloadReceipt() {
 // Auto-open receipt modal after successful payment
 <?php if ($receipt_id): ?>
 document.addEventListener('DOMContentLoaded', function() {
+    <?php if (!empty($receipt_ids)): ?>
+    openReceiptModal(<?php echo $receipt_id; ?>, [<?php echo implode(',', $receipt_ids); ?>]);
+    <?php else: ?>
     openReceiptModal(<?php echo $receipt_id; ?>);
+    <?php endif; ?>
 });
 <?php endif; ?>
 </script>
