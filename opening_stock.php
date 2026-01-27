@@ -294,6 +294,15 @@ try {
             <h1 class="text-3xl font-bold text-gray-900">Opening Stock Management</h1>
             <p class="text-gray-600">Set initial stock quantities with cost prices</p>
         </div>
+
+        
+<button
+    onclick="openModal('manualStockUpdateModal')"
+    class="bg-sky-500 text-white px-4 py-2 rounded-md hover:bg-sky-600 transition-colors duration-300"
+>
+    Manual Stock Update
+</button>
+
         <button onclick="openModal('createOpeningStockModal')" class="bg-primary text-white px-4 py-2 rounded-md hover:bg-blue-600 transition-colors">
             Create New Opening Stock
         </button>
@@ -531,6 +540,154 @@ try {
     </div>
 </div>
 
+<!-- Manual Stock Update Modal -->
+<div id="manualStockUpdateModal" class="fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full modal-backdrop hidden">
+    <div class="relative top-10 mx-auto p-5 border w-11/12 max-w-6xl shadow-lg rounded-md bg-white">
+        <div class="flex justify-between items-center mb-4">
+            <h3 class="text-lg font-bold text-gray-900">Manual Stock Update</h3>
+            <button onclick="closeModal('manualStockUpdateModal')" class="text-gray-400 hover:text-gray-600">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                </svg>
+            </button>
+        </div>
+        <form method="POST" class="space-y-6" id="manualStockUpdateForm">
+            <input type="hidden" name="action" value="manual_update">
+            
+            <!-- Header Info -->
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-4 bg-gray-50 p-4 rounded-lg">
+                <!-- Location -->
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Location <span class="text-red-500">*</span></label>
+                    <select name="manual_location_id" id="manual_location_id" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent">
+                        <option value="">Select Location</option>
+                        <?php foreach ($locations as $location): ?>
+                            <option value="<?php echo $location['id']; ?>">
+                                <?php echo htmlspecialchars($location['name']); ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+
+                <!-- Update Date -->
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Update Date <span class="text-red-500">*</span></label>
+                    <input type="date" name="manual_update_date" id="manual_update_date" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent" value="<?php echo date('Y-m-d'); ?>">
+                </div>
+
+                <!-- Remarks -->
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Remarks</label>
+                    <input type="text" name="manual_remarks" id="manual_remarks" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent" placeholder="Reason for manual update...">
+                </div>
+            </div>
+
+            <!-- Raw Materials Table -->
+            <div class="bg-white border rounded-lg overflow-hidden">
+                <div class="bg-sky-50 px-4 py-3 border-b flex justify-between items-center">
+                    <h4 class="text-md font-medium text-gray-900">📦 Raw Materials</h4>
+                    <button type="button" onclick="addManualStockRow('raw')" class="bg-sky-500 text-white px-3 py-1 rounded-md hover:bg-sky-600 text-sm flex items-center">
+                        <svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
+                        </svg>
+                        Add Row
+                    </button>
+                </div>
+                <div class="overflow-x-auto">
+                    <table class="min-w-full divide-y divide-gray-200">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-8">#</th>
+                                <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Raw Material <span class="text-red-500">*</span></th>
+                                <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-32">Quantity <span class="text-red-500">*</span></th>
+                                <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-36">Unit Rate (Rs.)</th>
+                                <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-36">Total Value (Rs.)</th>
+                                <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-16">Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="manualRawItemsBody" class="bg-white divide-y divide-gray-200">
+                            <!-- Dynamic rows will be added here -->
+                        </tbody>
+                        <tfoot class="bg-gray-50">
+                            <tr>
+                                <td colspan="4" class="px-3 py-3 text-right text-sm font-medium text-gray-700">Raw Materials Total:</td>
+                                <td class="px-3 py-3 text-sm font-bold text-sky-600" id="manualRawTotalValue">Rs. 0.00</td>
+                                <td></td>
+                            </tr>
+                        </tfoot>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Finished Items Table -->
+            <div class="bg-white border rounded-lg overflow-hidden">
+                <div class="bg-green-50 px-4 py-3 border-b flex justify-between items-center">
+                    <h4 class="text-md font-medium text-gray-900">🏭 Finished Items</h4>
+                    <button type="button" onclick="addManualStockRow('finished')" class="bg-green-500 text-white px-3 py-1 rounded-md hover:bg-green-600 text-sm flex items-center">
+                        <svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
+                        </svg>
+                        Add Row
+                    </button>
+                </div>
+                <div class="overflow-x-auto">
+                    <table class="min-w-full divide-y divide-gray-200">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-8">#</th>
+                                <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Finished Item <span class="text-red-500">*</span></th>
+                                <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-32">Quantity <span class="text-red-500">*</span></th>
+                                <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-36">Unit Rate (Rs.)</th>
+                                <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-36">Total Value (Rs.)</th>
+                                <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-16">Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="manualFinishedItemsBody" class="bg-white divide-y divide-gray-200">
+                            <!-- Dynamic rows will be added here -->
+                        </tbody>
+                        <tfoot class="bg-gray-50">
+                            <tr>
+                                <td colspan="4" class="px-3 py-3 text-right text-sm font-medium text-gray-700">Finished Items Total:</td>
+                                <td class="px-3 py-3 text-sm font-bold text-green-600" id="manualFinishedTotalValue">Rs. 0.00</td>
+                                <td></td>
+                            </tr>
+                        </tfoot>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Grand Total -->
+            <div class="bg-gray-100 p-4 rounded-lg">
+                <div class="flex justify-between items-center">
+                    <span class="text-lg font-medium text-gray-700">Grand Total:</span>
+                    <span class="text-xl font-bold text-gray-900" id="manualGrandTotalValue">Rs. 0.00</span>
+                </div>
+            </div>
+
+            <!-- Validation Warning -->
+            <div id="manualValidationWarning" class="p-3 bg-yellow-50 border-l-4 border-yellow-400 rounded hidden">
+                <div class="flex items-center">
+                    <div class="text-yellow-500 mr-2">⚠️</div>
+                    <div class="text-sm text-yellow-700">
+                        <span class="font-medium">Note:</span>
+                        <span id="manualWarningText"></span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="flex justify-between items-center pt-4">
+                <div class="text-sm text-gray-500">
+                    <span id="manualRawCount">0</span> raw material(s), <span id="manualFinishedCount">0</span> finished item(s) added
+                </div>
+                <div class="flex space-x-3">
+                    <button type="button" onclick="closeModal('manualStockUpdateModal')" class="px-4 py-2 border border-gray-300 rounded-md text-gray-700 hover:bg-gray-50">Cancel</button>
+                    <button type="submit" id="manualSubmitBtn" class="px-4 py-2 bg-sky-500 text-white rounded-md hover:bg-sky-600 disabled:opacity-50 disabled:cursor-not-allowed" disabled>Update Stock</button>
+                </div>
+            </div>
+        </form>
+    </div>
+</div>
+
 <script>
 function calculateTotalValue() {
     const quantity = parseFloat(document.getElementById('quantity').value) || 0;
@@ -689,6 +846,421 @@ document.addEventListener('DOMContentLoaded', function() {
     onRawSelectChange();
     onFinishedSelectChange();
 });
+
+// ========== Manual Stock Update Modal Functions (Multiple Items) ==========
+const rawItemsData = <?php echo json_encode($raw_items); ?>;
+const finishedItemsData = <?php echo json_encode($finished_items); ?>;
+let manualRawRowCounter = 0;
+let manualFinishedRowCounter = 0;
+
+function addManualStockRow(type) {
+    if (type === 'raw') {
+        manualRawRowCounter++;
+        const tbody = document.getElementById('manualRawItemsBody');
+        
+        let rawOptions = '<option value="">Select Raw Material</option>';
+        rawItemsData.forEach(item => {
+            rawOptions += `<option value="${item.id}" data-symbol="${item.symbol}">${item.code} - ${item.name} (${item.symbol})</option>`;
+        });
+        
+        const row = document.createElement('tr');
+        row.id = `manualRawRow_${manualRawRowCounter}`;
+        row.className = 'hover:bg-gray-50';
+        row.innerHTML = `
+            <td class="px-3 py-2 text-sm text-gray-500">${tbody.children.length + 1}</td>
+            <td class="px-3 py-2">
+                <select name="raw_items[${manualRawRowCounter}][item_id]" 
+                        id="manualRawItem_${manualRawRowCounter}"
+                        class="w-full px-2 py-1 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm"
+                        onchange="validateManualForm()"
+                        required>
+                    ${rawOptions}
+                </select>
+            </td>
+            <td class="px-3 py-2">
+                <input type="number" 
+                       name="raw_items[${manualRawRowCounter}][quantity]" 
+                       id="manualRawQty_${manualRawRowCounter}"
+                       step="0.001" 
+                       min="0.001" 
+                       class="w-full px-2 py-1 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm" 
+                       placeholder="0.000"
+                       oninput="calculateManualRowValue('raw', ${manualRawRowCounter})"
+                       required>
+            </td>
+            <td class="px-3 py-2">
+                <input type="number" 
+                       name="raw_items[${manualRawRowCounter}][rate]" 
+                       id="manualRawRate_${manualRawRowCounter}"
+                       step="0.01" 
+                       min="0" 
+                       class="w-full px-2 py-1 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm" 
+                       placeholder="0.00"
+                       oninput="calculateManualRowTotal('raw', ${manualRawRowCounter})">
+            </td>
+            <td class="px-3 py-2">
+                <input type="number" 
+                       name="raw_items[${manualRawRowCounter}][total_value]" 
+                       id="manualRawTotal_${manualRawRowCounter}"
+                       step="0.01" 
+                       min="0" 
+                       class="w-full px-2 py-1 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm bg-sky-50" 
+                       placeholder="0.00"
+                       oninput="calculateManualRowRate('raw', ${manualRawRowCounter})">
+            </td>
+            <td class="px-3 py-2 text-center">
+                <button type="button" onclick="removeManualStockRow('raw', ${manualRawRowCounter})" class="text-red-500 hover:text-red-700">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
+                    </svg>
+                </button>
+            </td>
+        `;
+        
+        tbody.appendChild(row);
+    } else if (type === 'finished') {
+        manualFinishedRowCounter++;
+        const tbody = document.getElementById('manualFinishedItemsBody');
+        
+        let finishedOptions = '<option value="">Select Finished Item</option>';
+        finishedItemsData.forEach(item => {
+            finishedOptions += `<option value="${item.id}" data-symbol="${item.symbol}">${item.code} - ${item.name} (${item.symbol})</option>`;
+        });
+        
+        const row = document.createElement('tr');
+        row.id = `manualFinishedRow_${manualFinishedRowCounter}`;
+        row.className = 'hover:bg-gray-50';
+        row.innerHTML = `
+            <td class="px-3 py-2 text-sm text-gray-500">${tbody.children.length + 1}</td>
+            <td class="px-3 py-2">
+                <select name="finished_items[${manualFinishedRowCounter}][item_id]" 
+                        id="manualFinishedItem_${manualFinishedRowCounter}"
+                        class="w-full px-2 py-1 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-sm"
+                        onchange="validateManualForm()"
+                        required>
+                    ${finishedOptions}
+                </select>
+            </td>
+            <td class="px-3 py-2">
+                <input type="number" 
+                       name="finished_items[${manualFinishedRowCounter}][quantity]" 
+                       id="manualFinishedQty_${manualFinishedRowCounter}"
+                       step="0.001" 
+                       min="0.001" 
+                       class="w-full px-2 py-1 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-sm" 
+                       placeholder="0.000"
+                       oninput="calculateManualRowValue('finished', ${manualFinishedRowCounter})"
+                       required>
+            </td>
+            <td class="px-3 py-2">
+                <input type="number" 
+                       name="finished_items[${manualFinishedRowCounter}][rate]" 
+                       id="manualFinishedRate_${manualFinishedRowCounter}"
+                       step="0.01" 
+                       min="0" 
+                       class="w-full px-2 py-1 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-sm" 
+                       placeholder="0.00"
+                       oninput="calculateManualRowTotal('finished', ${manualFinishedRowCounter})">
+            </td>
+            <td class="px-3 py-2">
+                <input type="number" 
+                       name="finished_items[${manualFinishedRowCounter}][total_value]" 
+                       id="manualFinishedTotal_${manualFinishedRowCounter}"
+                       step="0.01" 
+                       min="0" 
+                       class="w-full px-2 py-1 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-sm bg-green-50" 
+                       placeholder="0.00"
+                       oninput="calculateManualRowRate('finished', ${manualFinishedRowCounter})">
+            </td>
+            <td class="px-3 py-2 text-center">
+                <button type="button" onclick="removeManualStockRow('finished', ${manualFinishedRowCounter})" class="text-red-500 hover:text-red-700">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
+                    </svg>
+                </button>
+            </td>
+        `;
+        
+        tbody.appendChild(row);
+    }
+    
+    updateManualItemCount();
+    validateManualForm();
+}
+
+function removeManualStockRow(type, rowNum) {
+    const prefix = type === 'raw' ? 'manualRawRow' : 'manualFinishedRow';
+    const row = document.getElementById(`${prefix}_${rowNum}`);
+    if (row) {
+        row.remove();
+        updateManualRowNumbers(type);
+        updateManualGrandTotal();
+        updateManualItemCount();
+        validateManualForm();
+    }
+}
+
+function updateManualRowNumbers(type) {
+    const tbodyId = type === 'raw' ? 'manualRawItemsBody' : 'manualFinishedItemsBody';
+    const tbody = document.getElementById(tbodyId);
+    const rows = tbody.querySelectorAll('tr');
+    rows.forEach((row, index) => {
+        row.querySelector('td:first-child').textContent = index + 1;
+    });
+}
+
+function calculateManualRowTotal(type, rowNum) {
+    const prefix = type === 'raw' ? 'manualRaw' : 'manualFinished';
+    const qty = parseFloat(document.getElementById(`${prefix}Qty_${rowNum}`)?.value) || 0;
+    const rate = parseFloat(document.getElementById(`${prefix}Rate_${rowNum}`)?.value) || 0;
+    const totalField = document.getElementById(`${prefix}Total_${rowNum}`);
+    
+    if (qty > 0 && rate > 0) {
+        totalField.value = (qty * rate).toFixed(2);
+        totalField.classList.add('bg-blue-50');
+        totalField.classList.remove(type === 'raw' ? 'bg-sky-50' : 'bg-green-50');
+    }
+    
+    updateManualGrandTotal();
+    validateManualForm();
+}
+
+function calculateManualRowRate(type, rowNum) {
+    const prefix = type === 'raw' ? 'manualRaw' : 'manualFinished';
+    const qty = parseFloat(document.getElementById(`${prefix}Qty_${rowNum}`)?.value) || 0;
+    const total = parseFloat(document.getElementById(`${prefix}Total_${rowNum}`)?.value) || 0;
+    const rateField = document.getElementById(`${prefix}Rate_${rowNum}`);
+    const totalField = document.getElementById(`${prefix}Total_${rowNum}`);
+    
+    if (qty > 0 && total > 0) {
+        rateField.value = (total / qty).toFixed(2);
+        rateField.classList.add('bg-green-50');
+        totalField.classList.remove('bg-blue-50');
+        totalField.classList.add(type === 'raw' ? 'bg-sky-50' : 'bg-green-50');
+    }
+    
+    updateManualGrandTotal();
+    validateManualForm();
+}
+
+function calculateManualRowValue(type, rowNum) {
+    const prefix = type === 'raw' ? 'manualRaw' : 'manualFinished';
+    const qty = parseFloat(document.getElementById(`${prefix}Qty_${rowNum}`)?.value) || 0;
+    const rate = parseFloat(document.getElementById(`${prefix}Rate_${rowNum}`)?.value) || 0;
+    const total = parseFloat(document.getElementById(`${prefix}Total_${rowNum}`)?.value) || 0;
+    
+    if (qty > 0) {
+        if (rate > 0) {
+            calculateManualRowTotal(type, rowNum);
+        } else if (total > 0) {
+            calculateManualRowRate(type, rowNum);
+        }
+    }
+    validateManualForm();
+}
+
+function updateManualGrandTotal() {
+    // Calculate raw materials total
+    const rawTbody = document.getElementById('manualRawItemsBody');
+    const rawRows = rawTbody.querySelectorAll('tr');
+    let rawTotalValue = 0;
+    
+    rawRows.forEach(row => {
+        const rowId = row.id.split('_')[1];
+        const total = parseFloat(document.getElementById(`manualRawTotal_${rowId}`)?.value) || 0;
+        rawTotalValue += total;
+    });
+    
+    document.getElementById('manualRawTotalValue').textContent = `Rs. ${rawTotalValue.toFixed(2)}`;
+    
+    // Calculate finished items total
+    const finishedTbody = document.getElementById('manualFinishedItemsBody');
+    const finishedRows = finishedTbody.querySelectorAll('tr');
+    let finishedTotalValue = 0;
+    
+    finishedRows.forEach(row => {
+        const rowId = row.id.split('_')[1];
+        const total = parseFloat(document.getElementById(`manualFinishedTotal_${rowId}`)?.value) || 0;
+        finishedTotalValue += total;
+    });
+    
+    document.getElementById('manualFinishedTotalValue').textContent = `Rs. ${finishedTotalValue.toFixed(2)}`;
+    
+    // Calculate grand total
+    const grandTotal = rawTotalValue + finishedTotalValue;
+    document.getElementById('manualGrandTotalValue').textContent = `Rs. ${grandTotal.toFixed(2)}`;
+}
+
+function updateManualItemCount() {
+    const rawCount = document.getElementById('manualRawItemsBody').querySelectorAll('tr').length;
+    const finishedCount = document.getElementById('manualFinishedItemsBody').querySelectorAll('tr').length;
+    document.getElementById('manualRawCount').textContent = rawCount;
+    document.getElementById('manualFinishedCount').textContent = finishedCount;
+}
+
+function showManualWarning(text) {
+    document.getElementById('manualWarningText').textContent = text;
+    document.getElementById('manualValidationWarning').classList.remove('hidden');
+}
+
+function hideManualWarning() {
+    document.getElementById('manualValidationWarning').classList.add('hidden');
+}
+
+function validateManualForm() {
+    const rawTbody = document.getElementById('manualRawItemsBody');
+    const finishedTbody = document.getElementById('manualFinishedItemsBody');
+    const rawRows = rawTbody.querySelectorAll('tr');
+    const finishedRows = finishedTbody.querySelectorAll('tr');
+    const locationId = document.getElementById('manual_location_id').value;
+    const submitBtn = document.getElementById('manualSubmitBtn');
+    
+    let isValid = true;
+    let errorMsg = '';
+    
+    // Check if location is selected
+    if (!locationId) {
+        isValid = false;
+        errorMsg = 'Please select a location';
+    }
+    
+    // Check if at least one row exists in either table
+    if (rawRows.length === 0 && finishedRows.length === 0) {
+        isValid = false;
+        errorMsg = 'Please add at least one item';
+    }
+    
+    // Validate raw material rows
+    let usedRawItems = [];
+    rawRows.forEach(row => {
+        const rowId = row.id.split('_')[1];
+        const itemId = document.getElementById(`manualRawItem_${rowId}`)?.value;
+        const qty = parseFloat(document.getElementById(`manualRawQty_${rowId}`)?.value) || 0;
+        const rate = parseFloat(document.getElementById(`manualRawRate_${rowId}`)?.value) || 0;
+        const total = parseFloat(document.getElementById(`manualRawTotal_${rowId}`)?.value) || 0;
+        
+        if (!itemId) {
+            isValid = false;
+            errorMsg = 'Please select an item for all raw material rows';
+        } else if (usedRawItems.includes(itemId)) {
+            isValid = false;
+            errorMsg = 'Duplicate raw material detected';
+        } else {
+            usedRawItems.push(itemId);
+        }
+        
+        if (qty <= 0) {
+            isValid = false;
+            errorMsg = 'Please enter quantity for all raw materials';
+        }
+        
+        if (rate <= 0 && total <= 0) {
+            isValid = false;
+            errorMsg = 'Please enter rate or total value for all raw materials';
+        }
+    });
+    
+    // Validate finished item rows
+    let usedFinishedItems = [];
+    finishedRows.forEach(row => {
+        const rowId = row.id.split('_')[1];
+        const itemId = document.getElementById(`manualFinishedItem_${rowId}`)?.value;
+        const qty = parseFloat(document.getElementById(`manualFinishedQty_${rowId}`)?.value) || 0;
+        const rate = parseFloat(document.getElementById(`manualFinishedRate_${rowId}`)?.value) || 0;
+        const total = parseFloat(document.getElementById(`manualFinishedTotal_${rowId}`)?.value) || 0;
+        
+        if (!itemId) {
+            isValid = false;
+            errorMsg = 'Please select an item for all finished item rows';
+        } else if (usedFinishedItems.includes(itemId)) {
+            isValid = false;
+            errorMsg = 'Duplicate finished item detected';
+        } else {
+            usedFinishedItems.push(itemId);
+        }
+        
+        if (qty <= 0) {
+            isValid = false;
+            errorMsg = 'Please enter quantity for all finished items';
+        }
+        
+        if (rate <= 0 && total <= 0) {
+            isValid = false;
+            errorMsg = 'Please enter rate or total value for all finished items';
+        }
+    });
+    
+    if (isValid) {
+        submitBtn.disabled = false;
+        submitBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+        hideManualWarning();
+    } else {
+        submitBtn.disabled = true;
+        submitBtn.classList.add('opacity-50', 'cursor-not-allowed');
+        if (errorMsg) {
+            showManualWarning(errorMsg);
+        }
+    }
+}
+
+function resetManualStockForm() {
+    document.getElementById('manualStockUpdateForm').reset();
+    document.getElementById('manualRawItemsBody').innerHTML = '';
+    document.getElementById('manualFinishedItemsBody').innerHTML = '';
+    document.getElementById('manualRawTotalValue').textContent = 'Rs. 0.00';
+    document.getElementById('manualFinishedTotalValue').textContent = 'Rs. 0.00';
+    document.getElementById('manualGrandTotalValue').textContent = 'Rs. 0.00';
+    document.getElementById('manualRawCount').textContent = '0';
+    document.getElementById('manualFinishedCount').textContent = '0';
+    manualRawRowCounter = 0;
+    manualFinishedRowCounter = 0;
+    hideManualWarning();
+    document.getElementById('manualSubmitBtn').disabled = true;
+}
+
+// Update closeModal to handle manual modal
+const originalCloseModal = closeModal;
+closeModal = function(modalId) {
+    document.getElementById(modalId).classList.add('hidden');
+    
+    if (modalId === 'createOpeningStockModal') {
+        document.getElementById('openingStockForm').reset();
+        document.getElementById('unit_rate').classList.remove('bg-green-50', 'bg-blue-50');
+        document.getElementById('total_value').classList.remove('bg-green-50', 'bg-blue-50');
+        hideCalculation();
+        hideWarning();
+        document.getElementById('submitBtn').disabled = true;
+        const rawSel = document.getElementById('raw_item_id');
+        const finSel = document.getElementById('finished_item_id');
+        if (rawSel) rawSel.disabled = false;
+        if (finSel) finSel.disabled = false;
+    }
+    
+    if (modalId === 'manualStockUpdateModal') {
+        resetManualStockForm();
+    }
+}
+
+// Update openModal to handle manual modal
+const originalOpenModal = openModal;
+openModal = function(modalId) {
+    document.getElementById(modalId).classList.remove('hidden');
+    
+    if (modalId === 'createOpeningStockModal') {
+        onRawSelectChange();
+        onFinishedSelectChange();
+    }
+    
+    if (modalId === 'manualStockUpdateModal') {
+        // Add first row automatically for raw materials
+        if (document.getElementById('manualRawItemsBody').children.length === 0) {
+            addManualStockRow('raw');
+        }
+    }
+}
+
+// Add change listener for location
+document.getElementById('manual_location_id')?.addEventListener('change', validateManualForm);
 </script>
 
 <?php include 'footer.php'; ?>

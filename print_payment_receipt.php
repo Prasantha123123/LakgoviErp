@@ -43,6 +43,63 @@ if (!$payment) {
     die('Payment not found');
 }
 
+// Get the payment_no from the first payment to fetch all payments in the same batch
+$payment_no = $payment['payment_no'];
+
+// Fetch ALL payments with the same payment_no (entire batch)
+$batch_payments_stmt = $db->prepare("
+    SELECT sp.*, 
+           sp.payment_method, sp.amount, sp.reference_no, 
+           sp.cheque_number, sp.cheque_date, sp.bank_name, sp.cheque_status,
+           si.invoice_no
+    FROM sales_payments sp
+    JOIN sales_invoices si ON sp.invoice_id = si.id
+    WHERE sp.payment_no = ?
+    ORDER BY sp.id ASC
+");
+$batch_payments_stmt->execute([$payment_no]);
+$session_payments = $batch_payments_stmt->fetchAll(PDO::FETCH_ASSOC);
+
+// If no payments found, just use the single payment
+if (empty($session_payments)) {
+    $session_payments = [$payment];
+}
+
+// Calculate total for this batch
+$session_total = 0;
+foreach ($session_payments as $sp) {
+    $session_total += floatval($sp['amount']);
+}
+
+// Group payments by payment method for summary display
+$payment_by_method = [];
+foreach ($session_payments as $sp) {
+    $method = $sp['payment_method'];
+    if (!isset($payment_by_method[$method])) {
+        $payment_by_method[$method] = [
+            'method' => $method,
+            'total' => 0,
+            'payments' => [],
+            'reference_no' => $sp['reference_no'],
+            'cheque_number' => $sp['cheque_number'],
+            'cheque_date' => $sp['cheque_date'],
+            'bank_name' => $sp['bank_name']
+        ];
+    }
+    $payment_by_method[$method]['total'] += floatval($sp['amount']);
+    $payment_by_method[$method]['payments'][] = $sp;
+}
+
+// Get unique invoices affected
+$invoices_affected = [];
+foreach ($session_payments as $sp) {
+    $inv_no = $sp['invoice_no'];
+    if (!isset($invoices_affected[$inv_no])) {
+        $invoices_affected[$inv_no] = 0;
+    }
+    $invoices_affected[$inv_no] += floatval($sp['amount']);
+}
+
 // Helpers
 function format_currency($amount) {
     return number_format($amount, 2);
@@ -109,6 +166,11 @@ $method_label = $method_labels[$payment['payment_method']] ?? ucfirst($payment['
         }
         @media screen {
             body { padding: 20px; }
+            .page-break { 
+                 
+                margin-top: 100px; 
+                padding-top: 30px; 
+            }
         }
     </style>
 </head>
@@ -152,12 +214,18 @@ $method_label = $method_labels[$payment['payment_method']] ?? ucfirst($payment['
                 <div class="meta-value"><?php echo date('d M Y', strtotime($payment['payment_date'])); ?></div>
             </div>
             <div class="meta-card">
-                <div class="meta-label">Invoice</div>
-                <div class="meta-value">#<?php echo htmlspecialchars($payment['invoice_no']); ?> (<?php echo date('d M Y', strtotime($payment['invoice_date'])); ?>)</div>
+                <div class="meta-label">Invoice(s)</div>
+                <div class="meta-value">
+                    <?php if (count($invoices_affected) == 1): ?>
+                        #<?php echo htmlspecialchars($payment['invoice_no']); ?>
+                    <?php else: ?>
+                        <?php echo count($invoices_affected); ?> invoices
+                    <?php endif; ?>
+                </div>
             </div>
             <div class="meta-card">
-                <div class="meta-label">Amount</div>
-                <div class="meta-value"><?php echo htmlspecialchars($currency); ?> <?php echo format_currency($payment['amount']); ?></div>
+                <div class="meta-label">Total Payment</div>
+                <div class="meta-value"><?php echo htmlspecialchars($currency); ?> <?php echo format_currency($session_total); ?></div>
             </div>
         </div>
 
@@ -187,41 +255,82 @@ $method_label = $method_labels[$payment['payment_method']] ?? ucfirst($payment['
         <div class="section">
             <h3>Payment Details</h3>
             <table>
-                <tr>
-                    <th style="width: 150px;">Method</th>
-                    <td><?php echo htmlspecialchars($method_label); ?></td>
-                </tr>
-                <tr>
-                    <th>Reference</th>
-                    <td>
-                        <?php if ($payment['payment_method'] === 'cheque'): ?>
-                            Cheque #: <?php echo htmlspecialchars($payment['cheque_number'] ?? '-'); ?>
-                            <?php if ($payment['cheque_date']): ?> | Date: <?php echo date('d M Y', strtotime($payment['cheque_date'])); ?><?php endif; ?>
-                            <?php if ($payment['bank_name']): ?> | Bank: <?php echo htmlspecialchars($payment['bank_name']); ?><?php endif; ?>
-                        <?php else: ?>
-                            <?php echo htmlspecialchars($payment['reference_no'] ?: '-'); ?>
-                        <?php endif; ?>
-                    </td>
-                </tr>
-                <?php if ($payment['payment_method'] === 'cheque'): ?>
-                <tr>
-                    <th>Status</th>
-                    <td>
-                        <?php 
-                        $status = $payment['cheque_status'] ?: 'pending';
-                        $badgeClass = $status === 'cleared' ? 'badge-green' : ($status === 'pending' ? 'badge-yellow' : 'badge-red');
-                        ?>
-                        <span class="badge <?php echo $badgeClass; ?>"><?php echo ucfirst($status); ?></span>
-                        <?php if ($status === 'cleared' && $payment['clearance_date']): ?>
-                            (Cleared: <?php echo date('d M Y', strtotime($payment['clearance_date'])); ?>)
-                        <?php elseif ($status === 'bounced' && $payment['bounce_reason']): ?>
-                            (Reason: <?php echo htmlspecialchars($payment['bounce_reason']); ?>)
-                        <?php endif; ?>
-                    </td>
-                </tr>
+                <thead>
+                    <tr>
+                        <th style="width: 120px;">Method</th>
+                        <th>Reference</th>
+                        <th style="width: 130px; text-align: right;">Amount</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach ($payment_by_method as $method => $pm): ?>
+                    <tr>
+                        <td><?php echo htmlspecialchars($method_labels[$method] ?? ucfirst($method)); ?></td>
+                        <td>
+                            <?php if ($method === 'cheque'): ?>
+                                Cheque #: <?php echo htmlspecialchars($pm['cheque_number'] ?? '-'); ?>
+                                <?php if (!empty($pm['cheque_date'])): ?> | Date: <?php echo date('d M Y', strtotime($pm['cheque_date'])); ?><?php endif; ?>
+                                <?php if (!empty($pm['bank_name'])): ?> | Bank: <?php echo htmlspecialchars($pm['bank_name']); ?><?php endif; ?>
+                            <?php elseif ($method === 'bank_transfer' && !empty($pm['bank_name'])): ?>
+                                Bank: <?php echo htmlspecialchars($pm['bank_name']); ?>
+                                <?php if (!empty($pm['reference_no'])): ?> | Ref: <?php echo htmlspecialchars($pm['reference_no']); ?><?php endif; ?>
+                            <?php else: ?>
+                                <?php echo htmlspecialchars($pm['reference_no'] ?: '-'); ?>
+                            <?php endif; ?>
+                        </td>
+                        <td style="text-align: right; font-weight: 600;"><?php echo htmlspecialchars($currency); ?> <?php echo format_currency($pm['total']); ?></td>
+                    </tr>
+                    <?php endforeach; ?>
+                </tbody>
+                <?php if (count($payment_by_method) > 1): ?>
+                <tfoot>
+                    <tr style="border-top: 2px solid #333;">
+                        <td colspan="2" style="text-align: right; font-weight: bold; padding-top: 8px;">Total Payment:</td>
+                        <td style="text-align: right; font-weight: bold; padding-top: 8px; font-size: 11px;"><?php echo htmlspecialchars($currency); ?> <?php echo format_currency($session_total); ?></td>
+                    </tr>
+                </tfoot>
                 <?php endif; ?>
             </table>
         </div>
+        
+        <?php if (count($invoices_affected) > 1): ?>
+        <div class="section">
+            <h3>Invoice Allocation (FIFO)</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Invoice No</th>
+                        <th style="width: 130px; text-align: right;">Amount Applied</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach ($invoices_affected as $inv_no => $amount): ?>
+                    <tr>
+                        <td>#<?php echo htmlspecialchars($inv_no); ?></td>
+                        <td style="text-align: right; font-weight: 600;"><?php echo htmlspecialchars($currency); ?> <?php echo format_currency($amount); ?></td>
+                    </tr>
+                    <?php endforeach; ?>
+                </tbody>
+                <tfoot>
+                    <tr style="border-top: 2px solid #333;">
+                        <td style="text-align: right; font-weight: bold; padding-top: 8px;">Total:</td>
+                        <td style="text-align: right; font-weight: bold; padding-top: 8px; font-size: 11px;"><?php echo htmlspecialchars($currency); ?> <?php echo format_currency($session_total); ?></td>
+                    </tr>
+                </tfoot>
+            </table>
+        </div>
+        <?php endif; ?>
+
+        <div class="print-actions">
+            <button class="btn" onclick="window.print()">🖨️ Print Receipt</button>
+            <a href="sales_payments.php" class="btn" style="background:#6b7280; margin-left:6px; text-decoration:none;">← Back</a>
+        </div>
+    </div>
+
+    <!-- Second Page - Invoice Summary -->
+    <div class="receipt-container" style="page-break-before: always;">
+       
+ 
 
         <div class="section">
             <h3>Invoice Summary</h3>
@@ -230,41 +339,36 @@ $method_label = $method_labels[$payment['payment_method']] ?? ucfirst($payment['
                     <td class="label">Invoice Total:</td>
                     <td class="value"><?php echo htmlspecialchars($currency); ?> <?php echo format_currency($payment['total_amount']); ?></td>
                 </tr>
-                <tr>
+                <!-- <tr>
                     <td class="label">Paid To Date:</td>
                     <td class="value"><?php echo htmlspecialchars($currency); ?> <?php echo format_currency($payment['paid_amount']); ?></td>
-                </tr>
+                </tr> -->
                 <tr>
                     <td class="label">Balance:</td>
                     <td class="value"><?php echo htmlspecialchars($currency); ?> <?php echo format_currency($payment['balance_amount']); ?></td>
                 </tr>
                 <tr class="grand">
                     <td class="label">This Payment:</td>
-                    <td class="value"><?php echo htmlspecialchars($currency); ?> <?php echo format_currency($payment['amount']); ?></td>
+                    <td class="value">
+                      <?php echo htmlspecialchars($currency); ?> <?php echo format_currency($session_total); ?>
+                    </td>
                 </tr>
             </table>
         </div>
 
         <div class="section" style="margin-top: 28px;">
-            <table>
-                <tr>
-                    <th style="width: 50%; text-align: center;">Customer Signature</th>
-                    <th style="width: 50%; text-align: center;">Authorized Signature</th>
-                </tr>
-                <tr>
-                    <td style="height: 70px;"></td>
-                    <td></td>
-                </tr>
-            </table>
+            <div style="display: flex; justify-content: space-between; margin-top: 20px;">
+                <div style="width: 45%; text-align: center;">
+                    <div style="border-top: 1.5px dotted #333; padding-top: 8px; font-size: 9px; text-transform: uppercase;">Customer Signature</div>
+                </div>
+                <div style="width: 45%; text-align: center;">
+                    <div style="border-top: 1.5px dotted #333; padding-top: 8px; font-size: 9px; text-transform: uppercase;">Authorized Signature</div>
+                </div>
+            </div>
         </div>
 
         <div class="section" style="text-align: center; font-size: 11px; color: #777; margin-top: 20px;">
             Generated on <?php echo date('d M Y H:i'); ?> by <?php echo htmlspecialchars($payment['created_by_full_name'] ?? $payment['created_by_name'] ?? 'System'); ?>
-        </div>
-
-        <div class="print-actions">
-            <button class="btn" onclick="window.print()">🖨️ Print Receipt</button>
-            <a href="sales_payments.php" class="btn" style="background:#6b7280; margin-left:6px; text-decoration:none;">← Back</a>
         </div>
     </div>
 </body>

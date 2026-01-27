@@ -130,6 +130,10 @@ function insertPaymentLines($db, $invoice_id, $payments, $payment_type, $created
     $invoice = $stmt->fetch();
     $default_date = $invoice ? $invoice['invoice_date'] : date('Y-m-d');
     
+    // Generate ONE payment_no for the entire batch
+    // All payments saved together share the same pay_no
+    $batch_payment_no = getNextPaymentNo($db);
+    
     foreach ($payments as $payment) {
         $amount = floatval($payment['amount'] ?? 0);
         
@@ -158,9 +162,6 @@ function insertPaymentLines($db, $invoice_id, $payments, $payment_type, $created
             $bank_name = !empty($payment['bank_name']) ? $payment['bank_name'] : null;
         }
         
-        // Get next payment number
-        $payment_no = getNextPaymentNo($db);
-        
         $stmt = $db->prepare("
             INSERT INTO sales_payments (
                 payment_no, invoice_id, payment_date, amount, 
@@ -171,7 +172,7 @@ function insertPaymentLines($db, $invoice_id, $payments, $payment_type, $created
         ");
         
         $stmt->execute([
-            $payment_no,
+            $batch_payment_no,
             $invoice_id,
             $payment_date,
             $amount,
