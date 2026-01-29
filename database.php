@@ -7,6 +7,12 @@ class Database {
     private $password = '';
     private $conn;
 
+    //  private $host = 'localhost';
+    // private $db_name = 'lakgovi_erp';
+    //  private $username = 'dbuser';
+    // private $password = 'L{582Phb1Lh5';
+    // private $conn;
+
     public function getConnection() {
         $this->conn = null;
         try {
