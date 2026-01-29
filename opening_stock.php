@@ -212,6 +212,151 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                     $db->commit();
                     $success = "Opening stock deleted successfully!";
                     break;
+                    
+                case 'manual_update':
+                    $db->beginTransaction();
+                    
+                    // Validate required fields
+                    $location_id = $_POST['manual_location_id'] ?? '';
+                    $update_date = $_POST['manual_update_date'] ?? date('Y-m-d');
+                    
+                    if (empty($location_id)) {
+                        throw new Exception("Location is required");
+                    }
+                    
+                    $raw_items_posted = $_POST['raw_items'] ?? [];
+                    $finished_items_posted = $_POST['finished_items'] ?? [];
+                    
+                    if (empty($raw_items_posted) && empty($finished_items_posted)) {
+                        throw new Exception("At least one item must be added for stock update");
+                    }
+                    
+                    $updated_count = 0;
+                    $updated_items = [];
+                    
+                    // Process raw materials
+                    foreach ($raw_items_posted as $item) {
+                        if (!empty($item['item_id']) && isset($item['quantity']) && floatval($item['quantity']) != 0) {
+                            $item_id = intval($item['item_id']);
+                            $quantity = floatval($item['quantity']);
+                            
+                            // Get item details
+                            $stmt = $db->prepare("SELECT name, code FROM items WHERE id = ?");
+                            $stmt->execute([$item_id]);
+                            $item_details = $stmt->fetch();
+                            
+                            if (!$item_details) {
+                                throw new Exception("Item with ID {$item_id} not found");
+                            }
+                            
+                            // Update current_stock in items table using helper function
+                            updateItemStock($db, $item_id, $quantity);
+                            
+                            // Get updated balance from stock ledger for this location
+                            $stmt = $db->prepare("
+                                SELECT COALESCE(SUM(quantity_in - quantity_out), 0) as current_balance 
+                                FROM stock_ledger 
+                                WHERE item_id = ? AND location_id = ?
+                            ");
+                            $stmt->execute([$item_id, $location_id]);
+                            $result = $stmt->fetch();
+                            $current_balance = $result ? floatval($result['current_balance']) : 0;
+                            $new_balance = $current_balance + $quantity;
+                            
+                            // Generate reference number for manual stock update
+                            $stmt = $db->query("SELECT COUNT(*) as count FROM stock_ledger WHERE transaction_type = 'manual_stock'");
+                            $count = $stmt->fetch()['count'] + 1;
+                            $reference_no = 'MS' . str_pad($count, 6, '0', STR_PAD_LEFT);
+                            
+                            // Insert into stock_ledger
+                            if ($quantity > 0) {
+                                $stmt = $db->prepare("
+                                    INSERT INTO stock_ledger (
+                                        item_id, location_id, transaction_type, reference_id, reference_no,
+                                        transaction_date, quantity_in, quantity_out, balance, created_at
+                                    ) VALUES (?, ?, 'manual_stock', 0, ?, ?, ?, 0, ?, NOW())
+                                ");
+                                $stmt->execute([$item_id, $location_id, $reference_no, $update_date, $quantity, $new_balance]);
+                            } else {
+                                $stmt = $db->prepare("
+                                    INSERT INTO stock_ledger (
+                                        item_id, location_id, transaction_type, reference_id, reference_no,
+                                        transaction_date, quantity_in, quantity_out, balance, created_at
+                                    ) VALUES (?, ?, 'manual_stock', 0, ?, ?, 0, ?, ?, NOW())
+                                ");
+                                $stmt->execute([$item_id, $location_id, $reference_no, $update_date, abs($quantity), $new_balance]);
+                            }
+                            
+                            $updated_count++;
+                            $updated_items[] = $item_details['code'] . ' (' . ($quantity > 0 ? '+' : '') . number_format($quantity, 3) . ')';
+                        }
+                    }
+                    
+                    // Process finished items
+                    foreach ($finished_items_posted as $item) {
+                        if (!empty($item['item_id']) && isset($item['quantity']) && floatval($item['quantity']) != 0) {
+                            $item_id = intval($item['item_id']);
+                            $quantity = floatval($item['quantity']);
+                            
+                            // Get item details
+                            $stmt = $db->prepare("SELECT name, code FROM items WHERE id = ?");
+                            $stmt->execute([$item_id]);
+                            $item_details = $stmt->fetch();
+                            
+                            if (!$item_details) {
+                                throw new Exception("Item with ID {$item_id} not found");
+                            }
+                            
+                            // Update current_stock in items table using helper function
+                            updateItemStock($db, $item_id, $quantity);
+                            
+                            // Get updated balance from stock ledger for this location
+                            $stmt = $db->prepare("
+                                SELECT COALESCE(SUM(quantity_in - quantity_out), 0) as current_balance 
+                                FROM stock_ledger 
+                                WHERE item_id = ? AND location_id = ?
+                            ");
+                            $stmt->execute([$item_id, $location_id]);
+                            $result = $stmt->fetch();
+                            $current_balance = $result ? floatval($result['current_balance']) : 0;
+                            $new_balance = $current_balance + $quantity;
+                            
+                            // Generate reference number for manual stock update
+                            $stmt = $db->query("SELECT COUNT(*) as count FROM stock_ledger WHERE transaction_type = 'manual_stock'");
+                            $count = $stmt->fetch()['count'] + 1;
+                            $reference_no = 'MS' . str_pad($count, 6, '0', STR_PAD_LEFT);
+                            
+                            // Insert into stock_ledger
+                            if ($quantity > 0) {
+                                $stmt = $db->prepare("
+                                    INSERT INTO stock_ledger (
+                                        item_id, location_id, transaction_type, reference_id, reference_no,
+                                        transaction_date, quantity_in, quantity_out, balance, created_at
+                                    ) VALUES (?, ?, 'manual_stock', 0, ?, ?, ?, 0, ?, NOW())
+                                ");
+                                $stmt->execute([$item_id, $location_id, $reference_no, $update_date, $quantity, $new_balance]);
+                            } else {
+                                $stmt = $db->prepare("
+                                    INSERT INTO stock_ledger (
+                                        item_id, location_id, transaction_type, reference_id, reference_no,
+                                        transaction_date, quantity_in, quantity_out, balance, created_at
+                                    ) VALUES (?, ?, 'manual_stock', 0, ?, ?, 0, ?, ?, NOW())
+                                ");
+                                $stmt->execute([$item_id, $location_id, $reference_no, $update_date, abs($quantity), $new_balance]);
+                            }
+                            
+                            $updated_count++;
+                            $updated_items[] = $item_details['code'] . ' (' . ($quantity > 0 ? '+' : '') . number_format($quantity, 3) . ')';
+                        }
+                    }
+                    
+                    if ($updated_count == 0) {
+                        throw new Exception("No valid items to update");
+                    }
+                    
+                    $db->commit();
+                    $success = "Manual stock update completed! Updated {$updated_count} item(s): " . implode(', ', $updated_items);
+                    break;
             }
         }
     } catch(Exception $e) {
@@ -555,7 +700,7 @@ try {
             <input type="hidden" name="action" value="manual_update">
             
             <!-- Header Info -->
-            <div class="grid grid-cols-1 md:grid-cols-3 gap-4 bg-gray-50 p-4 rounded-lg">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4 bg-gray-50 p-4 rounded-lg">
                 <!-- Location -->
                 <div>
                     <label class="block text-sm font-medium text-gray-700 mb-1">Location <span class="text-red-500">*</span></label>
@@ -573,12 +718,6 @@ try {
                 <div>
                     <label class="block text-sm font-medium text-gray-700 mb-1">Update Date <span class="text-red-500">*</span></label>
                     <input type="date" name="manual_update_date" id="manual_update_date" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent" value="<?php echo date('Y-m-d'); ?>">
-                </div>
-
-                <!-- Remarks -->
-                <div>
-                    <label class="block text-sm font-medium text-gray-700 mb-1">Remarks</label>
-                    <input type="text" name="manual_remarks" id="manual_remarks" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent" placeholder="Reason for manual update...">
                 </div>
             </div>
 
@@ -600,21 +739,14 @@ try {
                                 <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-8">#</th>
                                 <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Raw Material <span class="text-red-500">*</span></th>
                                 <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-32">Quantity <span class="text-red-500">*</span></th>
-                                <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-36">Unit Rate (Rs.)</th>
-                                <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-36">Total Value (Rs.)</th>
+                                
                                 <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-16">Action</th>
                             </tr>
                         </thead>
                         <tbody id="manualRawItemsBody" class="bg-white divide-y divide-gray-200">
                             <!-- Dynamic rows will be added here -->
                         </tbody>
-                        <tfoot class="bg-gray-50">
-                            <tr>
-                                <td colspan="4" class="px-3 py-3 text-right text-sm font-medium text-gray-700">Raw Materials Total:</td>
-                                <td class="px-3 py-3 text-sm font-bold text-sky-600" id="manualRawTotalValue">Rs. 0.00</td>
-                                <td></td>
-                            </tr>
-                        </tfoot>
+                      
                     </table>
                 </div>
             </div>
@@ -637,32 +769,19 @@ try {
                                 <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-8">#</th>
                                 <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Finished Item <span class="text-red-500">*</span></th>
                                 <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-32">Quantity <span class="text-red-500">*</span></th>
-                                <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-36">Unit Rate (Rs.)</th>
-                                <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-36">Total Value (Rs.)</th>
+                             
                                 <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-16">Action</th>
                             </tr>
                         </thead>
                         <tbody id="manualFinishedItemsBody" class="bg-white divide-y divide-gray-200">
                             <!-- Dynamic rows will be added here -->
                         </tbody>
-                        <tfoot class="bg-gray-50">
-                            <tr>
-                                <td colspan="4" class="px-3 py-3 text-right text-sm font-medium text-gray-700">Finished Items Total:</td>
-                                <td class="px-3 py-3 text-sm font-bold text-green-600" id="manualFinishedTotalValue">Rs. 0.00</td>
-                                <td></td>
-                            </tr>
-                        </tfoot>
+                       
                     </table>
                 </div>
             </div>
 
-            <!-- Grand Total -->
-            <div class="bg-gray-100 p-4 rounded-lg">
-                <div class="flex justify-between items-center">
-                    <span class="text-lg font-medium text-gray-700">Grand Total:</span>
-                    <span class="text-xl font-bold text-gray-900" id="manualGrandTotalValue">Rs. 0.00</span>
-                </div>
-            </div>
+           
 
             <!-- Validation Warning -->
             <div id="manualValidationWarning" class="p-3 bg-yellow-50 border-l-4 border-yellow-400 rounded hidden">
@@ -882,32 +1001,12 @@ function addManualStockRow(type) {
                        name="raw_items[${manualRawRowCounter}][quantity]" 
                        id="manualRawQty_${manualRawRowCounter}"
                        step="0.001" 
-                       min="0.001" 
                        class="w-full px-2 py-1 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm" 
                        placeholder="0.000"
-                       oninput="calculateManualRowValue('raw', ${manualRawRowCounter})"
+                       oninput="validateManualForm()"
                        required>
             </td>
-            <td class="px-3 py-2">
-                <input type="number" 
-                       name="raw_items[${manualRawRowCounter}][rate]" 
-                       id="manualRawRate_${manualRawRowCounter}"
-                       step="0.01" 
-                       min="0" 
-                       class="w-full px-2 py-1 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm" 
-                       placeholder="0.00"
-                       oninput="calculateManualRowTotal('raw', ${manualRawRowCounter})">
-            </td>
-            <td class="px-3 py-2">
-                <input type="number" 
-                       name="raw_items[${manualRawRowCounter}][total_value]" 
-                       id="manualRawTotal_${manualRawRowCounter}"
-                       step="0.01" 
-                       min="0" 
-                       class="w-full px-2 py-1 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm bg-sky-50" 
-                       placeholder="0.00"
-                       oninput="calculateManualRowRate('raw', ${manualRawRowCounter})">
-            </td>
+           
             <td class="px-3 py-2 text-center">
                 <button type="button" onclick="removeManualStockRow('raw', ${manualRawRowCounter})" class="text-red-500 hover:text-red-700">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -946,32 +1045,12 @@ function addManualStockRow(type) {
                        name="finished_items[${manualFinishedRowCounter}][quantity]" 
                        id="manualFinishedQty_${manualFinishedRowCounter}"
                        step="0.001" 
-                       min="0.001" 
                        class="w-full px-2 py-1 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-sm" 
                        placeholder="0.000"
-                       oninput="calculateManualRowValue('finished', ${manualFinishedRowCounter})"
+                       oninput="validateManualForm()"
                        required>
             </td>
-            <td class="px-3 py-2">
-                <input type="number" 
-                       name="finished_items[${manualFinishedRowCounter}][rate]" 
-                       id="manualFinishedRate_${manualFinishedRowCounter}"
-                       step="0.01" 
-                       min="0" 
-                       class="w-full px-2 py-1 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-sm" 
-                       placeholder="0.00"
-                       oninput="calculateManualRowTotal('finished', ${manualFinishedRowCounter})">
-            </td>
-            <td class="px-3 py-2">
-                <input type="number" 
-                       name="finished_items[${manualFinishedRowCounter}][total_value]" 
-                       id="manualFinishedTotal_${manualFinishedRowCounter}"
-                       step="0.01" 
-                       min="0" 
-                       class="w-full px-2 py-1 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 text-sm bg-green-50" 
-                       placeholder="0.00"
-                       oninput="calculateManualRowRate('finished', ${manualFinishedRowCounter})">
-            </td>
+           
             <td class="px-3 py-2 text-center">
                 <button type="button" onclick="removeManualStockRow('finished', ${manualFinishedRowCounter})" class="text-red-500 hover:text-red-700">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -994,7 +1073,6 @@ function removeManualStockRow(type, rowNum) {
     if (row) {
         row.remove();
         updateManualRowNumbers(type);
-        updateManualGrandTotal();
         updateManualItemCount();
         validateManualForm();
     }
@@ -1007,88 +1085,6 @@ function updateManualRowNumbers(type) {
     rows.forEach((row, index) => {
         row.querySelector('td:first-child').textContent = index + 1;
     });
-}
-
-function calculateManualRowTotal(type, rowNum) {
-    const prefix = type === 'raw' ? 'manualRaw' : 'manualFinished';
-    const qty = parseFloat(document.getElementById(`${prefix}Qty_${rowNum}`)?.value) || 0;
-    const rate = parseFloat(document.getElementById(`${prefix}Rate_${rowNum}`)?.value) || 0;
-    const totalField = document.getElementById(`${prefix}Total_${rowNum}`);
-    
-    if (qty > 0 && rate > 0) {
-        totalField.value = (qty * rate).toFixed(2);
-        totalField.classList.add('bg-blue-50');
-        totalField.classList.remove(type === 'raw' ? 'bg-sky-50' : 'bg-green-50');
-    }
-    
-    updateManualGrandTotal();
-    validateManualForm();
-}
-
-function calculateManualRowRate(type, rowNum) {
-    const prefix = type === 'raw' ? 'manualRaw' : 'manualFinished';
-    const qty = parseFloat(document.getElementById(`${prefix}Qty_${rowNum}`)?.value) || 0;
-    const total = parseFloat(document.getElementById(`${prefix}Total_${rowNum}`)?.value) || 0;
-    const rateField = document.getElementById(`${prefix}Rate_${rowNum}`);
-    const totalField = document.getElementById(`${prefix}Total_${rowNum}`);
-    
-    if (qty > 0 && total > 0) {
-        rateField.value = (total / qty).toFixed(2);
-        rateField.classList.add('bg-green-50');
-        totalField.classList.remove('bg-blue-50');
-        totalField.classList.add(type === 'raw' ? 'bg-sky-50' : 'bg-green-50');
-    }
-    
-    updateManualGrandTotal();
-    validateManualForm();
-}
-
-function calculateManualRowValue(type, rowNum) {
-    const prefix = type === 'raw' ? 'manualRaw' : 'manualFinished';
-    const qty = parseFloat(document.getElementById(`${prefix}Qty_${rowNum}`)?.value) || 0;
-    const rate = parseFloat(document.getElementById(`${prefix}Rate_${rowNum}`)?.value) || 0;
-    const total = parseFloat(document.getElementById(`${prefix}Total_${rowNum}`)?.value) || 0;
-    
-    if (qty > 0) {
-        if (rate > 0) {
-            calculateManualRowTotal(type, rowNum);
-        } else if (total > 0) {
-            calculateManualRowRate(type, rowNum);
-        }
-    }
-    validateManualForm();
-}
-
-function updateManualGrandTotal() {
-    // Calculate raw materials total
-    const rawTbody = document.getElementById('manualRawItemsBody');
-    const rawRows = rawTbody.querySelectorAll('tr');
-    let rawTotalValue = 0;
-    
-    rawRows.forEach(row => {
-        const rowId = row.id.split('_')[1];
-        const total = parseFloat(document.getElementById(`manualRawTotal_${rowId}`)?.value) || 0;
-        rawTotalValue += total;
-    });
-    
-    document.getElementById('manualRawTotalValue').textContent = `Rs. ${rawTotalValue.toFixed(2)}`;
-    
-    // Calculate finished items total
-    const finishedTbody = document.getElementById('manualFinishedItemsBody');
-    const finishedRows = finishedTbody.querySelectorAll('tr');
-    let finishedTotalValue = 0;
-    
-    finishedRows.forEach(row => {
-        const rowId = row.id.split('_')[1];
-        const total = parseFloat(document.getElementById(`manualFinishedTotal_${rowId}`)?.value) || 0;
-        finishedTotalValue += total;
-    });
-    
-    document.getElementById('manualFinishedTotalValue').textContent = `Rs. ${finishedTotalValue.toFixed(2)}`;
-    
-    // Calculate grand total
-    const grandTotal = rawTotalValue + finishedTotalValue;
-    document.getElementById('manualGrandTotalValue').textContent = `Rs. ${grandTotal.toFixed(2)}`;
 }
 
 function updateManualItemCount() {
@@ -1136,8 +1132,6 @@ function validateManualForm() {
         const rowId = row.id.split('_')[1];
         const itemId = document.getElementById(`manualRawItem_${rowId}`)?.value;
         const qty = parseFloat(document.getElementById(`manualRawQty_${rowId}`)?.value) || 0;
-        const rate = parseFloat(document.getElementById(`manualRawRate_${rowId}`)?.value) || 0;
-        const total = parseFloat(document.getElementById(`manualRawTotal_${rowId}`)?.value) || 0;
         
         if (!itemId) {
             isValid = false;
@@ -1149,14 +1143,9 @@ function validateManualForm() {
             usedRawItems.push(itemId);
         }
         
-        if (qty <= 0) {
+        if (qty == 0) {
             isValid = false;
             errorMsg = 'Please enter quantity for all raw materials';
-        }
-        
-        if (rate <= 0 && total <= 0) {
-            isValid = false;
-            errorMsg = 'Please enter rate or total value for all raw materials';
         }
     });
     
@@ -1166,8 +1155,6 @@ function validateManualForm() {
         const rowId = row.id.split('_')[1];
         const itemId = document.getElementById(`manualFinishedItem_${rowId}`)?.value;
         const qty = parseFloat(document.getElementById(`manualFinishedQty_${rowId}`)?.value) || 0;
-        const rate = parseFloat(document.getElementById(`manualFinishedRate_${rowId}`)?.value) || 0;
-        const total = parseFloat(document.getElementById(`manualFinishedTotal_${rowId}`)?.value) || 0;
         
         if (!itemId) {
             isValid = false;
@@ -1179,14 +1166,9 @@ function validateManualForm() {
             usedFinishedItems.push(itemId);
         }
         
-        if (qty <= 0) {
+        if (qty == 0) {
             isValid = false;
             errorMsg = 'Please enter quantity for all finished items';
-        }
-        
-        if (rate <= 0 && total <= 0) {
-            isValid = false;
-            errorMsg = 'Please enter rate or total value for all finished items';
         }
     });
     
@@ -1207,9 +1189,6 @@ function resetManualStockForm() {
     document.getElementById('manualStockUpdateForm').reset();
     document.getElementById('manualRawItemsBody').innerHTML = '';
     document.getElementById('manualFinishedItemsBody').innerHTML = '';
-    document.getElementById('manualRawTotalValue').textContent = 'Rs. 0.00';
-    document.getElementById('manualFinishedTotalValue').textContent = 'Rs. 0.00';
-    document.getElementById('manualGrandTotalValue').textContent = 'Rs. 0.00';
     document.getElementById('manualRawCount').textContent = '0';
     document.getElementById('manualFinishedCount').textContent = '0';
     manualRawRowCounter = 0;
